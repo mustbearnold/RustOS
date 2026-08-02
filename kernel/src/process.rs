@@ -80,6 +80,7 @@ pub const SYS_PATH_INFO: u64 = 51;
 pub const SYS_GETCREDENTIALS: u64 = 52;
 pub const SYS_SPAWN_AS: u64 = 53;
 pub const SYS_SPAWN_PRIVILEGED: u64 = 54;
+pub const SYS_GET_CALLER_CREDENTIALS: u64 = 55;
 const PATH_INFO_LENGTH: usize = 16;
 const CREDENTIALS_LENGTH: usize = 16;
 const PATH_KIND_FILE: u64 = 1;
@@ -216,6 +217,7 @@ pub enum SyscallAction {
     WaitpidNonblocking,
     PathInfo,
     GetCredentials,
+    GetCallerCredentials,
     SpawnAs,
     SpawnPrivileged,
 }
@@ -237,8 +239,10 @@ pub struct ProcessExit {
 /// is a root-only variant that reads the path from `rdi`, uses the requested UID in
 /// `rsi` and GID in `rdx`, and inherits both standard streams from the caller;
 /// `SYS_SPAWN_PRIVILEGED` permits an explicit non-root caller to launch only the allowlisted
-/// `/sbin/admin` helper as root, with selected redirected streams; `SYS_GETCREDENTIALS`
-/// writes a bounded `{uid, gid}` record to the user buffer `(rdi, rsi)`; `SYS_PIPE` returns a
+/// `/sbin/admin` helper as root, with selected redirected streams; `SYS_GET_CALLER_CREDENTIALS`
+/// lets that helper retrieve the trusted credentials of the requesting process;
+/// `SYS_GETCREDENTIALS` writes a bounded `{uid, gid}` record to the user buffer `(rdi, rsi)`;
+/// `SYS_PIPE` returns a
 /// readable descriptor in `rax` and a writable descriptor in `rdx` for a bounded
 /// anonymous pipe; and `SYS_READ_NONBLOCK` has the same ABI as `SYS_READ` but returns
 /// `SYSCALL_EAGAIN` instead of yielding when a pipe has no data;
@@ -309,6 +313,7 @@ pub fn dispatch_syscall(pid: ProcessId, frame: &mut SyscallFrame) -> SyscallActi
         SYS_SPAWN_AS => SyscallAction::SpawnAs,
         SYS_SPAWN_PRIVILEGED => SyscallAction::SpawnPrivileged,
         SYS_GETCREDENTIALS => SyscallAction::GetCredentials,
+        SYS_GET_CALLER_CREDENTIALS => SyscallAction::GetCallerCredentials,
         SYS_WAITPID => SyscallAction::Wait,
         SYS_WAITPID_NONBLOCK => SyscallAction::WaitpidNonblocking,
         SYS_WRITE => SyscallAction::Write,
@@ -2324,6 +2329,7 @@ impl Thread {
             | SyscallAction::SpawnAs
             | SyscallAction::SpawnPrivileged
             | SyscallAction::GetCredentials
+            | SyscallAction::GetCallerCredentials
             | SyscallAction::Wait
             | SyscallAction::WaitpidNonblocking
             | SyscallAction::Write
@@ -2422,6 +2428,8 @@ pub struct Process {
     parent_pid: ProcessId,
     uid: UserId,
     gid: GroupId,
+    caller_uid: UserId,
+    caller_gid: GroupId,
     origin: &'static str,
     executable: &'static str,
     address_space: UserAddressSpace,
@@ -2498,6 +2506,8 @@ impl Process {
             None,
             uid,
             gid,
+            uid,
+            gid,
         )
     }
 
@@ -2511,6 +2521,8 @@ impl Process {
         fork_context: ForkContext,
         uid: UserId,
         gid: GroupId,
+        caller_uid: UserId,
+        caller_gid: GroupId,
     ) -> Self {
         Self::new_with_state(
             pid,
@@ -2522,6 +2534,8 @@ impl Process {
             Some(fork_context),
             uid,
             gid,
+            caller_uid,
+            caller_gid,
         )
     }
 
@@ -2535,6 +2549,8 @@ impl Process {
         fork_context: Option<ForkContext>,
         uid: UserId,
         gid: GroupId,
+        caller_uid: UserId,
+        caller_gid: GroupId,
     ) -> Self {
         let kernel_stack = vec![0; USER_KERNEL_STACK_SIZE].into_boxed_slice();
         let process = Self {
@@ -2542,6 +2558,8 @@ impl Process {
             parent_pid,
             uid,
             gid,
+            caller_uid,
+            caller_gid,
             origin,
             executable,
             address_space,
@@ -2591,6 +2609,10 @@ impl Process {
 
     fn credentials(&self) -> (UserId, GroupId) {
         (self.uid, self.gid)
+    }
+
+    fn caller_credentials(&self) -> (UserId, GroupId) {
+        (self.caller_uid, self.caller_gid)
     }
 
     fn is_root(&self) -> bool {
@@ -2920,6 +2942,7 @@ impl Process {
             SyscallAction::SpawnAs => {}
             SyscallAction::SpawnPrivileged => {}
             SyscallAction::GetCredentials => {}
+            SyscallAction::GetCallerCredentials => {}
             SyscallAction::Wait => {}
             SyscallAction::WaitpidNonblocking => {}
             SyscallAction::Write => {}
@@ -3296,6 +3319,7 @@ fn spawn_configured_process(
     stdin_fd: u64,
     stdout_fd: u64,
     credential_override: Option<(UserId, GroupId)>,
+    caller_override: Option<(UserId, GroupId)>,
 ) -> Result<ProcessId, SpawnError> {
     if !crate::scheduler::is_initialized() {
         return Err(SpawnError::Scheduler(
@@ -3311,6 +3335,7 @@ fn spawn_configured_process(
             unsafe { (&*pointer).credentials() }
         })
         .unwrap_or((ROOT_UID, ROOT_GID));
+    let caller_credentials = caller_override.unwrap_or(inherited_credentials);
     let (uid, gid) = credential_override.unwrap_or(inherited_credentials);
     let image = find_spawn_image(path, uid, gid)?;
     let pid = allocate_process_id()?;
@@ -3335,6 +3360,8 @@ fn spawn_configured_process(
         None,
         uid,
         gid,
+        caller_credentials.0,
+        caller_credentials.1,
     );
     let process = Box::leak(Box::new(process_value));
     register_runtime_process(process).map_err(SpawnError::Registry)?;
@@ -3365,7 +3392,7 @@ fn spawn_for_syscall(frame: &SyscallFrame) -> u64 {
         }
     };
 
-    match spawn_configured_process(&path[..path_length], frame.rsi, frame.rdx, None) {
+    match spawn_configured_process(&path[..path_length], frame.rsi, frame.rdx, None, None) {
         Ok(child_pid) => u64::from(child_pid),
         Err(SpawnError::ExecutableNotFound) => SYSCALL_ENOENT,
         Err(SpawnError::InvalidHandle) => SYSCALL_EBADF,
@@ -3415,6 +3442,7 @@ fn spawn_as_for_syscall(frame: &SyscallFrame) -> u64 {
         SPAWN_INHERIT_PARENT_FD,
         SPAWN_INHERIT_PARENT_FD,
         Some((uid, gid)),
+        None,
     ) {
         Ok(child_pid) => u64::from(child_pid),
         Err(SpawnError::ExecutableNotFound) => SYSCALL_ENOENT,
@@ -3452,11 +3480,16 @@ fn spawn_privileged_for_syscall(frame: &SyscallFrame) -> u64 {
         return SYSCALL_EPERM;
     }
 
+    // Preserve the unprivileged requester while the helper runs with root's effective identity.
+    // The helper cannot infer this relationship from its own credentials after the transition.
+    let caller_credentials = unsafe { (&*pointer).credentials() };
+
     match spawn_configured_process(
         &path[..path_length],
         frame.rsi,
         frame.rdx,
         Some((ROOT_UID, ROOT_GID)),
+        Some(caller_credentials),
     ) {
         Ok(child_pid) => u64::from(child_pid),
         Err(SpawnError::ExecutableNotFound) => SYSCALL_ENOENT,
@@ -3486,6 +3519,39 @@ fn credentials_for_syscall(frame: &mut SyscallFrame) {
     // stable for the duration of this syscall.
     let process = unsafe { &*pointer };
     let (uid, gid) = process.credentials();
+    let mut bytes = [0u8; CREDENTIALS_LENGTH];
+    bytes[..8].copy_from_slice(&u64::from(uid).to_le_bytes());
+    bytes[8..].copy_from_slice(&u64::from(gid).to_le_bytes());
+    if process
+        .address_space
+        .copy_to_user_bytes(frame.rdi, &bytes)
+        .is_err()
+    {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    }
+    frame.rax = CREDENTIALS_LENGTH as u64;
+}
+
+#[cfg(target_os = "none")]
+fn caller_credentials_for_syscall(frame: &mut SyscallFrame) {
+    if frame.rsi != CREDENTIALS_LENGTH as u64 {
+        frame.rax = SYSCALL_EINVAL;
+        return;
+    }
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    if !process.is_root() {
+        frame.rax = SYSCALL_EPERM;
+        return;
+    }
+    let (uid, gid) = process.caller_credentials();
     let mut bytes = [0u8; CREDENTIALS_LENGTH];
     bytes[..8].copy_from_slice(&u64::from(uid).to_le_bytes());
     bytes[8..].copy_from_slice(&u64::from(gid).to_le_bytes());
@@ -3581,7 +3647,9 @@ fn fork_for_syscall(frame: &mut SyscallFrame) -> u64 {
             address_space,
         )
     };
-    let (uid, gid) = unsafe { (&*parent_pointer).credentials() };
+    let parent = unsafe { &*parent_pointer };
+    let (uid, gid) = parent.credentials();
+    let (caller_uid, caller_gid) = parent.caller_credentials();
     let child = Box::leak(Box::new(Process::new_fork_child(
         child_pid,
         parent_pid,
@@ -3592,6 +3660,8 @@ fn fork_for_syscall(frame: &mut SyscallFrame) -> u64 {
         context,
         uid,
         gid,
+        caller_uid,
+        caller_gid,
     )));
     if register_runtime_process(child).is_err() {
         return SYSCALL_EAGAIN;
@@ -5800,6 +5870,10 @@ fn dispatch_user_syscall(frame: &mut SyscallFrame) -> SyscallAction {
             credentials_for_syscall(frame);
             SyscallAction::Return
         }
+        SyscallAction::GetCallerCredentials => {
+            caller_credentials_for_syscall(frame);
+            SyscallAction::Return
+        }
         SyscallAction::Pipe => {
             pipe_for_syscall(frame);
             SyscallAction::Return
@@ -6082,6 +6156,9 @@ pub extern "C" fn rustos_user_syscall_dispatch(frame: *mut SyscallFrame) -> u64 
         }
         SyscallAction::GetCredentials => {
             unreachable!("credentials syscall must be resolved before returning")
+        }
+        SyscallAction::GetCallerCredentials => {
+            unreachable!("caller credentials syscall must be resolved before returning")
         }
         SyscallAction::Pipe => unreachable!("pipe syscall must be resolved before returning"),
         SyscallAction::Wait => unreachable!("waitpid syscall must be resolved before returning"),
@@ -6626,6 +6703,16 @@ mod tests {
             SyscallAction::SpawnPrivileged
         );
         assert_eq!(privileged_spawn.rax, SYS_SPAWN_PRIVILEGED);
+
+        let mut caller_credentials = SyscallFrame {
+            rax: SYS_GET_CALLER_CREDENTIALS,
+            ..SyscallFrame::default()
+        };
+        assert_eq!(
+            dispatch_syscall(1, &mut caller_credentials),
+            SyscallAction::GetCallerCredentials
+        );
+        assert_eq!(caller_credentials.rax, SYS_GET_CALLER_CREDENTIALS);
     }
 
     #[test]

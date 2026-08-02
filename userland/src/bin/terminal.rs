@@ -134,6 +134,9 @@ pub extern "C" fn _start() -> ! {
     let mut admin_password_reported = false;
     let mut passwd_launch_reported = false;
     let mut passwd_output_reported = false;
+    let mut useradd_admin_password_reported = false;
+    let mut sudo_password_reported = false;
+    let mut sudo_auth_failed_reported = false;
     let mut useradd_username_reported = false;
     let mut useradd_password_reported = false;
     let mut useradd_confirm_reported = false;
@@ -265,6 +268,22 @@ pub extern "C" fn _start() -> ! {
                 write_stdout(b"terminal: admin password updated status=ready\n");
                 admin_password_reported = true;
             }
+            if !useradd_admin_password_reported && transcript.contains(b"useradd: admin password: ")
+            {
+                write_stdout(b"terminal: useradd admin password prompt=ready\n");
+                useradd_admin_password_reported = true;
+            }
+            if !sudo_password_reported && transcript.contains(b"sudo: password: ") {
+                write_stdout(b"terminal: sudo password prompt=ready\n");
+                sudo_password_reported = true;
+            }
+            if !sudo_auth_failed_reported
+                && (transcript.contains(b"admin: authorization denied status=denied")
+                    || transcript.contains(b"admin: authorization failed status=denied"))
+            {
+                write_stdout(b"terminal: sudo authentication failed status=denied\n");
+                sudo_auth_failed_reported = true;
+            }
             if !passwd_changed_reported && transcript.contains(b"passwd: changed status=ready") {
                 write_stdout(b"terminal: passwd changed status=ready\n");
                 passwd_changed_reported = true;
@@ -282,8 +301,10 @@ pub extern "C" fn _start() -> ! {
                 passwd_output_reported = true;
             }
             if bytes_contain(output, b"useradd: password: ")
+                || bytes_contain(output, b"useradd: admin password: ")
                 || bytes_contain(output, b"useradd: retype password: ")
                 || bytes_contain(output, b"lock: password: ")
+                || bytes_contain(output, b"sudo: password: ")
                 || bytes_contain(output, b"passwd: current password: ")
                 || bytes_contain(output, b"passwd: new password: ")
                 || bytes_contain(output, b"passwd: retype new password: ")

@@ -69,6 +69,11 @@ path = "src/bin/login.rs"
 test = false
 
 [[bin]]
+name = "shell-login"
+path = "src/bin/shell_login.rs"
+test = false
+
+[[bin]]
 name = "passwd"
 path = "src/bin/passwd.rs"
 test = false

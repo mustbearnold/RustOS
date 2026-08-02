@@ -37,7 +37,7 @@ const REPOSITORY_ROOT_SIGNING_KEY_BYTES: [u8; 32] = [
 ];
 const REPOSITORY_ROTATED_SIGNING_KEY_BYTES: [u8; 32] = [0x42; 32];
 const REPOSITORY_KEY_ROTATION_DOMAIN: &[u8] = b"RUSTOS.KEY.ROTATE\0";
-const USERLAND_BINARIES: [&str; 18] = [
+const USERLAND_BINARIES: [&str; 19] = [
     "init",
     "shell",
     "service",
@@ -49,6 +49,7 @@ const USERLAND_BINARIES: [&str; 18] = [
     "pkg",
     "admin",
     "login",
+    "shell-login",
     "passwd",
     "useradd",
     "lock",
@@ -505,6 +506,7 @@ fn build(release: bool) -> Result<(), String> {
     let pkg = read_userland_image(&userland, "pkg")?;
     let admin = read_userland_image(&userland, "admin")?;
     let login = read_userland_image(&userland, "login")?;
+    let shell_login = read_userland_image(&userland, "shell-login")?;
     let passwd = read_userland_image(&userland, "passwd")?;
     let useradd = read_userland_image(&userland, "useradd")?;
     let lock = read_userland_image(&userland, "lock")?;
@@ -513,10 +515,11 @@ fn build(release: bool) -> Result<(), String> {
     let window = read_userland_image(&userland, "window")?;
     let window_secondary = read_userland_image(&userland, "window-secondary")?;
 
-    let default_entries: [(&str, &[u8], u32); 19] = [
+    let default_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
+        ("sbin/shell-login", &shell_login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
         ("bin/useradd", &useradd, 0o100755),
         ("bin/lock", &lock, 0o100755),
@@ -534,10 +537,11 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/init.cfg", USER_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
     ];
-    let shell_entries: [(&str, &[u8], u32); 19] = [
+    let shell_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
+        ("sbin/shell-login", &shell_login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
         ("bin/useradd", &useradd, 0o100755),
         ("bin/lock", &lock, 0o100755),
@@ -555,10 +559,11 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/init.cfg", SHELL_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
     ];
-    let desktop_entries: [(&str, &[u8], u32); 20] = [
+    let desktop_entries: [(&str, &[u8], u32); 21] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
+        ("sbin/shell-login", &shell_login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
         ("bin/useradd", &useradd, 0o100755),
         ("bin/lock", &lock, 0o100755),
@@ -577,10 +582,11 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/init.cfg", DESKTOP_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
     ];
-    let recovery_entries: [(&str, &[u8], u32); 20] = [
+    let recovery_entries: [(&str, &[u8], u32); 21] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
+        ("sbin/shell-login", &shell_login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
         ("bin/useradd", &useradd, 0o100755),
         ("bin/lock", &lock, 0o100755),
@@ -1493,7 +1499,8 @@ fn run(
         || virtio_gpu_proof
         || terminal_proof
         || desktop_proof
-        || account_proof)
+        || account_proof
+        || (mode == ImageMode::Shell && keyboard_proof))
         .then(|| {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1884,8 +1891,10 @@ fn run(
                             .expect("desktop proof serial path exists")
                             .clone(),
                     )
+                } else if mode == ImageMode::Shell {
+                    spawn_keyboard_proof(path.clone(), screenshot.clone(), serial_path.clone())
                 } else {
-                    spawn_keyboard_proof(path.clone(), screenshot.clone())
+                    spawn_keyboard_proof(path.clone(), screenshot.clone(), None)
                 }
             });
     let mut result = run_command(&mut qemu, &format!("running the {firmware} image in QEMU"));
@@ -2063,7 +2072,11 @@ fn qemu_supports_virtio_gpu(binary: &OsStr) -> bool {
 }
 
 #[cfg(unix)]
-fn spawn_keyboard_proof(path: PathBuf, screenshot: PathBuf) -> JoinHandle<()> {
+fn spawn_keyboard_proof(
+    path: PathBuf,
+    screenshot: PathBuf,
+    serial: Option<PathBuf>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(20));
         let mut monitor = None;
@@ -2079,6 +2092,11 @@ fn spawn_keyboard_proof(path: PathBuf, screenshot: PathBuf) -> JoinHandle<()> {
         let Some(mut monitor) = monitor else {
             return;
         };
+        if let Some(serial) = serial.as_deref()
+            && !ensure_shell_login(&mut monitor, serial)
+        {
+            return;
+        }
         for command in ["sendkey n\n", "sendkey e\n", "sendkey t\n", "sendkey ret\n"] {
             if monitor.write_all(command.as_bytes()).is_err() {
                 return;
@@ -2097,8 +2115,6 @@ fn spawn_keyboard_proof(path: PathBuf, screenshot: PathBuf) -> JoinHandle<()> {
 #[cfg(unix)]
 fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> JoinHandle<()> {
     thread::spawn(move || {
-        let ready = wait_for_serial_markers(&serial, &["RustOS shell"], Duration::from_secs(90));
-        println!("shell proof: shell_ready={ready}");
         let mut monitor = None;
         for _ in 0..100 {
             match UnixStream::connect(&path) {
@@ -2112,6 +2128,11 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
         let Some(mut monitor) = monitor else {
             return;
         };
+        let ready = ensure_shell_login(&mut monitor, &serial);
+        println!("shell proof: shell_ready={ready}");
+        if !ready {
+            return;
+        }
         let steps = [
             ("id", "shell: credentials uid=1000 gid=1000 status=ready"),
             ("pwd", "shell: pwd path=/home/user status=ready"),
@@ -2138,7 +2159,6 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "write /etc/rustos/config.txt denied",
                 "shell: permission denied path=/etc/rustos/config.txt status=ready",
             ),
-            ("sudo state set", "sudo: state set status=ready"),
             ("state", "shell: state read status=ready"),
             ("sudo pkg install", "sudo: pkg install status=ready"),
             (
@@ -2152,6 +2172,32 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
             ("cd ..", "shell: cwd changed path=/ status=ready"),
             ("pwd", "shell: pwd path=/ status=ready"),
         ];
+        let denied = send_shell_privileged_command(
+            &mut monitor,
+            &serial,
+            "sudo state set",
+            "wrong",
+            1,
+            "admin: authorization failed status=denied",
+        );
+        println!("shell proof: privileged_denied={denied}");
+        if !denied {
+            let _ = monitor.write_all(b"quit\n");
+            return;
+        }
+        let allowed = send_shell_privileged_command(
+            &mut monitor,
+            &serial,
+            "sudo state set",
+            "rustos",
+            2,
+            "sudo: state set status=ready",
+        );
+        println!("shell proof: privileged_allowed={allowed}");
+        if !allowed {
+            let _ = monitor.write_all(b"quit\n");
+            return;
+        }
         for (command, marker) in steps {
             if !send_shell_command(&mut monitor, command) {
                 let _ = monitor.write_all(b"quit\n");
@@ -2162,6 +2208,17 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
             } else {
                 Duration::from_secs(30)
             };
+            if command == "sudo pkg install"
+                && (!wait_for_serial_occurrences(
+                    &serial,
+                    "sudo: password: ",
+                    3,
+                    Duration::from_secs(30),
+                ) || !send_shell_command(&mut monitor, "rustos"))
+            {
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
             let completed = wait_for_serial_markers(&serial, &[marker], timeout);
             println!("shell proof: command={command} completed={completed}");
             if !completed {
@@ -2194,6 +2251,58 @@ fn send_shell_command(monitor: &mut UnixStream, command: &str) -> bool {
         Duration::from_millis(80),
         Duration::from_millis(200),
     )
+}
+
+#[cfg(unix)]
+fn ensure_shell_login(monitor: &mut UnixStream, serial: &Path) -> bool {
+    let Some(first_marker) = wait_for_serial_any(
+        serial,
+        &[
+            "shell-login: account store setup required status=ready",
+            "RustOS shell",
+        ],
+        Duration::from_secs(90),
+    ) else {
+        println!("shell login proof: prompt=false");
+        return false;
+    };
+    if first_marker == 0 {
+        if !send_shell_command(monitor, "user")
+            || !send_shell_command(monitor, "rustos")
+            || !send_shell_command(monitor, "rustos")
+            || !wait_for_serial_markers(
+                serial,
+                &["shell-login: account store bootstrapped status=ready"],
+                Duration::from_secs(30),
+            )
+        {
+            println!("shell login proof: first-boot-setup=false");
+            return false;
+        }
+    }
+    let ready = wait_for_serial_markers(serial, &["RustOS shell"], Duration::from_secs(30));
+    println!("shell login proof: ready={ready}");
+    ready
+}
+
+#[cfg(unix)]
+fn send_shell_privileged_command(
+    monitor: &mut UnixStream,
+    serial: &Path,
+    command: &str,
+    password: &str,
+    prompt_occurrence: usize,
+    marker: &str,
+) -> bool {
+    send_shell_command(monitor, command)
+        && wait_for_serial_occurrences(
+            serial,
+            "sudo: password: ",
+            prompt_occurrence,
+            Duration::from_secs(30),
+        )
+        && send_shell_command(monitor, password)
+        && wait_for_serial_markers(serial, &[marker], Duration::from_secs(30))
 }
 
 #[cfg(unix)]
@@ -2295,11 +2404,6 @@ fn focus_terminal(monitor: &mut UnixStream) -> bool {
 #[cfg(unix)]
 fn spawn_pipe_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> JoinHandle<()> {
     thread::spawn(move || {
-        let ready = wait_for_serial_markers(&serial, &["RustOS shell"], Duration::from_secs(90));
-        println!("pipe proof: shell_ready={ready}");
-        if !ready {
-            return;
-        }
         let mut monitor = None;
         for _ in 0..100 {
             match UnixStream::connect(&path) {
@@ -2313,6 +2417,11 @@ fn spawn_pipe_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Join
         let Some(mut monitor) = monitor else {
             return;
         };
+        let ready = ensure_shell_login(&mut monitor, &serial);
+        println!("pipe proof: shell_ready={ready}");
+        if !ready {
+            return;
+        }
         if !send_shell_command(&mut monitor, "ps") {
             return;
         }
@@ -2604,6 +2713,10 @@ fn spawn_virtio_network_proof(
             return;
         };
 
+        if !ensure_shell_login(&mut monitor, &serial) {
+            return;
+        }
+
         let interface_count = if dual_network { 2 } else { 1 };
         let manager_marker = format!(
             "net: manager interfaces={} default=virtio0 backend=virtio routes=1 status=ready",
@@ -2778,6 +2891,10 @@ fn spawn_nvme_interrupt_proof(path: PathBuf, serial: PathBuf) -> JoinHandle<()> 
             return;
         };
 
+        if !ensure_shell_login(&mut monitor, &serial) {
+            return;
+        }
+
         let ready = wait_for_serial_markers(
             &serial,
             &[
@@ -2830,6 +2947,10 @@ fn spawn_ahci_interrupt_proof(path: PathBuf, serial: PathBuf) -> JoinHandle<()> 
         let Some(mut monitor) = monitor else {
             return;
         };
+
+        if !ensure_shell_login(&mut monitor, &serial) {
+            return;
+        }
 
         let ready = wait_for_serial_markers(
             &serial,
@@ -2884,8 +3005,7 @@ fn spawn_vm_proof(path: PathBuf, serial: PathBuf) -> JoinHandle<()> {
             return;
         };
 
-        let shell_ready =
-            wait_for_serial_markers(&serial, &["RustOS shell"], Duration::from_secs(30));
+        let shell_ready = ensure_shell_login(&mut monitor, &serial);
         let mut ready = false;
         if shell_ready {
             for command in ["sendkey v\n", "sendkey m\n", "sendkey ret\n"] {
@@ -3425,6 +3545,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
     let content = fs::read_to_string(serial)
         .map_err(|error| format!("reading shell proof serial {}: {error}", serial.display()))?;
     let required = [
+        "shell-login: account store ",
         "shell: credentials uid=1000 gid=1000 status=ready",
         "shell: pwd path=/home/user status=ready",
         "shell: cwd changed path=/home/user/work status=ready",
@@ -3434,6 +3555,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: ps status=ready",
         "shell: relative read path=/etc/rustos/config.txt status=ready",
         "shell: permission denied path=/etc/rustos/config.txt status=ready",
+        "admin: authorization failed status=denied",
         "sudo: state set status=ready",
         "shell: state read status=ready",
         "sudo: pkg install status=ready",
@@ -3475,7 +3597,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "shell proof: identity=true permissions=true privileged_admin=true cwd=true relative_write=true relative_read=true ls=true screenshot_bytes={} status=ready",
+        "shell proof: identity=true permissions=true privileged_denied=true privileged_admin=true cwd=true relative_write=true relative_read=true ls=true screenshot_bytes={} status=ready",
         screenshot_bytes.len()
     );
     Ok(())
@@ -3539,6 +3661,8 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
     let password_changed = content.contains("terminal: passwd changed status=ready")
         && content.contains("terminal: admin password updated status=ready");
     let account_created = content.contains("terminal: useradd account created status=ready");
+    let admin_password_prompt = content.contains("terminal: useradd admin password prompt=ready");
+    let non_admin_denied = content.contains("terminal: sudo authentication failed status=denied");
     let password_masked = content.contains("terminal: password input masked status=ready");
     let session_lock = content.contains("terminal: lock prompt=ready")
         && content.contains("terminal: lock authentication failed status=ready")
@@ -3572,11 +3696,14 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         && bootstrapped
         && password_changed
         && account_created
+        && admin_password_prompt
+        && non_admin_denied
         && password_masked
         && session_lock
         && authentication_failures >= 2
         && content.contains("login: username selected name=alice status=ready")
         && content.contains("login: authenticated username=alice status=ready")
+        && non_admin_denied
         && content.contains("desktop: credentials uid=1001 gid=1001 status=ready")
         && content.contains("login: session authenticated number=2 status=ready")
         && authenticated_sessions >= 2
@@ -3601,7 +3728,7 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         && logout_sessions >= 2;
     if (!first_boot_ready && !reload_ready) || screenshot_bytes == 0 {
         return Err(format!(
-            "account proof did not verify first-boot account setup, password mutation, multi-account login, session locking, or persistent reload: {}",
+            "account proof did not verify first-boot account setup, password mutation, multi-account login, session locking, authorization denial, or persistent reload: {}",
             serial.display()
         ));
     }
@@ -4124,6 +4251,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             let account_created = send_account_command(&mut monitor, "sudo useradd")
                 && wait_for_serial_markers(
                     &serial,
+                    &["terminal: useradd admin password prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "daily-use")
+                && wait_for_serial_markers(
+                    &serial,
                     &["terminal: useradd username prompt=ready"],
                     Duration::from_secs(30),
                 )
@@ -4227,6 +4360,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 return;
             }
             println!("account proof: alice_login=true");
+            let alice_denied = prove_non_admin_sudo_denied(&mut monitor, &serial);
+            println!("account proof: alice_privileged_denied={alice_denied}");
+            if !alice_denied {
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
         } else {
             if !send_login_command(&mut monitor, "user")
                 || !send_login_command(&mut monitor, "rustos")
@@ -4286,6 +4425,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 return;
             }
             println!("account proof: reloaded_multi_account_login=true");
+            let alice_denied = prove_non_admin_sudo_denied(&mut monitor, &serial);
+            println!("account proof: alice_privileged_denied={alice_denied}");
+            if !alice_denied {
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
         }
 
         let session_count = 2;
@@ -4333,6 +4478,22 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
 fn capture_account_proof_screenshot(monitor: &mut UnixStream, screenshot: &Path) {
     let _ = monitor.write_all(format!("screendump {}\n", screenshot.display()).as_bytes());
     thread::sleep(Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+fn prove_non_admin_sudo_denied(monitor: &mut UnixStream, serial: &Path) -> bool {
+    send_account_command(monitor, "sudo state set")
+        && wait_for_serial_markers(
+            serial,
+            &["terminal: sudo password prompt=ready"],
+            Duration::from_secs(30),
+        )
+        && send_account_input(monitor, "alice-pass")
+        && wait_for_serial_markers(
+            serial,
+            &["terminal: sudo authentication failed status=denied"],
+            Duration::from_secs(30),
+        )
 }
 
 #[cfg(unix)]
@@ -4441,7 +4602,11 @@ fn spawn_usb_hotplug_proof(
 }
 
 #[cfg(not(unix))]
-fn spawn_keyboard_proof(_path: PathBuf, _screenshot: PathBuf) -> JoinHandle<()> {
+fn spawn_keyboard_proof(
+    _path: PathBuf,
+    _screenshot: PathBuf,
+    _serial: Option<PathBuf>,
+) -> JoinHandle<()> {
     thread::spawn(|| {})
 }
 
@@ -5199,7 +5364,7 @@ fn ovmf_path() -> Result<PathBuf, String> {
 }
 
 const USER_INIT_CONFIG: &[u8] = b"/bin/service|0\0/bin/worker|0\0/bin/restart|1\0";
-const SHELL_INIT_CONFIG: &[u8] = b"/bin/sh|0|1000|1000\0";
+const SHELL_INIT_CONFIG: &[u8] = b"/sbin/shell-login|0|0|0\0";
 const DESKTOP_INIT_CONFIG: &[u8] = b"/sbin/login|0|0|0\0";
 const RECOVERY_MARKER_CONTENT: &[u8] = b"recovery=1\n";
 const USER_CONFIG_CONTENT: &[u8] = b"cfg=RustOS\n";

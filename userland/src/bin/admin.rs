@@ -2,21 +2,22 @@
 #![no_main]
 
 use rustos_userland::{
-    SPAWN_INHERIT_PARENT_FD,
+    CREDENTIALS_LENGTH, Credentials, SPAWN_INHERIT_PARENT_FD,
     accounts::{
         ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, ACCOUNT_USERNAME_LENGTH, AccountStore,
         MAX_ACCOUNTS, add_account, parse, serialize, update_password, valid_username,
         verify_password,
     },
-    close, exit, is_syscall_error, mkdir, open, open_create_write, open_write, pipe, read,
-    spawn_redirected, waitpid, write, write_stdout,
+    close, exit, get_caller_credentials, is_syscall_error, mkdir, open, open_create_write,
+    open_write, pipe, read, spawn_redirected, waitpid, write, write_stdout,
 };
 
 const STDIN_FD: u64 = 0;
 const FIXED_REQUEST_LENGTH: usize = 8;
 const PASSWORD_REQUEST_TAIL_LENGTH: usize = 8 + 32 + 32;
-const ADD_ACCOUNT_REQUEST_TAIL_LENGTH: usize = ACCOUNT_USERNAME_LENGTH + 32;
+const ADD_ACCOUNT_REQUEST_TAIL_LENGTH: usize = 32 + ACCOUNT_USERNAME_LENGTH + 32;
 const AUTH_REQUEST_TAIL_LENGTH: usize = 8 + 32;
+const AUTH_DIGEST_LENGTH: usize = 32;
 const ACCOUNT_WRITE_CHUNK_LENGTH: usize = 256;
 const PACKAGE_PATH: &[u8] = b"/bin/pkg\0";
 const STATE_PATH: &[u8] = b"/RUSTOS.ST\0";
@@ -33,6 +34,10 @@ const REQUEST_AUTHENTICATE: [u8; FIXED_REQUEST_LENGTH] = *b"AUTH\0\0\0\0";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    let Some(caller) = caller_credentials() else {
+        write_stdout(b"admin: caller credentials unavailable status=denied\n");
+        exit(1);
+    };
     let mut request = [0u8; FIXED_REQUEST_LENGTH];
     if !read_exact(STDIN_FD, &mut request) {
         write_stdout(b"admin: request invalid\n");
@@ -40,15 +45,23 @@ pub extern "C" fn _start() -> ! {
     }
 
     let status = if request == REQUEST_PASSWORD {
-        change_password()
+        change_password(caller)
     } else if request == REQUEST_ADD_ACCOUNT {
-        add_account_request()
+        add_account_request(caller)
     } else if request == REQUEST_AUTHENTICATE {
-        authenticate_request()
+        authenticate_request(caller)
     } else if request == REQUEST_STATE_SET {
-        write_state()
+        if authorize_admin_request(caller) {
+            write_state()
+        } else {
+            40
+        }
     } else if is_package_request(&request) {
-        run_package_manager(&request)
+        if authorize_admin_request(caller) {
+            run_package_manager(&request)
+        } else {
+            41
+        }
     } else {
         write_stdout(b"admin: request denied\n");
         3
@@ -93,7 +106,7 @@ fn run_package_manager(request: &[u8; FIXED_REQUEST_LENGTH]) -> i64 {
     0
 }
 
-fn change_password() -> i64 {
+fn change_password(caller: Credentials) -> i64 {
     let mut tail = [0u8; PASSWORD_REQUEST_TAIL_LENGTH];
     if !read_exact(STDIN_FD, &mut tail) {
         write_stdout(b"admin: password request invalid\n");
@@ -103,6 +116,10 @@ fn change_password() -> i64 {
     let mut uid_bytes = [0u8; 8];
     uid_bytes.copy_from_slice(&tail[..8]);
     let uid = u64::from_le_bytes(uid_bytes);
+    if caller.uid != 0 && caller.uid != uid {
+        write_stdout(b"admin: authorization denied status=denied\n");
+        return 16;
+    }
     let mut old_digest = [0u8; 32];
     old_digest.copy_from_slice(&tail[8..40]);
     let mut new_digest = [0u8; 32];
@@ -135,24 +152,31 @@ fn change_password() -> i64 {
     0
 }
 
-fn add_account_request() -> i64 {
+fn add_account_request(caller: Credentials) -> i64 {
     let mut tail = [0u8; ADD_ACCOUNT_REQUEST_TAIL_LENGTH];
     if !read_exact(STDIN_FD, &mut tail) {
         write_stdout(b"admin: account request invalid\n");
         return 20;
     }
-    let username_length = tail[..ACCOUNT_USERNAME_LENGTH]
+    let mut admin_digest = [0u8; AUTH_DIGEST_LENGTH];
+    admin_digest.copy_from_slice(&tail[..AUTH_DIGEST_LENGTH]);
+    if !authorize_admin(caller, &admin_digest) {
+        return 28;
+    }
+    let username_start = AUTH_DIGEST_LENGTH;
+    let username_end = username_start + ACCOUNT_USERNAME_LENGTH;
+    let username_length = tail[username_start..username_end]
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(ACCOUNT_USERNAME_LENGTH);
-    let username = &tail[..username_length];
+    let username = &tail[username_start..username_start + username_length];
     if username.is_empty() || !valid_username(username) || username_length > ACCOUNT_USERNAME_LENGTH
     {
         write_stdout(b"admin: account username invalid\n");
         return 21;
     }
     let mut password_digest = [0u8; 32];
-    password_digest.copy_from_slice(&tail[ACCOUNT_USERNAME_LENGTH..]);
+    password_digest.copy_from_slice(&tail[username_end..]);
     let Some(mut store) = read_store() else {
         write_stdout(b"admin: account store unavailable\n");
         return 22;
@@ -188,7 +212,7 @@ fn add_account_request() -> i64 {
     0
 }
 
-fn authenticate_request() -> i64 {
+fn authenticate_request(caller: Credentials) -> i64 {
     let mut tail = [0u8; AUTH_REQUEST_TAIL_LENGTH];
     if !read_exact(STDIN_FD, &mut tail) {
         write_stdout(b"admin: authentication request invalid\n");
@@ -197,6 +221,10 @@ fn authenticate_request() -> i64 {
     let mut uid_bytes = [0u8; 8];
     uid_bytes.copy_from_slice(&tail[..8]);
     let uid = u64::from_le_bytes(uid_bytes);
+    if caller.uid != 0 && caller.uid != uid {
+        write_stdout(b"admin: authorization denied status=denied\n");
+        return 33;
+    }
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&tail[8..]);
     let Some(store) = read_store() else {
@@ -248,6 +276,40 @@ fn read_store() -> Option<AccountStore> {
         return None;
     }
     parse(&bytes[..length])
+}
+
+fn caller_credentials() -> Option<Credentials> {
+    let mut credentials = Credentials::default();
+    (get_caller_credentials(&mut credentials) == CREDENTIALS_LENGTH as u64).then_some(credentials)
+}
+
+fn authorize_admin_request(caller: Credentials) -> bool {
+    let mut digest = [0u8; AUTH_DIGEST_LENGTH];
+    if !read_exact(STDIN_FD, &mut digest) {
+        write_stdout(b"admin: authorization request invalid status=denied\n");
+        return false;
+    }
+    authorize_admin(caller, &digest)
+}
+
+fn authorize_admin(caller: Credentials, digest: &[u8; AUTH_DIGEST_LENGTH]) -> bool {
+    if caller.uid == 0 {
+        return true;
+    }
+    if caller.uid != 1000 {
+        write_stdout(b"admin: authorization denied status=denied\n");
+        return false;
+    }
+    let Some(store) = read_store() else {
+        write_stdout(b"admin: account store unavailable status=denied\n");
+        return false;
+    };
+    if verify_password(&store, 1000, digest) {
+        true
+    } else {
+        write_stdout(b"admin: authorization failed status=denied\n");
+        false
+    }
 }
 
 fn write_store(accounts: &AccountStore) -> bool {

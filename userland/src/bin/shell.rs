@@ -4,7 +4,7 @@
 use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, NET_MAX_BUFFER_LENGTH, NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE,
     OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SPAWN_INHERIT_FD,
-    accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse},
+    accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse, password_digest},
     close, exit, get_credentials, is_permission_error, is_syscall_error, list_files,
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
     open_with_flags, open_write,
@@ -23,6 +23,7 @@ const ADMIN_PATH: &[u8] = b"/sbin/admin\0";
 const ADMIN_STATE_SET: [u8; PACKAGE_REQUEST_LENGTH] = *b"STATESET";
 const PACKAGE_REQUEST_PATH: &[u8] = b"/VAR/PKG/REQUEST\0";
 const PACKAGE_REQUEST_LENGTH: usize = 8;
+const AUTH_DIGEST_LENGTH: usize = 32;
 const PACKAGE_REQUEST_INSTALL: [u8; PACKAGE_REQUEST_LENGTH] = *b"INSTALL\0";
 const PACKAGE_REQUEST_UPDATE: [u8; PACKAGE_REQUEST_LENGTH] = *b"UPDATE\0\0";
 const PACKAGE_REQUEST_ROLLBACK: [u8; PACKAGE_REQUEST_LENGTH] = *b"ROLLBACK";
@@ -927,6 +928,13 @@ fn run_package_manager(request: Option<&[u8; PACKAGE_REQUEST_LENGTH]>) {
 }
 
 fn run_privileged(request: &[u8; PACKAGE_REQUEST_LENGTH], label: &[u8]) {
+    let mut skip_lf = false;
+    let mut password = [0u8; 64];
+    let password_length = read_secret_line(b"sudo: password: ", &mut password, &mut skip_lf);
+    let digest = password_digest(&password[..password_length]);
+    let mut authenticated_request = [0u8; PACKAGE_REQUEST_LENGTH + AUTH_DIGEST_LENGTH];
+    authenticated_request[..PACKAGE_REQUEST_LENGTH].copy_from_slice(request);
+    authenticated_request[PACKAGE_REQUEST_LENGTH..].copy_from_slice(&digest);
     let handles = pipe();
     if is_syscall_error(handles.read) || is_syscall_error(handles.write) {
         write_stdout(b"sudo: pipe failed\n");
@@ -943,10 +951,10 @@ fn run_privileged(request: &[u8; PACKAGE_REQUEST_LENGTH], label: &[u8]) {
         write_stdout(b"sudo: helper unavailable\n");
         return;
     }
-    let count = write(handles.write, request);
+    let count = write(handles.write, &authenticated_request);
     let _ = close(handles.write);
     let _ = close(handles.read);
-    if is_syscall_error(count) || count != PACKAGE_REQUEST_LENGTH as u64 {
+    if is_syscall_error(count) || count != authenticated_request.len() as u64 {
         write_stdout(b"sudo: request failed\n");
         return;
     }
@@ -958,6 +966,42 @@ fn run_privileged(request: &[u8; PACKAGE_REQUEST_LENGTH], label: &[u8]) {
     write_stdout(b"sudo: ");
     write_stdout(label);
     write_stdout(b" status=ready\n");
+}
+
+fn read_secret_line(prompt: &[u8], buffer: &mut [u8], skip_lf: &mut bool) -> usize {
+    write_stdout(prompt);
+    let mut length = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        let count = read(STDIN_FD, &mut byte);
+        if is_syscall_error(count) {
+            exit(1);
+        }
+        if count == 0 {
+            yield_now();
+            continue;
+        }
+        let byte = byte[0];
+        if *skip_lf && byte == b'\n' {
+            *skip_lf = false;
+            continue;
+        }
+        *skip_lf = false;
+        if byte == b'\r' || byte == b'\n' {
+            *skip_lf = byte == b'\r';
+            write_stdout(b"\n");
+            return length;
+        }
+        if byte == 8 || byte == 127 {
+            length = length.saturating_sub(1);
+            continue;
+        }
+        if !(0x20..=0x7e).contains(&byte) || length + 1 >= buffer.len() {
+            continue;
+        }
+        buffer[length] = byte;
+        length += 1;
+    }
 }
 
 fn write_package_request(request: &[u8; PACKAGE_REQUEST_LENGTH]) -> bool {

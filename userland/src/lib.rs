@@ -59,6 +59,7 @@ pub const SYS_PATH_INFO: u64 = 51;
 pub const SYS_GETCREDENTIALS: u64 = 52;
 pub const SYS_SPAWN_AS: u64 = 53;
 pub const SYS_SPAWN_PRIVILEGED: u64 = 54;
+pub const SYS_GET_CALLER_CREDENTIALS: u64 = 55;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_CREATE: u64 = 2;
 pub const SPAWN_INHERIT_FD: u64 = u64::MAX;
@@ -286,6 +287,17 @@ pub fn spawn_privileged_redirected(path: &[u8], stdin_fd: u64, stdout_fd: u64) -
 pub fn get_credentials(credentials: &mut Credentials) -> u64 {
     syscall(
         SYS_GETCREDENTIALS,
+        credentials as *mut Credentials as u64,
+        CREDENTIALS_LENGTH as u64,
+        0,
+    )
+    .rax
+}
+
+#[inline]
+pub fn get_caller_credentials(credentials: &mut Credentials) -> u64 {
+    syscall(
+        SYS_GET_CALLER_CREDENTIALS,
         credentials as *mut Credentials as u64,
         CREDENTIALS_LENGTH as u64,
         0,
