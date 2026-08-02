@@ -37,7 +37,7 @@ const REPOSITORY_ROOT_SIGNING_KEY_BYTES: [u8; 32] = [
 ];
 const REPOSITORY_ROTATED_SIGNING_KEY_BYTES: [u8; 32] = [0x42; 32];
 const REPOSITORY_KEY_ROTATION_DOMAIN: &[u8] = b"RUSTOS.KEY.ROTATE\0";
-const USERLAND_BINARIES: [&str; 16] = [
+const USERLAND_BINARIES: [&str; 18] = [
     "init",
     "shell",
     "service",
@@ -50,6 +50,8 @@ const USERLAND_BINARIES: [&str; 16] = [
     "admin",
     "login",
     "passwd",
+    "useradd",
+    "lock",
     "desktop",
     "terminal",
     "window",
@@ -504,16 +506,20 @@ fn build(release: bool) -> Result<(), String> {
     let admin = read_userland_image(&userland, "admin")?;
     let login = read_userland_image(&userland, "login")?;
     let passwd = read_userland_image(&userland, "passwd")?;
+    let useradd = read_userland_image(&userland, "useradd")?;
+    let lock = read_userland_image(&userland, "lock")?;
     let desktop = read_userland_image(&userland, "desktop")?;
     let terminal = read_userland_image(&userland, "terminal")?;
     let window = read_userland_image(&userland, "window")?;
     let window_secondary = read_userland_image(&userland, "window-secondary")?;
 
-    let default_entries: [(&str, &[u8], u32); 18] = [
+    let default_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
+        ("bin/useradd", &useradd, 0o100755),
+        ("bin/lock", &lock, 0o100755),
         ("bin/sh", &shell, 0o100755),
         ("bin/service", &service, 0o100755),
         ("bin/worker", &worker, 0o100755),
@@ -529,11 +535,13 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
         ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let shell_entries: [(&str, &[u8], u32); 18] = [
+    let shell_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
+        ("bin/useradd", &useradd, 0o100755),
+        ("bin/lock", &lock, 0o100755),
         ("bin/sh", &shell, 0o100755),
         ("bin/service", &service, 0o100755),
         ("bin/worker", &worker, 0o100755),
@@ -549,11 +557,13 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
         ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let desktop_entries: [(&str, &[u8], u32); 19] = [
+    let desktop_entries: [(&str, &[u8], u32); 21] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
+        ("bin/useradd", &useradd, 0o100755),
+        ("bin/lock", &lock, 0o100755),
         ("bin/sh", &shell, 0o100755),
         ("bin/service", &service, 0o100755),
         ("bin/worker", &worker, 0o100755),
@@ -570,11 +580,13 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
         ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let recovery_entries: [(&str, &[u8], u32); 19] = [
+    let recovery_entries: [(&str, &[u8], u32); 21] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
         ("bin/passwd", &passwd, 0o100755),
+        ("bin/useradd", &useradd, 0o100755),
+        ("bin/lock", &lock, 0o100755),
         ("bin/sh", &shell, 0o100755),
         ("bin/service", &service, 0o100755),
         ("bin/worker", &worker, 0o100755),
@@ -1154,7 +1166,7 @@ fn read_userland_image(artifacts: &[PathBuf], binary: &str) -> Result<Vec<u8>, S
 }
 
 fn build_initramfs(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
-    const MAX_ARCHIVE_SIZE: usize = 384 * 1024;
+    const MAX_ARCHIVE_SIZE: usize = 512 * 1024;
 
     let mut archive = Vec::new();
     for (path, data, mode) in entries.iter().copied() {
@@ -2194,6 +2206,17 @@ fn send_account_command(monitor: &mut UnixStream, command: &str) -> bool {
         monitor,
         command,
         true,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+}
+
+#[cfg(unix)]
+fn send_account_input(monitor: &mut UnixStream, input: &str) -> bool {
+    send_interactive_command(
+        monitor,
+        input,
+        false,
         Duration::from_secs(2),
         Duration::from_secs(2),
     )
@@ -3502,6 +3525,12 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
     let loaded = content.contains("login: account store loaded status=ready");
     let password_changed = content.contains("terminal: passwd changed status=ready")
         && content.contains("terminal: admin password updated status=ready");
+    let account_created = content.contains("terminal: useradd account created status=ready");
+    let password_masked = content.contains("terminal: password input masked status=ready");
+    let session_lock = content.contains("terminal: lock prompt=ready")
+        && content.contains("terminal: lock authentication failed status=ready")
+        && content.contains("terminal: lock unlocked status=ready")
+        && content.contains("terminal: lock command status=ready");
     let authentication_failures = content.matches("login: authentication failed").count();
     let authenticated_sessions = content
         .matches("login: session authenticated number=")
@@ -3528,7 +3557,13 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         .len();
     let first_boot_ready = bootstrapped
         && password_changed
+        && account_created
+        && password_masked
+        && session_lock
         && authentication_failures >= 2
+        && content.contains("login: username selected name=alice status=ready")
+        && content.contains("login: authenticated username=alice status=ready")
+        && content.contains("desktop: credentials uid=1001 gid=1001 status=ready")
         && content.contains("login: session authenticated number=2 status=ready")
         && authenticated_sessions >= 2
         && desktop_sessions >= 2
@@ -3537,15 +3572,22 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         && logout_sessions >= 2;
     let reload_ready = loaded
         && authentication_failures >= 1
+        && content.contains("login: username selected name=alice status=ready")
+        && content.contains("login: username selected name=user status=ready")
+        && content.contains("login: authenticated username=alice status=ready")
+        && content.contains("login: authenticated username=user status=ready")
+        && content.contains("desktop: credentials uid=1001 gid=1001 status=ready")
+        && content.contains("desktop: credentials uid=1000 gid=1000 status=ready")
         && content.contains("login: session authenticated number=1 status=ready")
-        && authenticated_sessions >= 1
-        && desktop_sessions >= 1
-        && terminal_logouts >= 1
-        && client_reaps >= 1
-        && logout_sessions >= 1;
+        && content.contains("login: session authenticated number=2 status=ready")
+        && authenticated_sessions >= 2
+        && desktop_sessions >= 2
+        && terminal_logouts >= 2
+        && client_reaps >= 2
+        && logout_sessions >= 2;
     if (!first_boot_ready && !reload_ready) || screenshot_bytes == 0 {
         return Err(format!(
-            "account proof did not verify password mutation or persistent reload: {}",
+            "account proof did not verify password mutation, multi-account login, session locking, or persistent reload: {}",
             serial.display()
         ));
     }
@@ -3555,9 +3597,12 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         "loaded"
     };
     println!(
-        "account proof: store={} password_changed={} old_password_rejected={} sessions={} desktop_sessions={} terminal_logouts={} client_reaps={} logout_sessions={} screenshot_bytes={} status=ready",
+        "account proof: store={} password_changed={} account_created={} password_masked={} session_lock={} old_password_rejected={} sessions={} desktop_sessions={} terminal_logouts={} client_reaps={} logout_sessions={} screenshot_bytes={} status=ready",
         store,
         password_changed,
+        account_created,
+        password_masked,
+        session_lock,
         authentication_failures >= if bootstrapped { 2 } else { 1 },
         authenticated_sessions,
         desktop_sessions,
@@ -3978,19 +4023,19 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                     &["terminal: passwd current prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_account_command(&mut monitor, "rustos")
+                || !send_account_input(&mut monitor, "rustos")
                 || !wait_for_serial_markers(
                     &serial,
                     &["terminal: passwd new prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_account_command(&mut monitor, "daily-use")
+                || !send_account_input(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &["terminal: passwd confirm prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_account_command(&mut monitor, "daily-use")
+                || !send_account_input(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &[
@@ -4006,7 +4051,64 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 return;
             }
             println!("account proof: password_change=true");
-            if !send_account_command(&mut monitor, "exit")
+            let account_created = send_account_command(&mut monitor, "sudo useradd")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: useradd username prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_command(&mut monitor, "alice")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: useradd password prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "alice-pass")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: useradd confirm prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "alice-pass")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: useradd account created status=ready"],
+                    Duration::from_secs(30),
+                );
+            println!("account proof: account_created={account_created}");
+            if !account_created {
+                capture_account_proof_screenshot(&mut monitor, &screenshot);
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
+            let session_lock = send_account_command(&mut monitor, "lock")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: lock prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "wrong")
+                && wait_for_serial_markers(
+                    &serial,
+                    &["terminal: lock authentication failed status=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "daily-use")
+                && wait_for_serial_markers(
+                    &serial,
+                    &[
+                        "terminal: lock unlocked status=ready",
+                        "terminal: lock command status=ready",
+                    ],
+                    Duration::from_secs(30),
+                );
+            println!("account proof: session_lock={session_lock}");
+            if !session_lock {
+                capture_account_proof_screenshot(&mut monitor, &screenshot);
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
+            if !send_account_input(&mut monitor, "exit")
                 || !wait_for_serial_occurrences(
                     &serial,
                     "desktop: session clients reaped status=ready",
@@ -4038,19 +4140,23 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 return;
             }
             println!("account proof: old_password_rejected=true");
-            if !send_login_command(&mut monitor, "user")
-                || !send_login_command(&mut monitor, "daily-use")
+            if !send_login_command(&mut monitor, "alice")
+                || !send_login_command(&mut monitor, "alice-pass")
                 || !wait_for_serial_markers(
                     &serial,
-                    &["login: session authenticated number=2 status=ready"],
+                    &[
+                        "login: username selected name=alice status=ready",
+                        "login: authenticated username=alice status=ready",
+                        "login: session authenticated number=2 status=ready",
+                    ],
                     Duration::from_secs(30),
                 )
             {
-                println!("account proof: new_password_login=false");
+                println!("account proof: alice_login=false");
                 let _ = monitor.write_all(b"quit\n");
                 return;
             }
-            println!("account proof: new_password_login=true");
+            println!("account proof: alice_login=true");
         } else {
             if !send_login_command(&mut monitor, "user")
                 || !send_login_command(&mut monitor, "rustos")
@@ -4060,28 +4166,60 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                     1,
                     Duration::from_secs(30),
                 )
-                || !send_login_command(&mut monitor, "user")
-                || !send_login_command(&mut monitor, "daily-use")
-                || !wait_for_serial_markers(
-                    &serial,
-                    &["login: session authenticated number=1 status=ready"],
-                    Duration::from_secs(30),
-                )
             {
                 println!("account proof: reloaded_password_login=false");
                 let _ = monitor.write_all(b"quit\n");
                 return;
             }
-            println!("account proof: reloaded_password_login=true");
+            println!("account proof: reloaded_old_password_rejected=true");
+            if !send_login_command(&mut monitor, "alice")
+                || !send_login_command(&mut monitor, "alice-pass")
+                || !wait_for_serial_markers(
+                    &serial,
+                    &[
+                        "login: username selected name=alice status=ready",
+                        "login: authenticated username=alice status=ready",
+                        "login: session authenticated number=1 status=ready",
+                        "desktop: credentials uid=1001 gid=1001 status=ready",
+                        "desktop: compositor framebuffer=ready scene=ready status=ready",
+                        "terminal: client surface=ready shell=spawned focus=ready status=ready",
+                    ],
+                    Duration::from_secs(90),
+                )
+                || !send_account_input(&mut monitor, "exit")
+                || !wait_for_serial_occurrences(
+                    &serial,
+                    "desktop: session clients reaped status=ready",
+                    1,
+                    Duration::from_secs(30),
+                )
+                || !wait_for_serial_occurrences(
+                    &serial,
+                    "login: session exited status=ready",
+                    1,
+                    Duration::from_secs(30),
+                )
+                || !send_login_command(&mut monitor, "user")
+                || !send_login_command(&mut monitor, "daily-use")
+                || !wait_for_serial_markers(
+                    &serial,
+                    &[
+                        "login: username selected name=user status=ready",
+                        "login: authenticated username=user status=ready",
+                        "login: session authenticated number=2 status=ready",
+                    ],
+                    Duration::from_secs(30),
+                )
+            {
+                println!("account proof: reloaded_multi_account_login=false");
+                let _ = monitor.write_all(b"quit\n");
+                return;
+            }
+            println!("account proof: reloaded_multi_account_login=true");
         }
 
-        let session_count = if first_boot { 2 } else { 1 };
+        let session_count = 2;
         let desktop_ready = wait_for_serial_occurrences(
-            &serial,
-            "desktop: credentials uid=1000 gid=1000 status=ready",
-            session_count,
-            Duration::from_secs(90),
-        ) && wait_for_serial_occurrences(
             &serial,
             "desktop: compositor framebuffer=ready scene=ready status=ready",
             session_count,
@@ -4091,6 +4229,11 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             "terminal: client surface=ready shell=spawned focus=ready status=ready",
             session_count,
             Duration::from_secs(90),
+        ) && wait_for_serial_occurrences(
+            &serial,
+            "terminal: shell output received status=ready",
+            session_count,
+            Duration::from_secs(90),
         );
         println!("account proof: desktop_ready={desktop_ready}");
         if desktop_ready {
@@ -4098,7 +4241,7 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             thread::sleep(Duration::from_secs(1));
         }
         let logged_out = desktop_ready
-            && send_account_command(&mut monitor, "exit")
+            && send_account_input(&mut monitor, "exit")
             && wait_for_serial_occurrences(
                 &serial,
                 "desktop: session clients reaped status=ready",

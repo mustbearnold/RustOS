@@ -3,9 +3,11 @@
 
 use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, NET_MAX_BUFFER_LENGTH, NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE,
-    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SPAWN_INHERIT_FD, close, exit,
-    get_credentials, is_permission_error, is_syscall_error, list_files, list_processes, mkdir,
-    net_info, net_interfaces, net_receive, net_renew, net_send, open, open_with_flags, open_write,
+    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SPAWN_INHERIT_FD,
+    accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse},
+    close, exit, get_credentials, is_permission_error, is_syscall_error, list_files,
+    list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
+    open_with_flags, open_write,
     path::{MAX_PATH_LENGTH, PathBuf, resolve},
     path_info, pipe, poweroff, read, reboot, spawn, spawn_privileged_redirected, spawn_redirected,
     suspend, waitpid, write, write_stdout, yield_now,
@@ -35,6 +37,9 @@ const NETWORK_PROBE_REQUEST: &[u8] = b"RUSTOS.REP2\0";
 const WORKER_PATH: &[u8] = b"/bin/worker\0";
 const CAT_PATH: &[u8] = b"/bin/cat\0";
 const PASSWD_PATH: &[u8] = b"/bin/passwd\0";
+const USERADD_PATH: &[u8] = b"/bin/useradd\0";
+const LOCK_PATH: &[u8] = b"/bin/lock\0";
+const ACCOUNT_READ_CHUNK_LENGTH: usize = 256;
 
 struct ShellState {
     cwd: PathBuf,
@@ -133,7 +138,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -159,6 +164,12 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"passwd" {
         run_password_change();
+        write_prompt(recovery_mode, state);
+    } else if line == b"useradd" || line == b"sudo useradd" {
+        run_user_add();
+        write_prompt(recovery_mode, state);
+    } else if line == b"lock" {
+        run_lock();
         write_prompt(recovery_mode, state);
     } else if let Some(path) = argument_after(line, b"run ") {
         run_external(state, path);
@@ -336,15 +347,49 @@ fn run_pipeline(left: &[u8], right: &[u8]) {
 }
 
 fn initialize_home(state: &mut ShellState) {
-    if let Some(home) = resolve(&PathBuf::root(), b"/home") {
-        make_directory_absolute(&home);
+    let home = current_home_path();
+    if let Some(parent) = resolve(&PathBuf::root(), b"/home") {
+        make_directory_absolute(&parent);
     }
-    if let Some(user_home) = resolve(&PathBuf::root(), b"/home/user") {
-        make_directory_absolute(&user_home);
-        if path_kind(&user_home) == Some(PATH_KIND_DIRECTORY) {
-            state.cwd = user_home;
+    make_directory_absolute(&home);
+    if path_kind(&home) == Some(PATH_KIND_DIRECTORY) {
+        state.cwd = home;
+    }
+}
+
+fn current_home_path() -> PathBuf {
+    let mut credentials = Credentials::default();
+    let uid = if get_credentials(&mut credentials) == CREDENTIALS_LENGTH as u64 {
+        credentials.uid
+    } else {
+        1000
+    };
+    let mut bytes = [0u8; MAX_PATH_LENGTH];
+    let prefix = b"/home/";
+    bytes[..prefix.len()].copy_from_slice(prefix);
+    let component = if uid == 1000 {
+        b"user".as_slice()
+    } else {
+        let mut digits = [0u8; 20];
+        let mut length = 0;
+        let mut value = uid;
+        loop {
+            digits[length] = b'0' + (value % 10) as u8;
+            length += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
         }
-    }
+        for (index, byte) in digits[..length].iter().rev().copied().enumerate() {
+            bytes[prefix.len() + index] = byte;
+        }
+        return resolve(&PathBuf::root(), &bytes[..prefix.len() + length])
+            .unwrap_or_else(PathBuf::root);
+    };
+    bytes[prefix.len()..prefix.len() + component.len()].copy_from_slice(component);
+    resolve(&PathBuf::root(), &bytes[..prefix.len() + component.len()])
+        .unwrap_or_else(PathBuf::root)
 }
 
 fn path_kind(path: &PathBuf) -> Option<u64> {
@@ -427,6 +472,36 @@ fn run_password_change() {
         write_stdout(b"shell: passwd status=failed\n");
     } else {
         write_stdout(b"shell: passwd status=ready\n");
+    }
+}
+
+fn run_user_add() {
+    write_stdout(b"shell: useradd launch status=ready\n");
+    let pid = spawn(USERADD_PATH);
+    if is_syscall_error(pid) {
+        write_stdout(b"useradd: unavailable\n");
+        return;
+    }
+    let result = waitpid(pid);
+    if is_syscall_error(result.pid) || result.status != 0 {
+        write_stdout(b"shell: useradd status=failed\n");
+    } else {
+        write_stdout(b"shell: useradd status=ready\n");
+    }
+}
+
+fn run_lock() {
+    write_stdout(b"shell: lock launch status=ready\n");
+    let pid = spawn(LOCK_PATH);
+    if is_syscall_error(pid) {
+        write_stdout(b"lock: unavailable\n");
+        return;
+    }
+    let result = waitpid(pid);
+    if is_syscall_error(result.pid) || result.status != 0 {
+        write_stdout(b"shell: lock status=failed\n");
+    } else {
+        write_stdout(b"shell: lock status=ready\n");
     }
 }
 
@@ -623,11 +698,34 @@ fn show_user_name() {
 fn write_user_name(uid: u64) {
     if uid == 0 {
         write_stdout(b"root");
-    } else if uid == 1000 {
-        write_stdout(b"user");
+    } else if let Some(account) = account_for_uid(uid) {
+        write_stdout(account.username());
     } else {
         write_stdout(b"unknown");
     }
+}
+
+fn account_for_uid(uid: u64) -> Option<rustos_userland::accounts::Account> {
+    let handle = open(ACCOUNT_STORE_PATH);
+    if is_syscall_error(handle) {
+        return None;
+    }
+    let mut bytes = [0u8; ACCOUNT_DATABASE_LENGTH];
+    let mut length = 0usize;
+    while length < bytes.len() {
+        let end = (length + ACCOUNT_READ_CHUNK_LENGTH).min(bytes.len());
+        let count = read(handle, &mut bytes[length..end]);
+        if is_syscall_error(count) {
+            let _ = close(handle);
+            return None;
+        }
+        if count == 0 {
+            break;
+        }
+        length = length.saturating_add(count as usize).min(bytes.len());
+    }
+    let _ = close(handle);
+    parse(&bytes[..length]).and_then(|store: AccountStore| store.find_uid(uid, uid))
 }
 
 fn write_decimal(mut value: u64) {

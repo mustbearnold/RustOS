@@ -134,12 +134,23 @@ pub extern "C" fn _start() -> ! {
     let mut admin_password_reported = false;
     let mut passwd_launch_reported = false;
     let mut passwd_output_reported = false;
+    let mut useradd_username_reported = false;
+    let mut useradd_password_reported = false;
+    let mut useradd_confirm_reported = false;
+    let mut useradd_created_reported = false;
+    let mut lock_prompt_reported = false;
+    let mut lock_failure_reported = false;
+    let mut lock_unlocked_reported = false;
+    let mut lock_command_reported = false;
+    let mut password_input_masked = false;
+    let mut password_mask_reported = false;
     if !draw_terminal(
         window_id,
         width,
         height,
         transcript.visible(),
         &input_line[..input_length],
+        password_input_masked,
         shell_finished,
     ) {
         write_stdout(b"terminal: initial draw failed\n");
@@ -173,6 +184,13 @@ pub extern "C" fn _start() -> ! {
                 let exit_input = enter && input_line[..input_length] == *b"exit";
                 if handle_keyboard(event.code, &mut input_line, &mut input_length, input.write) {
                     redraw = true;
+                    if enter {
+                        password_input_masked = false;
+                    }
+                    if password_input_masked && input_length != 0 && !password_mask_reported {
+                        write_stdout(b"terminal: password input masked status=ready\n");
+                        password_mask_reported = true;
+                    }
                     if exit_input {
                         write_stdout(b"terminal: exit input submitted status=ready\n");
                     }
@@ -204,7 +222,8 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"terminal: shell output read failed\n");
             close_terminal(window_id, input.write, output.read, shell);
         } else {
-            transcript.append(&output_bytes[..output_result as usize]);
+            let output = &output_bytes[..output_result as usize];
+            transcript.append(output);
             redraw = true;
             if !output_reported {
                 write_stdout(b"terminal: shell output received status=ready\n");
@@ -262,6 +281,58 @@ pub extern "C" fn _start() -> ! {
                 write_stdout(b"terminal: passwd output=ready\n");
                 passwd_output_reported = true;
             }
+            if bytes_contain(output, b"useradd: password: ")
+                || bytes_contain(output, b"useradd: retype password: ")
+                || bytes_contain(output, b"lock: password: ")
+                || bytes_contain(output, b"passwd: current password: ")
+                || bytes_contain(output, b"passwd: new password: ")
+                || bytes_contain(output, b"passwd: retype new password: ")
+            {
+                password_input_masked = true;
+            }
+            if password_input_masked && input_length != 0 && !password_mask_reported {
+                write_stdout(b"terminal: password input masked status=ready\n");
+                password_mask_reported = true;
+            }
+            if !useradd_username_reported && transcript.contains(b"useradd: username: ") {
+                write_stdout(b"terminal: useradd username prompt=ready\n");
+                useradd_username_reported = true;
+            }
+            if !useradd_password_reported && transcript.contains(b"useradd: password: ") {
+                write_stdout(b"terminal: useradd password prompt=ready\n");
+                useradd_password_reported = true;
+            }
+            if !useradd_confirm_reported && transcript.contains(b"useradd: retype password: ") {
+                write_stdout(b"terminal: useradd confirm prompt=ready\n");
+                useradd_confirm_reported = true;
+            }
+            if !useradd_created_reported
+                && (transcript.contains(b"useradd: account created status=ready")
+                    || transcript.contains(b"admin: account created username="))
+            {
+                write_stdout(b"terminal: useradd account created status=ready\n");
+                useradd_created_reported = true;
+            }
+            if !lock_prompt_reported && transcript.contains(b"lock: password: ") {
+                write_stdout(b"terminal: lock prompt=ready\n");
+                lock_prompt_reported = true;
+            }
+            if !lock_failure_reported
+                && transcript.contains(b"lock: authentication failed status=ready")
+            {
+                write_stdout(b"terminal: lock authentication failed status=ready\n");
+                lock_failure_reported = true;
+            }
+            if !lock_unlocked_reported
+                && transcript.contains(b"lock: session unlocked status=ready")
+            {
+                write_stdout(b"terminal: lock unlocked status=ready\n");
+                lock_unlocked_reported = true;
+            }
+            if !lock_command_reported && transcript.contains(b"shell: lock status=ready") {
+                write_stdout(b"terminal: lock command status=ready\n");
+                lock_command_reported = true;
+            }
         }
         if !shell_reaped && (shell_finished || exit_reported) {
             let wait_result = waitpid_nonblocking(shell);
@@ -288,6 +359,7 @@ pub extern "C" fn _start() -> ! {
                 height,
                 transcript.visible(),
                 &input_line[..input_length],
+                password_input_masked,
                 shell_finished,
             )
         {
@@ -334,12 +406,19 @@ fn handle_keyboard(
     true
 }
 
+fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= bytes.len()
+        && bytes.windows(needle.len()).any(|window| window == needle)
+}
+
 fn draw_terminal(
     window_id: u64,
     width: u32,
     height: u32,
     output: &[u8],
     input: &[u8],
+    input_masked: bool,
     shell_finished: bool,
 ) -> bool {
     if is_syscall_error(graphics_window_clear(window_id)) {
@@ -405,7 +484,11 @@ fn draw_terminal(
     input_text[0] = b'>';
     input_text[1] = b' ';
     let input_length = input.len().min(TEXT_BUFFER_LENGTH - 2);
-    input_text[2..2 + input_length].copy_from_slice(&input[..input_length]);
+    if input_masked {
+        input_text[2..2 + input_length].fill(b'*');
+    } else {
+        input_text[2..2 + input_length].copy_from_slice(&input[..input_length]);
+    }
     if is_syscall_error(graphics_window_text(
         window_id,
         22,

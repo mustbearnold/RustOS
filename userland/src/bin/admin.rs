@@ -4,8 +4,9 @@
 use rustos_userland::{
     SPAWN_INHERIT_PARENT_FD,
     accounts::{
-        ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse, serialize,
-        update_password,
+        ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, ACCOUNT_USERNAME_LENGTH, AccountStore,
+        MAX_ACCOUNTS, add_account, parse, serialize, update_password, valid_username,
+        verify_password,
     },
     close, exit, is_syscall_error, mkdir, open, open_create_write, open_write, pipe, read,
     spawn_redirected, waitpid, write, write_stdout,
@@ -14,6 +15,8 @@ use rustos_userland::{
 const STDIN_FD: u64 = 0;
 const FIXED_REQUEST_LENGTH: usize = 8;
 const PASSWORD_REQUEST_TAIL_LENGTH: usize = 8 + 32 + 32;
+const ADD_ACCOUNT_REQUEST_TAIL_LENGTH: usize = ACCOUNT_USERNAME_LENGTH + 32;
+const AUTH_REQUEST_TAIL_LENGTH: usize = 8 + 32;
 const ACCOUNT_WRITE_CHUNK_LENGTH: usize = 256;
 const PACKAGE_PATH: &[u8] = b"/bin/pkg\0";
 const STATE_PATH: &[u8] = b"/RUSTOS.ST\0";
@@ -25,6 +28,8 @@ const REQUEST_SYNC: [u8; FIXED_REQUEST_LENGTH] = *b"SYNCNET\0";
 const REQUEST_RECOVER: [u8; FIXED_REQUEST_LENGTH] = *b"RECOVER\0";
 const REQUEST_STATE_SET: [u8; FIXED_REQUEST_LENGTH] = *b"STATESET";
 const REQUEST_PASSWORD: [u8; FIXED_REQUEST_LENGTH] = *b"PASSWD\0\0";
+const REQUEST_ADD_ACCOUNT: [u8; FIXED_REQUEST_LENGTH] = *b"ADDUSER\0";
+const REQUEST_AUTHENTICATE: [u8; FIXED_REQUEST_LENGTH] = *b"AUTH\0\0\0\0";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -36,6 +41,10 @@ pub extern "C" fn _start() -> ! {
 
     let status = if request == REQUEST_PASSWORD {
         change_password()
+    } else if request == REQUEST_ADD_ACCOUNT {
+        add_account_request()
+    } else if request == REQUEST_AUTHENTICATE {
+        authenticate_request()
     } else if request == REQUEST_STATE_SET {
         write_state()
     } else if is_package_request(&request) {
@@ -126,6 +135,93 @@ fn change_password() -> i64 {
     0
 }
 
+fn add_account_request() -> i64 {
+    let mut tail = [0u8; ADD_ACCOUNT_REQUEST_TAIL_LENGTH];
+    if !read_exact(STDIN_FD, &mut tail) {
+        write_stdout(b"admin: account request invalid\n");
+        return 20;
+    }
+    let username_length = tail[..ACCOUNT_USERNAME_LENGTH]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(ACCOUNT_USERNAME_LENGTH);
+    let username = &tail[..username_length];
+    if username.is_empty() || !valid_username(username) || username_length > ACCOUNT_USERNAME_LENGTH
+    {
+        write_stdout(b"admin: account username invalid\n");
+        return 21;
+    }
+    let mut password_digest = [0u8; 32];
+    password_digest.copy_from_slice(&tail[ACCOUNT_USERNAME_LENGTH..]);
+    let Some(mut store) = read_store() else {
+        write_stdout(b"admin: account store unavailable\n");
+        return 22;
+    };
+    let Some(uid) = next_uid(&store) else {
+        write_stdout(b"admin: account capacity exhausted\n");
+        return 23;
+    };
+    if !add_account(&mut store, username, uid, uid, password_digest) {
+        write_stdout(b"admin: account creation rejected\n");
+        return 24;
+    }
+    if !write_store(&store) {
+        write_stdout(b"admin: account store write failed\n");
+        return 25;
+    }
+    let Some(verified) = read_store() else {
+        write_stdout(b"admin: account store reread failed\n");
+        return 26;
+    };
+    if verified
+        .find_username(username)
+        .is_none_or(|account| account.uid != uid || account.password_digest != password_digest)
+    {
+        write_stdout(b"admin: account store verification failed\n");
+        return 27;
+    }
+    write_stdout(b"admin: account created username=");
+    write_stdout(username);
+    write_stdout(b" uid=");
+    write_decimal(uid);
+    write_stdout(b" status=ready\n");
+    0
+}
+
+fn authenticate_request() -> i64 {
+    let mut tail = [0u8; AUTH_REQUEST_TAIL_LENGTH];
+    if !read_exact(STDIN_FD, &mut tail) {
+        write_stdout(b"admin: authentication request invalid\n");
+        return 30;
+    }
+    let mut uid_bytes = [0u8; 8];
+    uid_bytes.copy_from_slice(&tail[..8]);
+    let uid = u64::from_le_bytes(uid_bytes);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&tail[8..]);
+    let Some(store) = read_store() else {
+        write_stdout(b"admin: account store unavailable\n");
+        return 31;
+    };
+    if verify_password(&store, uid, &digest) {
+        write_stdout(b"admin: authentication ok status=ready\n");
+        0
+    } else {
+        write_stdout(b"admin: authentication failed status=denied\n");
+        32
+    }
+}
+
+fn next_uid(store: &AccountStore) -> Option<u64> {
+    (0..MAX_ACCOUNTS)
+        .map(|offset| 1000 + offset as u64)
+        .find(|uid| {
+            !store.accounts[..store.count]
+                .iter()
+                .any(|account| account.uid == *uid)
+        })
+}
+
 fn read_store() -> Option<AccountStore> {
     let handle = open(ACCOUNT_STORE_PATH);
     if is_syscall_error(handle) {
@@ -192,6 +288,22 @@ fn read_exact(handle: u64, buffer: &mut [u8]) -> bool {
         offset = offset.saturating_add(count as usize);
     }
     true
+}
+
+fn write_decimal(mut value: u64) {
+    let mut bytes = [0u8; 20];
+    let mut length = 0;
+    loop {
+        bytes[length] = b'0' + (value % 10) as u8;
+        length += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for byte in bytes[..length].iter().rev().copied() {
+        write_stdout(&[byte]);
+    }
 }
 
 fn write_state() -> i64 {

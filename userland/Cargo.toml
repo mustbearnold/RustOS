@@ -74,6 +74,16 @@ path = "src/bin/passwd.rs"
 test = false
 
 [[bin]]
+name = "useradd"
+path = "src/bin/useradd.rs"
+test = false
+
+[[bin]]
+name = "lock"
+path = "src/bin/lock.rs"
+test = false
+
+[[bin]]
 name = "desktop"
 path = "src/bin/desktop.rs"
 test = false

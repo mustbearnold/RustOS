@@ -75,6 +75,42 @@ pub fn update_password(
     true
 }
 
+pub fn verify_password(store: &AccountStore, uid: u64, digest: &[u8; 32]) -> bool {
+    store.accounts[..store.count]
+        .iter()
+        .any(|account| account.uid == uid && account.password_digest == *digest)
+}
+
+pub fn add_account(
+    store: &mut AccountStore,
+    username: &[u8],
+    uid: u64,
+    gid: u64,
+    password_digest: [u8; 32],
+) -> bool {
+    if store.count >= MAX_ACCOUNTS
+        || username.is_empty()
+        || username.len() > ACCOUNT_USERNAME_LENGTH
+        || !valid_username(username)
+        || !(1000..=u32::MAX as u64).contains(&uid)
+        || !(1000..=u32::MAX as u64).contains(&gid)
+        || store.accounts[..store.count].iter().any(|account| {
+            account.username() == username || account.uid == uid || account.gid == gid
+        })
+    {
+        return false;
+    }
+    let mut account = Account::EMPTY;
+    account.username[..username.len()].copy_from_slice(username);
+    account.username_length = username.len();
+    account.uid = uid;
+    account.gid = gid;
+    account.password_digest = password_digest;
+    store.accounts[store.count] = account;
+    store.count += 1;
+    true
+}
+
 pub fn parse(bytes: &[u8]) -> Option<AccountStore> {
     let mut store = AccountStore::empty();
     let mut cursor = 0;
@@ -185,7 +221,7 @@ fn parse_record(record: &[u8]) -> Option<Account> {
     Some(account)
 }
 
-fn valid_username(bytes: &[u8]) -> bool {
+pub fn valid_username(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| {
         byte.is_ascii_lowercase()
             || byte.is_ascii_uppercase()
@@ -334,6 +370,30 @@ mod tests {
             &mut store,
             1000,
             &old,
+            password_digest(b"other")
+        ));
+    }
+
+    #[test]
+    fn adds_and_authenticates_a_distinct_account() {
+        let mut store = parse(USER).unwrap();
+        let digest = password_digest(b"alice-pass");
+        assert!(add_account(&mut store, b"alice", 1001, 1001, digest));
+        assert_eq!(store.count, 2);
+        assert!(verify_password(&store, 1001, &digest));
+        assert!(!verify_password(&store, 1000, &digest));
+        assert!(!add_account(
+            &mut store,
+            b"alice",
+            1002,
+            1002,
+            password_digest(b"other")
+        ));
+        assert!(!add_account(
+            &mut store,
+            b"bad/name",
+            1002,
+            1002,
             password_digest(b"other")
         ));
     }

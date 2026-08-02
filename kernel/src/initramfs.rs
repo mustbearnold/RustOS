@@ -5,7 +5,7 @@
 //! and recovery code a stable archive boundary.
 
 pub const NEWC_HEADER_SIZE: usize = 110;
-pub const MAX_ARCHIVE_SIZE: usize = 384 * 1024;
+pub const MAX_ARCHIVE_SIZE: usize = 512 * 1024;
 pub const MAX_ENTRIES: usize = 32;
 pub const MAX_PATH_LENGTH: usize = 63;
 

@@ -388,8 +388,6 @@ const MODE_GROUP_EXECUTE: u32 = 0o010;
 const MODE_OTHER_READ: u32 = 0o004;
 const MODE_OTHER_WRITE: u32 = 0o002;
 const MODE_OTHER_EXECUTE: u32 = 0o001;
-const USER_HOME_PATH: &[u8] = b"/home/user";
-
 #[derive(Clone, Copy)]
 enum AccessKind {
     Read,
@@ -424,15 +422,39 @@ fn mode_allows(
     mode & bit != 0
 }
 
-fn user_home_path(path: &[u8]) -> bool {
-    path == USER_HOME_PATH
-        || path
-            .strip_prefix(USER_HOME_PATH)
-            .is_some_and(|suffix| suffix.first() == Some(&b'/'))
+fn user_home_path(path: &[u8], uid: UserId) -> bool {
+    let Some(suffix) = path.strip_prefix(b"/home/") else {
+        return false;
+    };
+    let component_end = suffix
+        .iter()
+        .position(|byte| *byte == b'/')
+        .unwrap_or(suffix.len());
+    let component = &suffix[..component_end];
+    if component == b"user" {
+        return uid == 1000;
+    }
+    if component.is_empty() {
+        return false;
+    }
+    let mut value = 0u32;
+    for byte in component.iter().copied() {
+        if !byte.is_ascii_digit() {
+            return false;
+        }
+        let Some(next) = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u32::from(byte - b'0')))
+        else {
+            return false;
+        };
+        value = next;
+    }
+    value == uid
 }
 
 fn runtime_access_allowed(path: &[u8], uid: UserId, access: AccessKind) -> bool {
-    uid == ROOT_UID || matches!(access, AccessKind::Read) || user_home_path(path)
+    uid == ROOT_UID || matches!(access, AccessKind::Read) || user_home_path(path, uid)
 }
 const MAX_USER_WRITE_LENGTH: usize = 256;
 #[cfg(target_os = "none")]
@@ -941,7 +963,7 @@ static CURRENT_PROCESS_ID: PerCpuAtomicU64 = PerCpuAtomicU64::new();
 #[cfg(target_os = "none")]
 static CURRENT_THREAD_ID: PerCpuAtomicU64 = PerCpuAtomicU64::new();
 #[cfg(target_os = "none")]
-const PROCESS_TABLE_SIZE: usize = 16;
+const PROCESS_TABLE_SIZE: usize = 32;
 #[cfg(target_os = "none")]
 static PROCESS_POINTERS: [AtomicU64; PROCESS_TABLE_SIZE] =
     [const { AtomicU64::new(0) }; PROCESS_TABLE_SIZE];
@@ -6634,6 +6656,16 @@ mod tests {
         ));
         assert!(runtime_access_allowed(
             b"/home/user/work/note",
+            1000,
+            AccessKind::Write
+        ));
+        assert!(runtime_access_allowed(
+            b"/home/1001/work/note",
+            1001,
+            AccessKind::Write
+        ));
+        assert!(!runtime_access_allowed(
+            b"/home/1001/work/note",
             1000,
             AccessKind::Write
         ));

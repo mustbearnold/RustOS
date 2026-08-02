@@ -35,6 +35,10 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
+        write_stdout(b"login: username selected name=");
+        write_stdout(&username[..username_length]);
+        write_stdout(b" status=ready\n");
+
         write_stdout(b"password: ");
         let mut password = [0u8; PASSWORD_BUFFER_LENGTH];
         let password_length = read_line(&mut password, false, &mut skip_lf);
@@ -48,6 +52,9 @@ pub extern "C" fn _start() -> ! {
                 });
         if let Some(account) = authenticated {
             write_stdout(b"login: authentication ok\n");
+            write_stdout(b"login: authenticated username=");
+            write_stdout(account.username());
+            write_stdout(b" status=ready\n");
             session_number = session_number.saturating_add(1);
             write_stdout(b"login: session authenticated number=");
             write_decimal(session_number);
