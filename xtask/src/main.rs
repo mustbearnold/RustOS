@@ -2179,6 +2179,48 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
 
 #[cfg(unix)]
 fn send_shell_command(monitor: &mut UnixStream, command: &str) -> bool {
+    send_interactive_command(
+        monitor,
+        command,
+        false,
+        Duration::from_millis(80),
+        Duration::from_millis(200),
+    )
+}
+
+#[cfg(unix)]
+fn send_account_command(monitor: &mut UnixStream, command: &str) -> bool {
+    send_interactive_command(
+        monitor,
+        command,
+        true,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+}
+
+#[cfg(unix)]
+fn send_login_command(monitor: &mut UnixStream, command: &str) -> bool {
+    send_interactive_command(
+        monitor,
+        command,
+        false,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+}
+
+#[cfg(unix)]
+fn send_interactive_command(
+    monitor: &mut UnixStream,
+    command: &str,
+    refocus: bool,
+    key_delay: Duration,
+    enter_delay: Duration,
+) -> bool {
+    if refocus && !focus_terminal(monitor) {
+        return false;
+    }
     for byte in command.bytes() {
         if let Some(key) = match byte {
             b'/' => Some("slash"),
@@ -2195,27 +2237,39 @@ fn send_shell_command(monitor: &mut UnixStream, command: &str) -> bool {
             {
                 return false;
             }
-            thread::sleep(Duration::from_millis(80));
-        } else if !send_shell_key(monitor, byte) {
+            thread::sleep(key_delay);
+        } else if !send_shell_key(monitor, byte, key_delay) {
             return false;
         }
     }
     if monitor.write_all(b"sendkey ret\n").is_err() {
         return false;
     }
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(enter_delay);
     true
 }
 
 #[cfg(unix)]
-fn send_shell_key(monitor: &mut UnixStream, byte: u8) -> bool {
+fn send_shell_key(monitor: &mut UnixStream, byte: u8, delay: Duration) -> bool {
     if monitor
         .write_all(format!("sendkey {}\n", char::from(byte)).as_bytes())
         .is_err()
     {
         return false;
     }
-    thread::sleep(Duration::from_millis(80));
+    thread::sleep(delay);
+    true
+}
+
+#[cfg(unix)]
+fn focus_terminal(monitor: &mut UnixStream) -> bool {
+    if monitor
+        .write_all(b"mouse_button 1\nmouse_button 0\n")
+        .is_err()
+    {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(500));
     true
 }
 
@@ -3455,6 +3509,15 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
     let logout_sessions = content
         .matches("login: session exited status=ready")
         .count();
+    let desktop_sessions = content
+        .matches("desktop: compositor framebuffer=ready scene=ready status=ready")
+        .count();
+    let terminal_logouts = content
+        .matches("terminal: logout requested status=ready")
+        .count();
+    let client_reaps = content
+        .matches("desktop: session clients reaped status=ready")
+        .count();
     let screenshot_bytes = fs::metadata(screenshot)
         .map_err(|error| {
             format!(
@@ -3468,11 +3531,17 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         && authentication_failures >= 2
         && content.contains("login: session authenticated number=2 status=ready")
         && authenticated_sessions >= 2
+        && desktop_sessions >= 2
+        && terminal_logouts >= 2
+        && client_reaps >= 2
         && logout_sessions >= 2;
     let reload_ready = loaded
         && authentication_failures >= 1
         && content.contains("login: session authenticated number=1 status=ready")
         && authenticated_sessions >= 1
+        && desktop_sessions >= 1
+        && terminal_logouts >= 1
+        && client_reaps >= 1
         && logout_sessions >= 1;
     if (!first_boot_ready && !reload_ready) || screenshot_bytes == 0 {
         return Err(format!(
@@ -3486,11 +3555,14 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         "loaded"
     };
     println!(
-        "account proof: store={} password_changed={} old_password_rejected={} sessions={} logout_sessions={} screenshot_bytes={} status=ready",
+        "account proof: store={} password_changed={} old_password_rejected={} sessions={} desktop_sessions={} terminal_logouts={} client_reaps={} logout_sessions={} screenshot_bytes={} status=ready",
         store,
         password_changed,
         authentication_failures >= if bootstrapped { 2 } else { 1 },
         authenticated_sessions,
+        desktop_sessions,
+        terminal_logouts,
+        client_reaps,
         logout_sessions,
         screenshot_bytes
     );
@@ -3900,25 +3972,25 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             println!("account proof: first_session={first_session}");
             thread::sleep(Duration::from_secs(2));
             if !first_session
-                || !send_shell_command(&mut monitor, "passwd")
+                || !send_account_command(&mut monitor, "passwd")
                 || !wait_for_serial_markers(
                     &serial,
                     &["terminal: passwd current prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_shell_command(&mut monitor, "rustos")
+                || !send_account_command(&mut monitor, "rustos")
                 || !wait_for_serial_markers(
                     &serial,
                     &["terminal: passwd new prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_shell_command(&mut monitor, "daily-use")
+                || !send_account_command(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &["terminal: passwd confirm prompt=ready"],
                     Duration::from_secs(30),
                 )
-                || !send_shell_command(&mut monitor, "daily-use")
+                || !send_account_command(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &[
@@ -3929,11 +4001,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 )
             {
                 println!("account proof: password_change=false");
+                capture_account_proof_screenshot(&mut monitor, &screenshot);
                 let _ = monitor.write_all(b"quit\n");
                 return;
             }
             println!("account proof: password_change=true");
-            if !send_shell_command(&mut monitor, "exit")
+            if !send_account_command(&mut monitor, "exit")
                 || !wait_for_serial_occurrences(
                     &serial,
                     "desktop: session clients reaped status=ready",
@@ -3951,8 +4024,8 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 let _ = monitor.write_all(b"quit\n");
                 return;
             }
-            if !send_shell_command(&mut monitor, "user")
-                || !send_shell_command(&mut monitor, "rustos")
+            if !send_login_command(&mut monitor, "user")
+                || !send_login_command(&mut monitor, "rustos")
                 || !wait_for_serial_occurrences(
                     &serial,
                     "login: authentication failed",
@@ -3965,8 +4038,8 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 return;
             }
             println!("account proof: old_password_rejected=true");
-            if !send_shell_command(&mut monitor, "user")
-                || !send_shell_command(&mut monitor, "daily-use")
+            if !send_login_command(&mut monitor, "user")
+                || !send_login_command(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &["login: session authenticated number=2 status=ready"],
@@ -3979,16 +4052,16 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             }
             println!("account proof: new_password_login=true");
         } else {
-            if !send_shell_command(&mut monitor, "user")
-                || !send_shell_command(&mut monitor, "rustos")
+            if !send_login_command(&mut monitor, "user")
+                || !send_login_command(&mut monitor, "rustos")
                 || !wait_for_serial_occurrences(
                     &serial,
                     "login: authentication failed",
                     1,
                     Duration::from_secs(30),
                 )
-                || !send_shell_command(&mut monitor, "user")
-                || !send_shell_command(&mut monitor, "daily-use")
+                || !send_login_command(&mut monitor, "user")
+                || !send_login_command(&mut monitor, "daily-use")
                 || !wait_for_serial_markers(
                     &serial,
                     &["login: session authenticated number=1 status=ready"],
@@ -4008,13 +4081,24 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             "desktop: credentials uid=1000 gid=1000 status=ready",
             session_count,
             Duration::from_secs(90),
+        ) && wait_for_serial_occurrences(
+            &serial,
+            "desktop: compositor framebuffer=ready scene=ready status=ready",
+            session_count,
+            Duration::from_secs(90),
+        ) && wait_for_serial_occurrences(
+            &serial,
+            "terminal: client surface=ready shell=spawned focus=ready status=ready",
+            session_count,
+            Duration::from_secs(90),
         );
         println!("account proof: desktop_ready={desktop_ready}");
         if desktop_ready {
             let _ = monitor.write_all(format!("screendump {}\n", screenshot.display()).as_bytes());
             thread::sleep(Duration::from_secs(1));
         }
-        let logged_out = send_shell_command(&mut monitor, "exit")
+        let logged_out = desktop_ready
+            && send_account_command(&mut monitor, "exit")
             && wait_for_serial_occurrences(
                 &serial,
                 "desktop: session clients reaped status=ready",
@@ -4030,6 +4114,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
         println!("account proof: logout={logged_out}");
         let _ = monitor.write_all(b"quit\n");
     })
+}
+
+#[cfg(unix)]
+fn capture_account_proof_screenshot(monitor: &mut UnixStream, screenshot: &Path) {
+    let _ = monitor.write_all(format!("screendump {}\n", screenshot.display()).as_bytes());
+    thread::sleep(Duration::from_secs(1));
 }
 
 #[cfg(unix)]

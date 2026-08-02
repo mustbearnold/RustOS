@@ -5,7 +5,7 @@ use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, GRAPHICS_INFO_LENGTH, GraphicsInfo, GraphicsPointerEvent,
     GraphicsRect, GraphicsWindow, INPUT_EVENT_KEYBOARD, INPUT_EVENT_LENGTH, INPUT_EVENT_MOUSE,
     InputEvent, default_window_geometry, exit, get_credentials, graphics_acquire,
-    graphics_compose_windows, graphics_fill_rect, graphics_info, graphics_text,
+    graphics_compose_windows, graphics_fill_rect, graphics_info, graphics_release, graphics_text,
     graphics_window_configure, graphics_window_dispatch_keyboard, graphics_window_dispatch_pointer,
     graphics_window_request_close, input_read, is_syscall_error, spawn, waitpid,
     waitpid_nonblocking, write_stdout, yield_now,
@@ -309,6 +309,10 @@ pub extern "C" fn _start() -> ! {
                         exit(13);
                     }
                     write_stdout(b"desktop: session clients reaped status=ready\n");
+                }
+                if is_syscall_error(graphics_release()) {
+                    write_stdout(b"desktop: framebuffer release failed\n");
+                    exit(14);
                 }
                 exit(0);
             }
