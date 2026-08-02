@@ -27,6 +27,10 @@ const CLOSE_BUTTON_WIDTH: u32 = 34;
 const RESIZE_GRAB_SIZE: u32 = 20;
 const MIN_WINDOW_WIDTH: u32 = 180;
 const MIN_WINDOW_HEIGHT: u32 = 180;
+const LOGOUT_BUTTON_WIDTH: u32 = 132;
+const LOGOUT_BUTTON_HEIGHT: u32 = 36;
+const LOGOUT_BUTTON_X_MARGIN: u32 = 18;
+const LOGOUT_BUTTON_Y: u32 = 18;
 
 #[derive(Clone, Copy)]
 struct ManagedWindow {
@@ -166,6 +170,18 @@ pub extern "C" fn _start() -> ! {
                 }
             }
             if !gesture_active {
+                if left_down && logout_button(info, cursor_x, cursor_y) {
+                    write_stdout(b"desktop: logout button pressed status=ready\n");
+                    if logout_session(
+                        &mut managed_windows,
+                        primary_window_pid,
+                        secondary_window_pid,
+                    ) {
+                        exit(0);
+                    }
+                    write_stdout(b"desktop: logout failed\n");
+                    exit(12);
+                }
                 let pointer = GraphicsPointerEvent {
                     x: cursor_x,
                     y: cursor_y,
@@ -322,6 +338,52 @@ pub extern "C" fn _start() -> ! {
 
 fn move_pointer(position: u32, delta: i32, limit: u32) -> u32 {
     (i64::from(position) + i64::from(delta)).clamp(0, i64::from(limit)) as u32
+}
+
+fn logout_button(info: GraphicsInfo, x: u32, y: u32) -> bool {
+    let button_x = info
+        .width
+        .saturating_sub(LOGOUT_BUTTON_WIDTH.saturating_add(LOGOUT_BUTTON_X_MARGIN));
+    x >= button_x
+        && x < button_x.saturating_add(LOGOUT_BUTTON_WIDTH)
+        && y >= LOGOUT_BUTTON_Y
+        && y < LOGOUT_BUTTON_Y.saturating_add(LOGOUT_BUTTON_HEIGHT)
+}
+
+fn logout_session(windows: &mut [ManagedWindow; 2], primary_pid: u64, secondary_pid: u64) -> bool {
+    write_stdout(b"desktop: logout requested status=ready\n");
+    for window_id in [1, 2] {
+        if windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .is_some_and(|window| window.live)
+            && is_syscall_error(graphics_window_request_close(window_id))
+        {
+            write_stdout(b"desktop: logout close request failed\n");
+            return false;
+        }
+    }
+
+    let primary = waitpid(primary_pid);
+    if primary.pid != primary_pid || is_syscall_error(primary.pid) || primary.status != 0 {
+        write_stdout(b"desktop: terminal logout reap failed\n");
+        return false;
+    }
+    let secondary = waitpid(secondary_pid);
+    if secondary.pid != secondary_pid || is_syscall_error(secondary.pid) || secondary.status != 0 {
+        write_stdout(b"desktop: secondary logout reap failed\n");
+        return false;
+    }
+    for window in windows.iter_mut() {
+        window.live = false;
+    }
+    write_stdout(b"desktop: session clients reaped status=ready\n");
+    if is_syscall_error(graphics_release()) {
+        write_stdout(b"desktop: framebuffer release failed\n");
+        return false;
+    }
+    write_stdout(b"desktop: framebuffer released status=ready\n");
+    true
 }
 
 fn title_bar(windows: &[ManagedWindow; 2], id: u64, x: u32, y: u32) -> bool {
@@ -523,6 +585,13 @@ fn render_scene(info: GraphicsInfo) -> bool {
             color: ACCENT,
         },
         GraphicsRect {
+            x: width.saturating_sub(LOGOUT_BUTTON_WIDTH.saturating_add(LOGOUT_BUTTON_X_MARGIN)),
+            y: LOGOUT_BUTTON_Y,
+            width: LOGOUT_BUTTON_WIDTH,
+            height: LOGOUT_BUTTON_HEIGHT,
+            color: PANEL_RAISED,
+        },
+        GraphicsRect {
             x: content_x,
             y: 96,
             width: content_width,
@@ -592,6 +661,14 @@ fn render_scene(info: GraphicsInfo) -> bool {
             22,
             MUTED,
             b"RUST-OWNED DESKTOP SESSION".as_slice(),
+        ),
+        (
+            width
+                .saturating_sub(LOGOUT_BUTTON_WIDTH.saturating_add(LOGOUT_BUTTON_X_MARGIN))
+                .saturating_add(20),
+            30,
+            ACCENT,
+            b"LOG OUT".as_slice(),
         ),
         (32, 128, TEXT, b"Overview".as_slice()),
         (32, 182, MUTED, b"Storage".as_slice()),

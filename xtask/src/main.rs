@@ -160,6 +160,9 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             let account_proof = arguments
                 .iter()
                 .any(|argument| argument == "--account-proof");
+            let logout_proof = arguments
+                .iter()
+                .any(|argument| argument == "--logout-proof");
             let virtio_gpu_proof = arguments
                 .iter()
                 .any(|argument| argument == "--virtio-gpu-proof");
@@ -229,6 +232,9 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             }
             if account_proof && mode != ImageMode::Desktop {
                 return Err("--account-proof requires --desktop".to_owned());
+            }
+            if logout_proof && mode != ImageMode::Desktop {
+                return Err("--logout-proof requires --desktop".to_owned());
             }
             if virtio_gpu_proof && mode != ImageMode::Desktop {
                 return Err("--virtio-gpu-proof requires --desktop".to_owned());
@@ -305,6 +311,28 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             {
                 return Err(
                     "--account-proof cannot be combined with another runtime proof".to_owned(),
+                );
+            }
+            if logout_proof
+                && (keyboard_proof
+                    || shell_proof
+                    || pipe_proof
+                    || desktop_proof
+                    || terminal_proof
+                    || account_proof
+                    || virtio_gpu_proof
+                    || poweroff_proof
+                    || reboot_proof
+                    || suspend_proof
+                    || smp_proof
+                    || any_audio_proof
+                    || virtio_network_proof
+                    || nvme_interrupt_proof
+                    || ahci_interrupt_proof
+                    || vm_proof)
+            {
+                return Err(
+                    "--logout-proof cannot be combined with another runtime proof".to_owned(),
                 );
             }
             if virtio_gpu_proof
@@ -424,6 +452,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 desktop_proof,
                 terminal_proof,
                 account_proof,
+                logout_proof,
                 virtio_gpu_proof,
                 poweroff_proof,
                 reboot_proof,
@@ -1461,6 +1490,7 @@ fn run(
     desktop_proof: bool,
     terminal_proof: bool,
     account_proof: bool,
+    logout_proof: bool,
     virtio_gpu_proof: bool,
     poweroff_proof: bool,
     reboot_proof: bool,
@@ -1500,6 +1530,7 @@ fn run(
         || terminal_proof
         || desktop_proof
         || account_proof
+        || logout_proof
         || (mode == ImageMode::Shell && keyboard_proof))
         .then(|| {
             let timestamp = SystemTime::now()
@@ -1675,7 +1706,8 @@ fn run(
         || pipe_proof
         || virtio_gpu_proof
         || terminal_proof
-        || account_proof)
+        || account_proof
+        || logout_proof)
         .then(|| {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1853,6 +1885,16 @@ fn run(
                             .expect("account proof serial path exists")
                             .clone(),
                     )
+                } else if logout_proof {
+                    spawn_logout_proof(
+                        path.clone(),
+                        screenshot.clone(),
+                        serial_path
+                            .as_ref()
+                            .expect("logout proof serial path exists")
+                            .clone(),
+                        firmware == "uefi",
+                    )
                 } else if terminal_proof {
                     spawn_terminal_proof(
                         path.clone(),
@@ -1910,6 +1952,7 @@ fn run(
         || virtio_gpu_proof
         || terminal_proof
         || account_proof
+        || logout_proof
         || desktop_proof
     {
         if let Some(proof_thread) = proof_thread {
@@ -2034,6 +2077,17 @@ fn run(
             .as_deref()
             .ok_or_else(|| "account proof screenshot path was not created".to_owned())?;
         if let Err(error) = verify_account_proof(serial, screenshot) {
+            result = Err(error);
+        }
+    }
+    if result.is_ok() && logout_proof {
+        let serial = serial_path
+            .as_deref()
+            .ok_or_else(|| "logout proof serial path was not created".to_owned())?;
+        let screenshot = screenshot_path
+            .as_deref()
+            .ok_or_else(|| "logout proof screenshot path was not created".to_owned())?;
+        if let Err(error) = verify_logout_proof(serial, screenshot) {
             result = Err(error);
         }
     }
@@ -3756,6 +3810,56 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
     Ok(())
 }
 
+fn verify_logout_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(serial)
+        .map_err(|error| format!("reading logout proof serial {}: {error}", serial.display()))?;
+    let required = [
+        "login: authentication ok",
+        "desktop: compositor framebuffer=ready scene=ready status=ready",
+        "desktop: logout button pressed status=ready",
+        "desktop: logout requested status=ready",
+        "desktop: session clients reaped status=ready",
+        "desktop: framebuffer released status=ready",
+        "login: session exited status=ready",
+        "login: ready for next session status=ready",
+    ];
+    if !required.iter().all(|marker| content.contains(marker)) {
+        return Err(format!(
+            "logout proof serial did not contain the desktop logout and login-boundary marker set: {}",
+            serial.display()
+        ));
+    }
+    let session_exit = content
+        .find("login: session exited status=ready")
+        .ok_or_else(|| "logout proof has no session-exit marker".to_owned())?;
+    let login_ready = content
+        .find("login: ready for next session status=ready")
+        .ok_or_else(|| "logout proof has no post-logout login marker".to_owned())?;
+    if login_ready <= session_exit {
+        return Err(format!(
+            "logout proof observed the next-login marker before the desktop session exited: {}",
+            serial.display()
+        ));
+    }
+    let screenshot_bytes = fs::read(screenshot).map_err(|error| {
+        format!(
+            "reading logout proof screenshot {}: {error}",
+            screenshot.display()
+        )
+    })?;
+    if !screenshot_bytes.starts_with(b"P6\n") || screenshot_bytes.len() <= 64 {
+        return Err(format!(
+            "logout proof screenshot is not a valid non-empty PPM image: {}",
+            screenshot.display()
+        ));
+    }
+    println!(
+        "logout proof: button=true clients_reaped=true framebuffer_released=true login_ready=true screenshot_bytes={} status=ready",
+        screenshot_bytes.len()
+    );
+    Ok(())
+}
+
 fn verify_desktop_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
     let content = fs::read_to_string(serial)
         .map_err(|error| format!("reading desktop proof serial {}: {error}", serial.display()))?;
@@ -4497,6 +4601,72 @@ fn prove_non_admin_sudo_denied(monitor: &mut UnixStream, serial: &Path) -> bool 
 }
 
 #[cfg(unix)]
+fn spawn_logout_proof(
+    path: PathBuf,
+    screenshot: PathBuf,
+    serial: PathBuf,
+    uefi: bool,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(8));
+        let Some(mut monitor) = connect_monitor(&path) else {
+            println!("logout proof: monitor=false");
+            return;
+        };
+        if !send_login_credentials(&mut monitor, &serial) {
+            return;
+        }
+        let ready = wait_for_serial_markers(
+            &serial,
+            &[
+                "desktop: compositor framebuffer=ready scene=ready status=ready",
+                "terminal: client surface=ready shell=spawned focus=ready status=ready",
+                "window: secondary client surface=ready presented=ready status=ready",
+            ],
+            Duration::from_secs(90),
+        );
+        println!("logout proof: guest_ready={ready}");
+        if !ready {
+            return;
+        }
+        thread::sleep(Duration::from_secs(2));
+        if monitor
+            .write_all(format!("screendump {}\n", screenshot.display()).as_bytes())
+            .is_err()
+        {
+            return;
+        }
+        thread::sleep(Duration::from_secs(1));
+        let vertical_move = if uefi { -360 } else { -320 };
+        for command in [
+            format!("mouse_move 500 {vertical_move}\n"),
+            "mouse_button 1\n".to_owned(),
+            "mouse_button 0\n".to_owned(),
+        ] {
+            if monitor.write_all(command.as_bytes()).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        let logged_out = wait_for_serial_markers(
+            &serial,
+            &[
+                "desktop: logout button pressed status=ready",
+                "desktop: logout requested status=ready",
+                "desktop: session clients reaped status=ready",
+                "desktop: framebuffer released status=ready",
+                "login: session exited status=ready",
+                "login: ready for next session status=ready",
+            ],
+            Duration::from_secs(45),
+        );
+        println!("logout proof: login_boundary={logged_out}");
+        thread::sleep(Duration::from_secs(1));
+        let _ = monitor.write_all(b"quit\n");
+    })
+}
+
+#[cfg(unix)]
 fn spawn_desktop_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> JoinHandle<()> {
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(8));
@@ -4635,6 +4805,16 @@ fn spawn_virtio_gpu_proof(
     _path: PathBuf,
     _screenshot: PathBuf,
     _serial: PathBuf,
+) -> JoinHandle<()> {
+    thread::spawn(|| {})
+}
+
+#[cfg(not(unix))]
+fn spawn_logout_proof(
+    _path: PathBuf,
+    _screenshot: PathBuf,
+    _serial: PathBuf,
+    _uefi: bool,
 ) -> JoinHandle<()> {
     thread::spawn(|| {})
 }
@@ -5289,6 +5469,9 @@ fn print_usage() {
         "  --terminal-proof   type `help` through the desktop terminal and verify shell output"
     );
     println!("  --account-proof    verify first-boot account setup and logout/reload persistence");
+    println!(
+        "  --logout-proof     click the desktop logout control and verify login-boundary return"
+    );
     println!("  --virtio-gpu-proof require a virtio-gpu scanout and desktop frame proof");
     println!("  --partitioned      use a GPT EFI + FAT32 RustOS root image (UEFI only)");
     println!("  --msi              use Q35 + e1000e to exercise PCI MSI delivery");

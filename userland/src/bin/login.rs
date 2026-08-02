@@ -69,6 +69,7 @@ pub extern "C" fn _start() -> ! {
             let result = waitpid(pid);
             if result.pid == pid {
                 write_stdout(b"login: session exited status=ready\n");
+                write_stdout(b"login: ready for next session status=ready\n");
             } else {
                 write_stdout(b"login: session wait failed\n");
             }
