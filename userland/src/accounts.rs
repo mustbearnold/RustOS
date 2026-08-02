@@ -4,7 +4,6 @@ pub const MAX_ACCOUNTS: usize = 4;
 pub const ACCOUNT_USERNAME_LENGTH: usize = 16;
 pub const ACCOUNT_RECORD_LENGTH: usize = 128;
 pub const ACCOUNT_DATABASE_LENGTH: usize = MAX_ACCOUNTS * ACCOUNT_RECORD_LENGTH;
-pub const ACCOUNT_SEED_PATH: &[u8] = b"/etc/rustos/accounts\0";
 pub const ACCOUNT_STORE_PATH: &[u8] = b"/VAR/RUSTOS/ACCOUNTS\0";
 
 #[derive(Clone, Copy)]

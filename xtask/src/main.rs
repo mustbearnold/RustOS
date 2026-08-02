@@ -513,7 +513,7 @@ fn build(release: bool) -> Result<(), String> {
     let window = read_userland_image(&userland, "window")?;
     let window_secondary = read_userland_image(&userland, "window-secondary")?;
 
-    let default_entries: [(&str, &[u8], u32); 20] = [
+    let default_entries: [(&str, &[u8], u32); 19] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
@@ -533,9 +533,8 @@ fn build(release: bool) -> Result<(), String> {
         ("bin/window-secondary", &window_secondary, 0o100755),
         ("etc/rustos/init.cfg", USER_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
-        ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let shell_entries: [(&str, &[u8], u32); 20] = [
+    let shell_entries: [(&str, &[u8], u32); 19] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
@@ -555,9 +554,8 @@ fn build(release: bool) -> Result<(), String> {
         ("bin/window-secondary", &window_secondary, 0o100755),
         ("etc/rustos/init.cfg", SHELL_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
-        ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let desktop_entries: [(&str, &[u8], u32); 21] = [
+    let desktop_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
@@ -578,9 +576,8 @@ fn build(release: bool) -> Result<(), String> {
         ("bin/window-secondary", &window_secondary, 0o100755),
         ("etc/rustos/init.cfg", DESKTOP_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
-        ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
-    let recovery_entries: [(&str, &[u8], u32); 21] = [
+    let recovery_entries: [(&str, &[u8], u32); 20] = [
         ("sbin/init", &init, 0o100755),
         ("sbin/admin", &admin, 0o100755),
         ("sbin/login", &login, 0o100755),
@@ -601,7 +598,6 @@ fn build(release: bool) -> Result<(), String> {
         ("etc/rustos/init.cfg", SHELL_INIT_CONFIG, 0o100644),
         ("etc/rustos/config.txt", USER_CONFIG_CONTENT, 0o100644),
         ("etc/rustos/recovery.cfg", RECOVERY_MARKER_CONTENT, 0o100644),
-        ("etc/rustos/accounts", ACCOUNT_CONTENT, 0o100644),
     ];
     let initramfs = build_initramfs(&default_entries)?;
     let shell_initramfs = build_initramfs(&shell_entries)?;
@@ -2983,6 +2979,21 @@ fn wait_for_serial_markers(path: &Path, markers: &[&str], timeout: Duration) -> 
 }
 
 #[cfg(unix)]
+fn wait_for_serial_any(path: &Path, markers: &[&str], timeout: Duration) -> Option<usize> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let content = fs::read_to_string(path).unwrap_or_default();
+        if let Some(index) = markers.iter().position(|marker| content.contains(marker)) {
+            return Some(index);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_serial_occurrences(
     path: &Path,
     marker: &str,
@@ -3522,6 +3533,8 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
     let content = fs::read_to_string(serial)
         .map_err(|error| format!("reading account proof serial {}: {error}", serial.display()))?;
     let bootstrapped = content.contains("login: account store bootstrapped status=ready");
+    let first_boot_setup = content.contains("login: account store setup required status=ready")
+        && content.contains("login: first account configured username=user status=ready");
     let loaded = content.contains("login: account store loaded status=ready");
     let password_changed = content.contains("terminal: passwd changed status=ready")
         && content.contains("terminal: admin password updated status=ready");
@@ -3555,7 +3568,8 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
             )
         })?
         .len();
-    let first_boot_ready = bootstrapped
+    let first_boot_ready = first_boot_setup
+        && bootstrapped
         && password_changed
         && account_created
         && password_masked
@@ -3587,7 +3601,7 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         && logout_sessions >= 2;
     if (!first_boot_ready && !reload_ready) || screenshot_bytes == 0 {
         return Err(format!(
-            "account proof did not verify password mutation, multi-account login, session locking, or persistent reload: {}",
+            "account proof did not verify first-boot account setup, password mutation, multi-account login, session locking, or persistent reload: {}",
             serial.display()
         ));
     }
@@ -3597,8 +3611,9 @@ fn verify_account_proof(serial: &Path, screenshot: &Path) -> Result<(), String> 
         "loaded"
     };
     println!(
-        "account proof: store={} password_changed={} account_created={} password_masked={} session_lock={} old_password_rejected={} sessions={} desktop_sessions={} terminal_logouts={} client_reaps={} logout_sessions={} screenshot_bytes={} status=ready",
+        "account proof: store={} first_boot_setup={} password_changed={} account_created={} password_masked={} session_lock={} old_password_rejected={} sessions={} desktop_sessions={} terminal_logouts={} client_reaps={} logout_sessions={} screenshot_bytes={} status=ready",
         store,
+        first_boot_setup,
         password_changed,
         account_created,
         password_masked,
@@ -3778,28 +3793,72 @@ fn connect_monitor(path: &Path) -> Option<UnixStream> {
 
 #[cfg(unix)]
 fn send_login_credentials(monitor: &mut UnixStream, serial: &Path) -> bool {
-    if !wait_for_serial_markers(serial, &["RustOS login"], Duration::from_secs(90)) {
+    let Some(first_marker) = wait_for_serial_any(
+        serial,
+        &[
+            "login: account store setup required status=ready",
+            "RustOS login",
+        ],
+        Duration::from_secs(90),
+    ) else {
+        println!("login proof: prompt=false");
+        return false;
+    };
+    if first_marker == 0 {
+        if !send_login_keys(
+            monitor,
+            &[
+                "sendkey u\n",
+                "sendkey s\n",
+                "sendkey e\n",
+                "sendkey r\n",
+                "sendkey ret\n",
+                "sendkey r\n",
+                "sendkey u\n",
+                "sendkey s\n",
+                "sendkey t\n",
+                "sendkey o\n",
+                "sendkey s\n",
+                "sendkey ret\n",
+                "sendkey r\n",
+                "sendkey u\n",
+                "sendkey s\n",
+                "sendkey t\n",
+                "sendkey o\n",
+                "sendkey s\n",
+                "sendkey ret\n",
+            ],
+        ) || !wait_for_serial_markers(
+            serial,
+            &["login: account store bootstrapped status=ready"],
+            Duration::from_secs(30),
+        ) {
+            println!("login proof: first-boot-setup=false");
+            return false;
+        }
+    }
+    if !wait_for_serial_markers(serial, &["RustOS login"], Duration::from_secs(30)) {
         println!("login proof: prompt=false");
         return false;
     }
-    for command in [
-        "sendkey u\n",
-        "sendkey s\n",
-        "sendkey e\n",
-        "sendkey r\n",
-        "sendkey ret\n",
-        "sendkey w\n",
-        "sendkey r\n",
-        "sendkey o\n",
-        "sendkey n\n",
-        "sendkey g\n",
-        "sendkey ret\n",
-    ] {
-        if monitor.write_all(command.as_bytes()).is_err() {
-            println!("login proof: invalid-input=false");
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
+    if !send_login_keys(
+        monitor,
+        &[
+            "sendkey u\n",
+            "sendkey s\n",
+            "sendkey e\n",
+            "sendkey r\n",
+            "sendkey ret\n",
+            "sendkey w\n",
+            "sendkey r\n",
+            "sendkey o\n",
+            "sendkey n\n",
+            "sendkey g\n",
+            "sendkey ret\n",
+        ],
+    ) {
+        println!("login proof: invalid-input=false");
+        return false;
     }
     let rejected = wait_for_serial_markers(
         serial,
@@ -3810,25 +3869,25 @@ fn send_login_credentials(monitor: &mut UnixStream, serial: &Path) -> bool {
         println!("login proof: invalid-password-rejected=false");
         return false;
     }
-    for command in [
-        "sendkey u\n",
-        "sendkey s\n",
-        "sendkey e\n",
-        "sendkey r\n",
-        "sendkey ret\n",
-        "sendkey r\n",
-        "sendkey u\n",
-        "sendkey s\n",
-        "sendkey t\n",
-        "sendkey o\n",
-        "sendkey s\n",
-        "sendkey ret\n",
-    ] {
-        if monitor.write_all(command.as_bytes()).is_err() {
-            println!("login proof: input=false");
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
+    if !send_login_keys(
+        monitor,
+        &[
+            "sendkey u\n",
+            "sendkey s\n",
+            "sendkey e\n",
+            "sendkey r\n",
+            "sendkey ret\n",
+            "sendkey r\n",
+            "sendkey u\n",
+            "sendkey s\n",
+            "sendkey t\n",
+            "sendkey o\n",
+            "sendkey s\n",
+            "sendkey ret\n",
+        ],
+    ) {
+        println!("login proof: input=false");
+        return false;
     }
     let authenticated = wait_for_serial_markers(
         serial,
@@ -3840,6 +3899,17 @@ fn send_login_credentials(monitor: &mut UnixStream, serial: &Path) -> bool {
         rejected
     );
     authenticated
+}
+
+#[cfg(unix)]
+fn send_login_keys(monitor: &mut UnixStream, commands: &[&str]) -> bool {
+    for command in commands {
+        if monitor.write_all(command.as_bytes()).is_err() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -3998,7 +4068,7 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
             return;
         }
         let serial_before_login = fs::read_to_string(&serial).unwrap_or_default();
-        let first_boot = serial_before_login.contains("login: account store bootstrapped");
+        let first_boot = serial_before_login.contains("login: account store setup required");
         if first_boot {
             if !send_login_credentials(&mut monitor, &serial) {
                 let _ = monitor.write_all(b"quit\n");
@@ -5053,9 +5123,7 @@ fn print_usage() {
     println!(
         "  --terminal-proof   type `help` through the desktop terminal and verify shell output"
     );
-    println!(
-        "  --account-proof    change the seeded password and verify logout/reload persistence"
-    );
+    println!("  --account-proof    verify first-boot account setup and logout/reload persistence");
     println!("  --virtio-gpu-proof require a virtio-gpu scanout and desktop frame proof");
     println!("  --partitioned      use a GPT EFI + FAT32 RustOS root image (UEFI only)");
     println!("  --msi              use Q35 + e1000e to exercise PCI MSI delivery");
@@ -5135,8 +5203,6 @@ const SHELL_INIT_CONFIG: &[u8] = b"/bin/sh|0|1000|1000\0";
 const DESKTOP_INIT_CONFIG: &[u8] = b"/sbin/login|0|0|0\0";
 const RECOVERY_MARKER_CONTENT: &[u8] = b"recovery=1\n";
 const USER_CONFIG_CONTENT: &[u8] = b"cfg=RustOS\n";
-const ACCOUNT_CONTENT: &[u8] =
-    b"user|1000|1000|38007df7107968c330e766fe0710bbcece10071a9713f90dd77348d16f57baa5\n";
 const PERSISTENT_STATE_CONTENT: &[u8] = b"boot=0\n";
 fn smp_count(arguments: &[String]) -> Result<u32, String> {
     let mut count = None;

@@ -4,8 +4,8 @@
 use rustos_userland::{
     SYSCALL_ENOENT,
     accounts::{
-        ACCOUNT_DATABASE_LENGTH, ACCOUNT_SEED_PATH, ACCOUNT_STORE_PATH, AccountStore, parse,
-        password_digest, serialize,
+        ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, add_account, parse,
+        password_digest, serialize, valid_username,
     },
     close, exit, is_syscall_error, mkdir, open, open_create_write, read, spawn_as, waitpid, write,
     write_stdout, yield_now,
@@ -16,6 +16,8 @@ const ACCOUNT_BUFFER_LENGTH: usize = ACCOUNT_DATABASE_LENGTH;
 const USERNAME_BUFFER_LENGTH: usize = 32;
 const PASSWORD_BUFFER_LENGTH: usize = 64;
 const WRITE_CHUNK_LENGTH: usize = 256;
+const FIRST_ACCOUNT_UID: u64 = 1000;
+const FIRST_ACCOUNT_GID: u64 = 1000;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -86,8 +88,9 @@ fn load_or_bootstrap_accounts() -> Option<AccountStore> {
             Some(accounts)
         }
         None if store_missing() => {
-            let seed = read_seed_store()?;
-            if !write_store(&seed) {
+            write_stdout(b"login: account store setup required status=ready\n");
+            let accounts = setup_first_account()?;
+            if !write_store(&accounts) {
                 return None;
             }
             let verified = read_store()?;
@@ -114,10 +117,6 @@ fn store_missing() -> bool {
 
 fn read_store() -> Option<AccountStore> {
     read_account_file(ACCOUNT_STORE_PATH)
-}
-
-fn read_seed_store() -> Option<AccountStore> {
-    read_account_file(ACCOUNT_SEED_PATH)
 }
 
 fn read_account_file(path: &[u8]) -> Option<AccountStore> {
@@ -174,6 +173,61 @@ fn write_store(accounts: &AccountStore) -> bool {
         success = false;
     }
     success
+}
+
+fn setup_first_account() -> Option<AccountStore> {
+    let mut skip_lf = false;
+    loop {
+        let mut username = [0u8; USERNAME_BUFFER_LENGTH];
+        write_stdout(b"login: setup username prompt=ready\n");
+        write_stdout(b"login: new username: ");
+        let username_length = read_line(&mut username, true, &mut skip_lf);
+        if username_length == 0
+            || username_length > rustos_userland::accounts::ACCOUNT_USERNAME_LENGTH
+            || !valid_username(&username[..username_length])
+        {
+            write_stdout(b"login: username invalid\n");
+            continue;
+        }
+
+        let mut password = [0u8; PASSWORD_BUFFER_LENGTH];
+        write_stdout(b"login: setup password prompt=ready\n");
+        write_stdout(b"login: new password: ");
+        let password_length = read_line(&mut password, false, &mut skip_lf);
+        write_stdout(b"\n");
+        if password_length == 0 {
+            write_stdout(b"login: password cannot be empty\n");
+            continue;
+        }
+
+        let mut confirmation = [0u8; PASSWORD_BUFFER_LENGTH];
+        write_stdout(b"login: setup confirm prompt=ready\n");
+        write_stdout(b"login: retype password: ");
+        let confirmation_length = read_line(&mut confirmation, false, &mut skip_lf);
+        write_stdout(b"\n");
+        if password_length != confirmation_length
+            || password[..password_length] != confirmation[..confirmation_length]
+        {
+            write_stdout(b"login: passwords do not match\n");
+            continue;
+        }
+
+        let mut accounts = AccountStore::empty();
+        if !add_account(
+            &mut accounts,
+            &username[..username_length],
+            FIRST_ACCOUNT_UID,
+            FIRST_ACCOUNT_GID,
+            password_digest(&password[..password_length]),
+        ) {
+            write_stdout(b"login: first account rejected\n");
+            return None;
+        }
+        write_stdout(b"login: first account configured username=");
+        write_stdout(&username[..username_length]);
+        write_stdout(b" status=ready\n");
+        return Some(accounts);
+    }
 }
 
 fn read_line(buffer: &mut [u8], echo: bool, skip_lf: &mut bool) -> usize {
