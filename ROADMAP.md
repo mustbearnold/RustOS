@@ -1,0 +1,98 @@
+# RustOS roadmap
+
+The project is intentionally staged. Each stage needs a boot or host-runtime proof before the next layer is treated as real.
+
+## 0. Boot contract — in progress
+
+- boot on x86_64 BIOS and UEFI through a Rust bootloader
+- report boot protocol, memory map, and framebuffer state
+- provide a serial console and a visible framebuffer
+- enumerate page-aligned physical frames from usable firmware memory
+- map a kernel virtual heap and validate Rust `alloc` at runtime
+- exercise reusable kernel page allocation, translation, read/write, and unmapping
+- enumerate PCI configuration space and expose immutable typed device descriptors to future drivers
+- attach legacy IDE PIO, PCI AHCI, and PCI NVMe mass-storage controllers through a bounded `BlockDevice`, identify disks, discover MBR/GPT partition metadata, mount FAT12/FAT16/FAT32, scan nested directories, read files through their cluster chains, create directories and files, grow them through bounded FAT12/FAT16/FAT32 cluster allocation, and perform sector-preserving writes; AHCI command completion now uses PCI MSI/MSI-X with polling fallback, and NVMe admin/I/O queues complete through PCI MSI-X with polling fallback
+- attach generic PCI AC'97 and Intel HDA playback controllers through bounded I/O-port or MMIO BAR claims, generate a Rust stereo PCM tone into DMA pages, discover an HDA codec DAC/output-pin path with codec verbs, and prove both playback paths through QEMU's WAV backend; attach modern PCI virtio-net through vendor capabilities, negotiate version 1, configure bounded split-queue DMA, arm shared MSI-X queue completion delivery with a polling fallback, prove real QEMU DHCP leases on multiple NICs, renew them through the Rust network manager's timer and ABI paths, and route the userland network syscalls through deterministic default-route and interface enumeration; capture, mixer policy, USB audio, and richer device policy remain future driver work
+- claim bounded PCI BAR resources, enable bus mastering, and initialize an Intel e1000 DMA TX/RX path with a verified loopback packet
+- parse legacy IRQ overrides, route the e1000 interrupt through the I/O APIC, and dispatch TX/RX completion through a reusable IDT device-vector table
+- expose bounded Ethernet frame construction/parsing through a kernel `NetworkInterface`, recycle consumed RX descriptors, and verify the e1000 loopback through that interface
+- add bounded IPv4 and UDP construction/parsing with Internet and pseudo-header checksums, then validate an IPv4/UDP datagram on the received e1000 frame
+- switch the validated e1000 from PHY loopback to external mode, resolve the QEMU gateway with ARP, and expose bounded ring-3 UDP send/receive syscalls
+- install an exception IDT and prove timer IRQ delivery through the PIC/PIT
+- discover ACPI MADT data and prove local-APIC timer delivery, then parse the FADT/DSDT S5, S3, and reset-register power contracts and expose Rust ACPI poweroff, reboot, and suspend/resume paths with BIOS and partitioned-UEFI guest proofs; the S3 path uses a validated FACS, a copied low-memory legacy mixed-mode wake trampoline, and a native extended 64-bit wake entry when the firmware advertises the ACPI 2.0 contract, with a strict native-vector UEFI proof
+- route an ISA interrupt through the ACPI-described I/O APIC
+- bring enabled MADT processors online with per-AP stacks and INIT/SIPI startup
+- run fixed-stack Rust kernel tasks with local-APIC preemption on each supported CPU; the strict two-vCPU BIOS/UEFI runtime proof now requires both processors online, BSP timer/scheduler activity, AP scheduler release before the process gate, and filesystem-backed ring-3 execution on the non-BSP CPU
+- persistent framebuffer text console with embedded Rust bitmap font, bounded line handling, serial-output mirroring, and BIOS/UEFI screenshot proof
+- polled i8042 PS/2 keyboard input with scancode translation, shift/caps/backspace handling, retained as a fallback for serial fd 0
+- one PCI xHCI host-controller path with bounded 4 KiB command/event/transfer rings, root-port reset, slot/address/configure commands, USB descriptor parsing, boot-protocol HID keyboard or mouse interrupt-IN DMA proofs through QEMU, and PCI MSI-X/MSI delivery with ACPI IO-APIC legacy shared-line fallback; translated USB HID reports now share the kernel input ABI with PS/2 fallback, and two HID devices share one event ring and input queue either directly on root ports or behind nested static USB 2 hubs with downstream power/reset control, composed xHCI route strings, and immediate parent-hub slot contexts; nested hub enumeration, inner-hub hotplug, and xHCI legacy interrupt delivery now have BIOS and partitioned UEFI proofs, including transfer-ring wrap and xHCI slot teardown
+- validated DPL3 graphics ABI for framebuffer geometry, single-process compositor ownership, bounded clipped color rectangles, and bounded bitmap text rendering, with a filesystem-backed Rust desktop session, unified USB/PS/2 input events through `SYS_INPUT_READ`, an interactive userland cursor, a bounded retained multi-process window surface ABI with explicit bottom-to-top z-order, click-to-raise focus, hit-tested pointer routing, focused-client keyboard delivery, compositor-controlled title-bar movement and bounded resize, close-request delivery with client reaping, two independent ring-3 clients, and BIOS/UEFI screenshot proof; a modern PCI `virtio-gpu` driver now negotiates version 1, allocates fragmented-DMA backing for a bounded 2D resource, binds scanout 0, and transfers and flushes compositor frames with BIOS and partitioned-UEFI proof; the compositor remains Rust-rasterized and Wayland protocol compatibility remains future work
+- make the image builder and test runner Rust tools
+- establish a root-owned Rust login/session boundary: `/sbin/login` reads bounded account records, bootstraps the immutable seed into the writable `/VAR/RUSTOS/ACCOUNTS` store on first boot, reloads that store on later boots, authenticates the selected user, and launches the desktop through `spawn_as`; the seeded desktop proof runs `/bin/desktop`, `/bin/terminal`, and `/bin/sh` as UID/GID 1000 on BIOS and partitioned UEFI, while account provisioning remains future work
+
+## 1. Kernel platform
+
+- interrupt descriptor table, exception diagnostics, and timer IRQs
+- physical-frame allocator from the boot memory map
+- bounded per-process virtual-memory manager beyond the initial heap mapping, including anonymous `mmap`/`munmap`, virtual-range reuse, physical-frame reclamation and reuse, and fork cloning
+- richer ACPI discovery and I/O APIC routing, including validated FADT/DSDT S5, S3, and reset-register contracts plus guest-owned ACPI poweroff, reboot, and suspend/resume paths with legacy and native FACS wake-vector handling; battery and thermal policy remain future work
+- extend PCI and driver support into MSI/MSI-X, reusable DMA APIs, and real driver attachment
+- attach one AHCI SATA port through PCI BAR5, use bounded 64-bit DMA command tables and PRDT entries for IDENTIFY/READ/WRITE/FLUSH, route command completion through one PCI MSI/MSI-X vector with polling fallback, and boot the FAT/VFS/userland path through Q35 AHCI with ATA PIO fallback; multi-port command scheduling remains future driver work
+- attach one PCI NVM Express controller through BAR0, configure bounded 4 KiB admin and I/O queues with PRP-backed IDENTIFY/READ/WRITE/FLUSH commands, route queue completions through one PCI MSI-X vector with polling fallback, and boot the FAT/VFS/userland path through QEMU NVMe in BIOS and UEFI; multi-namespace, multi-queue, and richer storage error recovery remain future driver work
+- attach one PCI xHCI controller through BAR0, configure one event ring and bounded command/transfer rings, enumerate up to two boot HID keyboard/mouse devices directly on root ports or through nested static USB 2 hubs, arm PCI MSI-X/MSI with ACPI IO-APIC legacy shared-line fallback, and route real interrupt-IN reports into a shared console or ring-3 input ABI after interrupt notification while retaining PS/2 fallback; compose route nibbles across hub tiers, preserve each immediate parent-hub context, and poll the active inner hub for bounded child attach/detach including xHCI slot teardown and transfer-ring wrap handling; isochronous endpoints and SuperSpeed devices remain future driver work
+- bounded conventional PCI capability traversal with MSI/MSI-X discovery, generic 32/64-bit MSI programming, one-vector MSI-X table programming, and an e1000/e1000e MSI-X runtime proof with MSI and ACPI legacy fallback; multi-queue vector allocation and PBA-driven interrupt accounting remain future driver work
+- modern virtio PCI vendor-capability parsing plus an interrupt-driven virtio-net driver with version-1 feature negotiation, MAC/status discovery, bounded RX/TX split virtqueues, physical DMA buffers, MSI-X queue completion notification, polling fallback, external DHCP proof, DHCP renewal packets, ARP gateway resolution, and network-manager attachment to the userland network syscalls; richer link policy remains future driver work
+
+## 2. Kernel services — in progress
+
+- root-owned `/sbin/login` with bounded multi-record account parsing, SHA-256 password verification, writable-store bootstrap and reread, invalid-credential rejection, and a parent-waited `spawn_as` desktop session; the desktop terminal and shell inherit the authenticated UID/GID, and BIOS plus partitioned-UEFI proofs cover first-boot bootstrap, second-boot persistent reload, authentication, command routing, exit, and child reaping
+
+- preemptive per-CPU kernel tasks and a scheduler handoff boundary
+- schedule filesystem-backed user processes on per-CPU queues with per-CPU TSS/GDT, current-process state, CR3 selection, and local-APIC preemption; a strict two-vCPU proof observes service, worker, restart, and fork-child execution on the AP while PID 1 continues on the BSP
+- initial isolated address-space root with supervisor-shared kernel mappings
+- bounded ELF64 loading, a user stack, GDT/TSS ring-3 entry, and a DPL3 syscall return path
+- PID 1 process object with scheduler registration, lifecycle states, and a tested `getpid`/`yield`/`spawn`/`waitpid`/`open`/`read`/`write`/`close`/`exit` syscall ABI whose `yield` performs a real voluntary scheduler handoff
+- filesystem-backed Rust userland ELF loading through FAT/VFS, user-space path validation, named executable selection, dynamic PID allocation, child address-space creation, scheduler registration, and child exit
+- parent-child `waitpid` blocking and wake-on-exit for multiple children, plus isolated user processes with heap-backed kernel stacks, CR3/TSS activation, timer-driven preemption, and independently verified voluntary yielding
+- bounded user-buffer validation and a file-descriptor-1 console write path exercised by both filesystem-loaded children
+- per-process file-handle tables with catalog-backed regular-file `open`/`read`/`close` exercised by both filesystem-loaded children
+- bounded POSIX `newc` initramfs carried by a FAT root file, with validated nested paths, regular-file filtering, archive limits, and a non-executable `/etc/rustos/config.txt` read proven from userland
+- shared-address-space user threads with independent user/kernel stacks, scheduler tasks, `thread_create`/`thread_join`/`thread_exit`, and wake-on-thread-exit proof in both filesystem-loaded children
+- same-PID catalog-backed `exec` replacement with a fresh address space, non-console handle closure, and runtime proof
+- same-continuation `fork` with deep user-address-space duplication, inherited handles, parent-side `waitpid`, and separate child-root runtime proof
+- bounded anonymous 4 KiB pipes with reader/writer lifetime tracking, redirected stdin/stdout inheritance on `spawn`, shell `worker | cat` composition, EOF-driven child exit, and BIOS/UEFI process-reaping proof
+- process-lifetime address-space teardown that unmaps ELF, stack, anonymous, and thread-stack pages, returns private user page tables and the root frame to the recycled pool on `exec` and exit, and emits a strict all-process `address_spaces_reclaimed=true` BIOS/UEFI proof; monotonic address-space IDs preserve isolation evidence while physical roots are reused
+- bounded ring-3 anonymous `mmap`/`munmap` with per-process page-table ownership, writable page validation, virtual-range reuse, returned physical-frame recycling, fork-preserved mappings, and a repeated allocation stress proof on BIOS and partitioned UEFI
+- config-driven bounded Rust PID 1 supervisor at `/sbin/init` that reads NUL-separated `path|retries` records from `/etc/rustos/init.cfg`, propagates child exit status through `waitpid`, and verifies one restart/recovery cycle
+- serial/USB HID/PS2-console fd 0 input, a persistent framebuffer-backed terminal, a bounded Rust `/bin/sh` command loop with UID/GID 1000 identity, a persistent `/home/user` working directory, `SYS_GETCREDENTIALS`/`SYS_PATH_INFO`, mode-aware system-file reads and home-scoped non-root writes, `cd`/`pwd`, bounded `.`/`..` and relative path resolution for `ls`/`cat`/`touch`/`mkdir`/`write`, inherited-stdio `run <path>` launching of filesystem-backed Rust programs, `help`/`id`/`whoami`/`uname`/`echo`/`cat`/`pipe`/`worker | cat`/`touch`/`mkdir`/`write`/`pkg`/`sudo pkg`/`sudo state set`/`poweroff`/`reboot`/`exit`, and BIOS/UEFI shell proofs with injected input, guest-owned ACPI shutdown and reboot, and clean PID 1 reaping; strict `--shell-proof` covers identity, the protected-system boundary, the persistent relative-file lifecycle, fixed-request root-helper execution, privileged package/state mutation, and external program launch
+- filesystem-backed `/bin/desktop` session that acquires the framebuffer through the graphics syscall ABI, starts a focused `/bin/terminal` client with a redirected `/bin/sh` child plus a storage-backed `/bin/window-secondary` file-browser client, keeps shell I/O nonblocking while keyboard and window events are serviced, renders bounded `SYS_LIST_FILES` catalog rows with refresh-on-`R`, composes both retained surfaces over a native overview scene in explicit z-order, raises the hit client on pointer button presses, routes focused keyboard events to it, maintains an interactive cursor, moves and resizes windows through compositor-only configure requests, requests client close through a window event, reaps clients, and renders a persistent multi-window native overview scene in BIOS and partitioned-UEFI guests; strict `--desktop-proof` verifies the compositor, focused clients, live storage snapshot, and framebuffer capture, while `--terminal-proof` verifies typed `help`, redirected shell output, and the exit command
+- bounded kernel-backed process and catalog snapshots exposed as shell `ps` and `ls` diagnostics, with syscall counters and a runtime proof
+- VFS traits with a FAT-backed initial on-disk filesystem, a mounted runtime writer with bounded nested-directory/file creation and growth across FAT12/FAT16/FAT32, recursive snapshots, and a kernel-loaded user executable
+- network and block-device interfaces, including external e1000/e1000e and interrupt-backed modern virtio-net paths, DHCP-backed multi-interface state, default-route selection, and the bounded network-manager syscall ABI
+- deterministic integration tests in QEMU
+
+## 3. Rust userland
+
+- bounded Rust account/session layer with fixed-size multi-record parsing and a writable `/VAR/RUSTOS/ACCOUNTS` store bootstrapped by `/sbin/login`; installer-selected users, account creation, password changes, session locking, logout, and multi-user policy remain future work required for daily use
+
+- richer PID 1 / service supervision, restart policy, and service status propagation (the first bounded restart/recovery proof is complete)
+- bounded `newc` initramfs and `/etc/rustos` system configuration (archive-backed boot proof complete)
+- shell, terminal, logging, and diagnostics utilities (`id`/`whoami`, UID/GID propagation, mode-aware system reads, home-scoped non-root writes, `ls`/`ps` snapshots, persistent nested-file `touch`/`mkdir`/`write`/`cat`, bounded `/bin/cat` pipe consumer, inherited-stdio `run <path>` launching, and fixed-request `/sbin/admin` root-helper execution for `sudo pkg` and `sudo state set`)
+- bounded `RREP3` repository with Ed25519-authenticated version index, root-signed key rotation from `RUSTKEY1` to `RUSTKEY2`, SHA-256 package digests, fixed dependency metadata, `RPKG1` payload validation, bounded dependency resolution, multi-package staging, commit-last `ACTIVE` activation, persisted trusted-key state, three-generation history, update/rollback/recovery transactions, malformed/tampered-metadata tests, and BIOS/UEFI runtime proof
+- Rust-hosted network repository sync over the kernel ARP/IPv4/UDP ABI, with signed RREP3 verification, persisted-key reuse, and BIOS/UEFI runtime proof
+- bounded DHCP discover/request/ack configuration plus `ciaddr` lease renewal for the e1000 and interrupt-backed modern virtio-net paths, one Rust network manager retaining every ready interface, midpoint timer scheduling with bounded retry, deterministic default-route selection, `SYS_NET_INFO`/`SYS_NET_INTERFACES`/`SYS_NET_RENEW`/`SYS_NET_SEND`/`SYS_NET_RECEIVE`, the shell `net`/`net interfaces`/`net renew`/`net probe` diagnostics, ARP gateway resolution, and BIOS multi-interface plus partitioned-UEFI interrupt, renewal, and repository-endpoint readback proofs; richer route policy remains future work
+- Rust-hosted installer integration that copies a selected BIOS/UEFI image to an explicit regular-file or block-device target, verifies its hash and readback, and boots installed BIOS/UEFI artifacts in QEMU
+- Rust-created UEFI installer layout with a GPT protective MBR, an EFI System Partition, a separate FAT32 RustOS root partition, root-volume selection at boot, FAT32 persistent state read/write, and UEFI runtime proof
+- Rust installer repartitioning of an existing regular-file target, with verified ESP/root partition extraction, fresh GPT reconstruction, partition-level SHA-256 readback, and UEFI boot proof; the same bounded path accepts block-device targets when the device reports sufficient capacity
+- separate BIOS/UEFI recovery images with a `recovery#` shell, recovery-marker detection, automatic verified package recovery, and installed-image runtime proof
+- user-selected filesystem layouts, destructive on-disk filesystem provisioning beyond the fixed RustOS ESP/root layout, and UEFI NVRAM boot-entry enrollment remain future installer work
+
+## 4. CachyOS-class distribution
+
+- broad hardware support and GPU-backed graphics stack
+- network manager, audio, power, and device policy (Rust multi-interface enumeration, DHCP state and renewal, midpoint retry scheduling, default-route policy, unified e1000/interrupt-backed virtio-net syscalls, Rust AC'97 and Intel HDA playback, modern virtio-net DHCP, and ACPI S5 poweroff, reboot, and S3 suspend/resume foundations are complete; richer route policy, capture/mixer/USB audio stack, battery, and thermal policy remain)
+- Wayland compositor and desktop session
+- package repositories, updates, rollback, account/user management, and developer tooling
+- performance profile matching and compatibility validation against CachyOS workloads
+
+The project will not claim “entirely Rust” until every component owned by this repository is Rust and the remaining firmware or third-party binary boundary is explicitly documented.

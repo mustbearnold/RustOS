@@ -1,0 +1,94 @@
+[package]
+name = "rustos-userland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["signature"] }
+sha2 = { version = "0.11.0", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+test = false
+
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+test = false
+
+[[bin]]
+name = "service"
+path = "src/bin/service.rs"
+test = false
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+test = false
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+test = false
+
+[[bin]]
+name = "vm"
+path = "src/bin/vm.rs"
+test = false
+
+[[bin]]
+name = "replaced"
+path = "src/bin/replaced.rs"
+test = false
+
+[[bin]]
+name = "restart"
+path = "src/bin/restart.rs"
+test = false
+
+[[bin]]
+name = "pkg"
+path = "src/bin/pkg.rs"
+test = false
+
+[[bin]]
+name = "admin"
+path = "src/bin/admin.rs"
+test = false
+
+[[bin]]
+name = "login"
+path = "src/bin/login.rs"
+test = false
+
+[[bin]]
+name = "passwd"
+path = "src/bin/passwd.rs"
+test = false
+
+[[bin]]
+name = "desktop"
+path = "src/bin/desktop.rs"
+test = false
+
+[[bin]]
+name = "terminal"
+path = "src/bin/terminal.rs"
+test = false
+
+[[bin]]
+name = "window"
+path = "src/bin/window.rs"
+test = false
+
+[[bin]]
+name = "window-secondary"
+path = "src/bin/window_secondary.rs"
+test = false
