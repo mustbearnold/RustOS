@@ -71,6 +71,7 @@ pub enum NvidiaError {
     FspQueueTimeout,
     FspSecureBootTimeout,
     FspUnavailable,
+    FspOptInRequired,
     FspResponseTimeout,
     FspResponseBufferTooSmall {
         required: usize,
@@ -659,7 +660,7 @@ impl NvidiaFspTransport {
     // Wire-ready GSP-RM transport. Boot keeps this uncalled until the r570 RM bootstrap
     // supplies SetSystemInfo and SetRegistry; queue writes are still explicit opt-in.
     #[cfg(target_os = "none")]
-    pub fn send_gsp_rpc(
+    fn send_gsp_rpc(
         &self,
         staging: &mut NvidiaGspStaging,
         function: u32,
@@ -667,6 +668,9 @@ impl NvidiaFspTransport {
         rpc_sequence: u32,
         payload: &[u8],
     ) -> Result<(), NvidiaError> {
+        if !staging.fsp_boot_requested {
+            return Err(NvidiaError::FspOptInRequired);
+        }
         let message = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
             function,
             transport_sequence,
@@ -706,7 +710,7 @@ impl NvidiaFspTransport {
     }
 
     #[cfg(target_os = "none")]
-    pub fn try_receive_gsp_rpc(
+    fn try_receive_gsp_rpc(
         &self,
         staging: &mut NvidiaGspStaging,
     ) -> Result<Option<Vec<u8>>, NvidiaError> {
@@ -753,7 +757,7 @@ impl NvidiaFspTransport {
         Err(NvidiaError::GspRpcTimeout { function })
     }
 
-    pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
+    fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
         validate_packet(packet)?;
         for _ in 0..NVIDIA_GSP_FSP_POLL_SPINS {
             let head = self
@@ -778,7 +782,7 @@ impl NvidiaFspTransport {
         Err(NvidiaError::FspQueueTimeout)
     }
 
-    pub fn try_receive(&self, buffer: &mut [u8]) -> Result<Option<usize>, NvidiaError> {
+    fn try_receive(&self, buffer: &mut [u8]) -> Result<Option<usize>, NvidiaError> {
         let head = self
             .mmio
             .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD))?;
@@ -814,7 +818,7 @@ impl NvidiaFspTransport {
         Ok(Some(packet_size))
     }
 
-    pub fn send_sync(
+    fn send_sync(
         &self,
         command_nvdm_type: u32,
         packet: &[u8],
@@ -899,6 +903,9 @@ pub fn boot_external_gsp(
     probe: &NvidiaProbe,
     staging: &mut NvidiaGspStaging,
 ) -> Result<NvidiaGspBootResult, NvidiaError> {
+    if !staging.fsp_boot_requested {
+        return Err(NvidiaError::FspOptInRequired);
+    }
     let transport = probe.fsp_transport().ok_or(NvidiaError::FspUnavailable)?;
     transport.wait_secure_boot()?;
     let fsp_response = transport.send_sync(
