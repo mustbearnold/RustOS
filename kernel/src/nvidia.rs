@@ -983,11 +983,15 @@ pub fn boot_external_gsp(
     let init_done =
         rustos_gpu_protocol::GspRpcMessage::parse(&init_done).map_err(NvidiaError::GspRpc)?;
     crate::kprintln!(
-        "driver: nvidia GSP-RM event function={} transport_sequence={} rpc_sequence={} status=consumed",
+        "driver: nvidia GSP-RM event function={} transport_sequence={} rpc_sequence={} result=0x{:08x} private_result=0x{:08x} status=consumed",
         init_done.function(),
         init_done.transport_sequence(),
         init_done.rpc_sequence(),
+        init_done.rpc_result(),
+        init_done.rpc_result_private(),
     );
+    validate_gsp_rpc_sequence_zero(init_done)?;
+    validate_gsp_rpc_result(init_done)?;
     let static_info_request = rustos_gpu_protocol::encode_gsp_static_info_request();
     transport.send_gsp_rpc(
         staging,
@@ -1015,14 +1019,8 @@ pub fn boot_external_gsp(
         static_info_message.rpc_result(),
         static_info_message.rpc_result_private(),
     );
-    validate_static_info_rpc_sequence(static_info_message)?;
-    if static_info_message.rpc_result() != 0 {
-        return Err(NvidiaError::GspRpcFailed {
-            function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
-            result: static_info_message.rpc_result(),
-            private_result: static_info_message.rpc_result_private(),
-        });
-    }
+    validate_gsp_rpc_sequence_zero(static_info_message)?;
+    validate_gsp_rpc_result(static_info_message)?;
     let static_info = rustos_gpu_protocol::parse_gsp_static_info(static_info_message.payload())
         .map_err(NvidiaError::GspStaticInfo)?;
     Ok(NvidiaGspBootResult {
@@ -1187,7 +1185,7 @@ fn io_bar_base(bar: PciBar) -> Option<u64> {
     }
 }
 
-fn validate_static_info_rpc_sequence(
+fn validate_gsp_rpc_sequence_zero(
     message: rustos_gpu_protocol::GspRpcMessage<'_>,
 ) -> Result<(), NvidiaError> {
     if message.rpc_sequence() != 0 {
@@ -1195,6 +1193,19 @@ fn validate_static_info_rpc_sequence(
             function: message.function(),
             expected_rpc: 0,
             actual_rpc: message.rpc_sequence(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_gsp_rpc_result(
+    message: rustos_gpu_protocol::GspRpcMessage<'_>,
+) -> Result<(), NvidiaError> {
+    if message.rpc_result() != 0 {
+        return Err(NvidiaError::GspRpcFailed {
+            function: message.function(),
+            result: message.rpc_result(),
+            private_result: message.rpc_result_private(),
         });
     }
     Ok(())
@@ -1377,16 +1388,19 @@ mod tests {
     }
 
     #[test]
-    fn requires_static_info_reply_rpc_sequence() {
-        let valid = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+    fn requires_zero_rpc_sequence_and_success_result() {
+        let mut valid = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
             rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
             2,
             0,
             &[],
         )
         .expect("static info reply");
+        let result_offset = rustos_gpu_protocol::NVIDIA_GSP_MESSAGE_HEADER_SIZE + 16;
+        valid[result_offset..result_offset + 4].copy_from_slice(&0u32.to_le_bytes());
         let valid = rustos_gpu_protocol::GspRpcMessage::parse(&valid).expect("parse reply");
-        assert_eq!(validate_static_info_rpc_sequence(valid), Ok(()));
+        assert_eq!(validate_gsp_rpc_sequence_zero(valid), Ok(()));
+        assert_eq!(validate_gsp_rpc_result(valid), Ok(()));
 
         let wrong = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
             rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
@@ -1397,11 +1411,33 @@ mod tests {
         .expect("static info reply");
         let wrong = rustos_gpu_protocol::GspRpcMessage::parse(&wrong).expect("parse reply");
         assert_eq!(
-            validate_static_info_rpc_sequence(wrong),
+            validate_gsp_rpc_sequence_zero(wrong),
             Err(NvidiaError::GspRpcSequenceMismatch {
                 function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
                 expected_rpc: 0,
                 actual_rpc: 2,
+            })
+        );
+
+        let mut failed = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            rustos_gpu_protocol::NVIDIA_GSP_EVENT_GSP_INIT_DONE,
+            0,
+            0,
+            &[],
+        )
+        .expect("GSP_INIT_DONE event");
+        failed[result_offset..result_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        let private_result_offset = rustos_gpu_protocol::NVIDIA_GSP_MESSAGE_HEADER_SIZE + 20;
+        failed[private_result_offset..private_result_offset + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        let failed = rustos_gpu_protocol::GspRpcMessage::parse(&failed).expect("parse event");
+        assert_eq!(validate_gsp_rpc_sequence_zero(failed), Ok(()));
+        assert_eq!(
+            validate_gsp_rpc_result(failed),
+            Err(NvidiaError::GspRpcFailed {
+                function: rustos_gpu_protocol::NVIDIA_GSP_EVENT_GSP_INIT_DONE,
+                result: 1,
+                private_result: 0,
             })
         );
     }

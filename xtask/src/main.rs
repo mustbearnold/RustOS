@@ -1550,7 +1550,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         return Err("physical NVIDIA GSP proof missing static-info reply".to_owned());
     };
     if !static_info_reply_line.contains("rpc_sequence=0")
-        || !static_info_reply_line.contains("result=0x00000000")
+        || !static_info_reply_line.contains(" result=0x00000000 ")
     {
         return Err("physical NVIDIA GSP proof has invalid static-info reply".to_owned());
     }
@@ -1560,7 +1560,10 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     else {
         return Err("physical NVIDIA GSP proof missing GSP_INIT_DONE event".to_owned());
     };
-    if !init_done_line.contains("rpc_sequence=0") || !init_done_line.contains("status=consumed") {
+    if !init_done_line.contains("rpc_sequence=0")
+        || !init_done_line.contains(" result=0x00000000 ")
+        || !init_done_line.contains("status=consumed")
+    {
         return Err("physical NVIDIA GSP proof has invalid GSP_INIT_DONE event".to_owned());
     }
     let Some(static_info_line) = content
@@ -6561,7 +6564,7 @@ mod tests {
             "driver: nvidia GSP-FMC ready hwcfg2=0x00000000 mailbox=0x00000000:0x00000000 riscv_active=true riscv_lockdown=false status=ready\n",
             "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent\n",
             "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
-            "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 status=consumed\n",
+            "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=consumed\n",
             "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=0 payload_bytes=1656 queue=shared status=sent\n",
             "driver: nvidia GSP-RM reply function=65 transport_sequence=1 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=received\n",
             "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[78, 86, 73, 68, 73, 65, 0]\n",
@@ -6602,6 +6605,12 @@ mod tests {
             "transport_sequence=1 rpc_sequence=2 result=0x00000000",
         );
         assert!(validate_nvidia_gsp_physical_log(&wrong_static_rpc).is_err());
+
+        let failed_init_done = success.replace(
+            "result=0x00000000 private_result=0x00000000 status=consumed",
+            "result=0x00000001 private_result=0x00000000 status=consumed",
+        );
+        assert!(validate_nvidia_gsp_physical_log(&failed_init_done).is_err());
 
         let empty_gpu_name =
             success.replace("gpu_name=[78, 86, 73, 68, 73, 65, 0]", "gpu_name=[0]");
