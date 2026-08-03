@@ -130,6 +130,13 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 .ok_or_else(|| "nvidia-gsp-bundle-check requires a bootloader path".to_owned())?;
             nvidia_gsp_bundle_check(version.as_bytes(), &gsp, &fmc, &bootloader)
         }
+        Some("nvidia-gsp-physical-proof") => {
+            let path = arguments
+                .get(1)
+                .map(PathBuf::from)
+                .ok_or_else(|| "nvidia-gsp-physical-proof requires a serial log path".to_owned())?;
+            nvidia_gsp_physical_proof(&path)
+        }
         Some("run") => {
             let firmware = arguments.get(1).map(String::as_str).ok_or_else(usage)?;
             let release = arguments.iter().any(|argument| argument == "--release");
@@ -1412,6 +1419,45 @@ fn nvidia_gsp_bundle_check(
         bundle.fmc.public_key.size,
         bundle.fmc.signature.size,
     );
+    Ok(())
+}
+
+fn nvidia_gsp_physical_proof(path: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("reading RustOS serial log {}: {error}", path.display()))?;
+    validate_nvidia_gsp_physical_log(&content)?;
+    println!(
+        "nvidia-gsp-physical-proof: log={} target=0b:00.0 device=0x2f04 sequence=set-system-info,set-registry,gsp-init-done,get-static-info gsp_rm=ready acceleration=unavailable status=ready",
+        path.display()
+    );
+    Ok(())
+}
+
+fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
+    let required = [
+        "driver: nvidia probe 0b:00.0 device=0x2f04",
+        "architecture=blackwell",
+        "driver: nvidia FSP COT response",
+        "status=accepted",
+        "driver: nvidia GSP-FMC ready",
+        "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info",
+        "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04",
+        "gsp_rm=ready",
+        "acceleration=unavailable",
+    ];
+    let mut cursor = 0;
+    for marker in required {
+        let Some(relative) = content[cursor..].find(marker) else {
+            return Err(format!("physical NVIDIA GSP proof missing `{marker}`"));
+        };
+        cursor += relative + marker.len();
+    }
+    if content.contains("GSP-RM bootstrap failed")
+        || content.contains("nvidia probe failed")
+        || content.contains("device_writes=disabled status=degraded")
+    {
+        return Err("physical NVIDIA GSP proof contains a degraded/failure marker".to_owned());
+    }
     Ok(())
 }
 
@@ -6190,7 +6236,7 @@ fn usage() -> String {
 }
 
 fn usage_text() -> &'static str {
-    "usage: cargo run -p rustos-xtask -- <build|check|nvidia-gsp-check|nvidia-fmc-check|nvidia-gsp-bundle-check|run|install> ..."
+    "usage: cargo run -p rustos-xtask -- <build|check|nvidia-gsp-check|nvidia-fmc-check|nvidia-gsp-bundle-check|nvidia-gsp-physical-proof|run|install> ..."
 }
 
 fn print_usage() {
@@ -6202,6 +6248,7 @@ fn print_usage() {
     println!(
         "  nvidia-gsp-bundle-check VERSION GSP FMC BOOTLOADER  validate matching GB20x firmware"
     );
+    println!("  nvidia-gsp-physical-proof LOG  verify physical target GSP-RM serial evidence");
     println!("  run bios|uefi      boot the image in QEMU with serial output");
     println!("  --shell            boot the shell-only init configuration");
     println!("  --recovery         boot the standalone recovery configuration");
@@ -6338,7 +6385,8 @@ mod tests {
         REPOSITORY_SIGNATURE_LENGTH, ahci_interrupt_count, build_repository,
         create_partitioned_uefi_image, install_image, install_partitioned_image,
         key_rotation_message, nvme_interrupt_count, partitioned_root_size,
-        validate_partitioned_root_size, virtio_interrupt_count, wav_data,
+        validate_nvidia_gsp_physical_log, validate_partitioned_root_size, virtio_interrupt_count,
+        wav_data,
     };
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::{
@@ -6350,6 +6398,24 @@ mod tests {
         0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
         0x51, 0x1a,
     ];
+
+    #[test]
+    fn physical_nvidia_gsp_proof_requires_target_and_full_sequence() {
+        let success = concat!(
+            "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
+            "driver: nvidia FSP COT response status=accepted\n",
+            "driver: nvidia GSP-FMC ready status=ready\n",
+            "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[0]\n",
+            "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
+        );
+        assert!(validate_nvidia_gsp_physical_log(success).is_ok());
+
+        let missing_static_info = success.replace("get-static-info", "missing-static-info");
+        assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());
+
+        let failed = format!("{success}driver: nvidia GSP-RM bootstrap failed status=degraded\n");
+        assert!(validate_nvidia_gsp_physical_log(&failed).is_err());
+    }
 
     #[test]
     fn virtio_interrupt_count_reads_the_runtime_diagnostic() {
