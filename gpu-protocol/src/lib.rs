@@ -50,6 +50,8 @@ pub const NVIDIA_GSP_QUEUE_ENTRY_OFFSET: usize = NVIDIA_GSP_PAGE_SIZE;
 pub const NVIDIA_GSP_QUEUE_ENTRY_SIZE: usize = NVIDIA_GSP_PAGE_SIZE;
 pub const NVIDIA_GSP_QUEUE_ENTRY_COUNT: usize =
     (NVIDIA_GSP_SHARED_QUEUE_BYTES - NVIDIA_GSP_QUEUE_ENTRY_OFFSET) / NVIDIA_GSP_QUEUE_ENTRY_SIZE;
+pub const NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET: usize = 16;
+pub const NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET: usize = 32;
 pub const NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE: usize = core::mem::size_of::<u64>();
 pub const NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE: usize = NVIDIA_GSP_PAGE_SIZE / 8;
 pub const NVIDIA_GSP_RADIX3_MAX_IMAGE_PAGES: usize =
@@ -74,7 +76,13 @@ pub const NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE: usize = 72;
 pub const NVIDIA_GSP_R570_QUEUE_RX_HEADER_OFFSET: u32 = 32;
 pub const NVIDIA_GSP_RPC_SIGNATURE: u32 = 0x4352_5056;
 pub const NVIDIA_GSP_RPC_HEADER_VERSION: u32 = 0x0300_0000;
-pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = 0x0000_0014;
+pub const NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO: u32 = 65;
+pub const NVIDIA_GSP_FUNCTION_CONTINUATION_RECORD: u32 = 71;
+pub const NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO: u32 = 72;
+pub const NVIDIA_GSP_FUNCTION_SET_REGISTRY: u32 = 73;
+pub const NVIDIA_GSP_EVENT_FIRST: u32 = 4096;
+pub const NVIDIA_GSP_EVENT_GSP_INIT_DONE: u32 = 4097;
+pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = NVIDIA_GSP_FUNCTION_CONTINUATION_RECORD;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELF_CLASS_64: u8 = 2;
@@ -1280,6 +1288,11 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, GspFirmwareError> {
 pub enum GspRpcError {
     PayloadTooLarge { size: usize, limit: usize },
     MessageTooLarge { pages: usize, limit: usize },
+    InvalidHeaderVersion { actual: u32 },
+    InvalidSignature { actual: u32 },
+    InvalidRpcLength { length: u32 },
+    InvalidElementCount { count: u32, pages: usize },
+    ChecksumMismatch { expected: u32, actual: u32 },
     SizeOverflow,
 }
 
@@ -1302,6 +1315,33 @@ impl<'a> GspRpcMessage<'a> {
                 limit: NVIDIA_GSP_MAX_MESSAGE_PAGES,
             });
         }
+        let element_count = read_le_u32(bytes, 40);
+        if usize::try_from(element_count).ok() != Some(pages) {
+            return Err(GspRpcError::InvalidElementCount {
+                count: element_count,
+                pages,
+            });
+        }
+        let rpc_offset = NVIDIA_GSP_MESSAGE_HEADER_SIZE;
+        let header_version = read_le_u32(bytes, rpc_offset);
+        if header_version != NVIDIA_GSP_RPC_HEADER_VERSION {
+            return Err(GspRpcError::InvalidHeaderVersion {
+                actual: header_version,
+            });
+        }
+        let signature = read_le_u32(bytes, rpc_offset + 4);
+        if signature != NVIDIA_GSP_RPC_SIGNATURE {
+            return Err(GspRpcError::InvalidSignature { actual: signature });
+        }
+        let rpc_length = read_le_u32(bytes, rpc_offset + 8);
+        let rpc_length_usize =
+            usize::try_from(rpc_length).map_err(|_| GspRpcError::SizeOverflow)?;
+        let rpc_end = rpc_offset
+            .checked_add(rpc_length_usize)
+            .ok_or(GspRpcError::SizeOverflow)?;
+        if rpc_length_usize < NVIDIA_GSP_RPC_HEADER_SIZE || rpc_end > bytes.len() {
+            return Err(GspRpcError::InvalidRpcLength { length: rpc_length });
+        }
         Ok(Self { bytes })
     }
 
@@ -1310,6 +1350,10 @@ impl<'a> GspRpcMessage<'a> {
     }
 
     pub fn sequence(self) -> u32 {
+        self.transport_sequence()
+    }
+
+    pub fn transport_sequence(self) -> u32 {
         read_le_u32(self.bytes, 36)
     }
 
@@ -1327,6 +1371,22 @@ impl<'a> GspRpcMessage<'a> {
 
     pub fn function(self) -> u32 {
         read_le_u32(self.bytes, NVIDIA_GSP_MESSAGE_HEADER_SIZE + 12)
+    }
+
+    pub fn rpc_result(self) -> u32 {
+        read_le_u32(self.bytes, NVIDIA_GSP_MESSAGE_HEADER_SIZE + 16)
+    }
+
+    pub fn rpc_result_private(self) -> u32 {
+        read_le_u32(self.bytes, NVIDIA_GSP_MESSAGE_HEADER_SIZE + 20)
+    }
+
+    pub fn rpc_sequence(self) -> u32 {
+        read_le_u32(self.bytes, NVIDIA_GSP_MESSAGE_HEADER_SIZE + 24)
+    }
+
+    pub fn message_length(self) -> usize {
+        self.bytes.len()
     }
 
     pub fn payload(self) -> &'a [u8] {
@@ -1349,16 +1409,23 @@ pub fn encode_gsp_rpc(
     sequence: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>, GspRpcError> {
+    encode_gsp_rpc_with_sequences(function, sequence, 0, payload)
+}
+
+pub fn encode_gsp_rpc_with_sequences(
+    function: u32,
+    transport_sequence: u32,
+    rpc_sequence: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>, GspRpcError> {
     let rpc_length = NVIDIA_GSP_RPC_HEADER_SIZE
         .checked_add(payload.len())
         .ok_or(GspRpcError::SizeOverflow)?;
-    let aligned_rpc_length = align8(rpc_length).ok_or(GspRpcError::SizeOverflow)?;
     let maximum_rpc_length = NVIDIA_GSP_MAX_MESSAGE_PAGES
         .checked_mul(NVIDIA_GSP_PAGE_SIZE)
         .and_then(|size| size.checked_sub(NVIDIA_GSP_MESSAGE_HEADER_SIZE))
-        .and_then(|size| size.checked_sub(NVIDIA_GSP_RPC_HEADER_SIZE))
         .ok_or(GspRpcError::SizeOverflow)?;
-    if aligned_rpc_length > maximum_rpc_length {
+    if rpc_length > maximum_rpc_length {
         return Err(GspRpcError::PayloadTooLarge {
             size: payload.len(),
             limit: maximum_rpc_length - NVIDIA_GSP_RPC_HEADER_SIZE,
@@ -1366,30 +1433,28 @@ pub fn encode_gsp_rpc(
     }
     let total_length = align_page(
         NVIDIA_GSP_MESSAGE_HEADER_SIZE
-            .checked_add(aligned_rpc_length)
+            .checked_add(rpc_length)
             .ok_or(GspRpcError::SizeOverflow)?,
     )
     .ok_or(GspRpcError::SizeOverflow)?;
     let mut bytes = Vec::new();
     bytes.resize(total_length, 0);
-    write_le_u32(&mut bytes, 36, sequence);
-    write_le_u32(
-        &mut bytes,
-        40,
-        u32::try_from(total_length / NVIDIA_GSP_PAGE_SIZE).unwrap_or(u32::MAX),
-    );
+    let element_count = u32::try_from(total_length / NVIDIA_GSP_PAGE_SIZE)
+        .map_err(|_| GspRpcError::SizeOverflow)?;
+    write_le_u32(&mut bytes, 36, transport_sequence);
+    write_le_u32(&mut bytes, 40, element_count);
     let rpc_offset = NVIDIA_GSP_MESSAGE_HEADER_SIZE;
     write_le_u32(&mut bytes, rpc_offset, NVIDIA_GSP_RPC_HEADER_VERSION);
     write_le_u32(&mut bytes, rpc_offset + 4, NVIDIA_GSP_RPC_SIGNATURE);
     write_le_u32(
         &mut bytes,
         rpc_offset + 8,
-        u32::try_from(aligned_rpc_length).unwrap_or(u32::MAX),
+        u32::try_from(rpc_length).map_err(|_| GspRpcError::SizeOverflow)?,
     );
     write_le_u32(&mut bytes, rpc_offset + 12, function);
     write_le_u32(&mut bytes, rpc_offset + 16, u32::MAX);
     write_le_u32(&mut bytes, rpc_offset + 20, u32::MAX);
-    write_le_u32(&mut bytes, rpc_offset + 24, sequence);
+    write_le_u32(&mut bytes, rpc_offset + 24, rpc_sequence);
     let payload_offset = rpc_offset + NVIDIA_GSP_RPC_HEADER_SIZE;
     bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
     let message_checksum = checksum(&bytes);
@@ -1397,8 +1462,227 @@ pub fn encode_gsp_rpc(
     Ok(bytes)
 }
 
-fn align8(value: usize) -> Option<usize> {
-    value.checked_add(7).map(|value| value & !7)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspQueueError {
+    BufferTooSmall {
+        required: usize,
+        actual: usize,
+    },
+    PointerOutOfRange {
+        pointer: u32,
+        count: usize,
+    },
+    QueueFull {
+        write_pointer: u32,
+        read_pointer: u32,
+    },
+    MessageNotReady {
+        required: usize,
+        available: usize,
+    },
+    Rpc(GspRpcError),
+}
+
+impl From<GspRpcError> for GspQueueError {
+    fn from(error: GspRpcError) -> Self {
+        Self::Rpc(error)
+    }
+}
+
+pub struct GspQueue<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> GspQueue<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Result<Self, GspQueueError> {
+        if bytes.len() < NVIDIA_GSP_SHARED_QUEUE_BYTES {
+            return Err(GspQueueError::BufferTooSmall {
+                required: NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn write_pointer(&self) -> Result<u32, GspQueueError> {
+        self.pointer(NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET)
+    }
+
+    pub fn read_pointer(&self) -> Result<u32, GspQueueError> {
+        self.pointer(NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET)
+    }
+
+    pub fn available_entries(&self) -> Result<usize, GspQueueError> {
+        let write = self.write_pointer()?;
+        let read = self.read_pointer()?;
+        let used = queue_distance(read, write)?;
+        Ok(NVIDIA_GSP_QUEUE_ENTRY_COUNT - used - 1)
+    }
+
+    pub fn write_message(&mut self, message: &[u8]) -> Result<u32, GspQueueError> {
+        let parsed = GspRpcMessage::parse(message)?;
+        if !parsed.checksum_valid() {
+            return Err(GspRpcError::ChecksumMismatch {
+                expected: checksum(message),
+                actual: parsed.checksum(),
+            }
+            .into());
+        }
+        let pages = message.len() / NVIDIA_GSP_PAGE_SIZE;
+        let write = self.write_pointer()?;
+        let read = self.read_pointer()?;
+        let available = self.available_entries()?;
+        if pages > available {
+            return Err(GspQueueError::QueueFull {
+                write_pointer: write,
+                read_pointer: read,
+            });
+        }
+        for page in 0..pages {
+            let slot = queue_advance(write, page)?;
+            let offset = queue_slot_offset(slot)?;
+            let slot_bytes = &mut self.bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE];
+            slot_bytes.fill(0);
+            let source_start = page * NVIDIA_GSP_PAGE_SIZE;
+            slot_bytes.copy_from_slice(&message[source_start..source_start + NVIDIA_GSP_PAGE_SIZE]);
+        }
+        let next = queue_advance(write, pages)?;
+        write_le_u32(self.bytes, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET, next);
+        Ok(next)
+    }
+
+    pub fn try_receive_message(&mut self) -> Result<Option<Vec<u8>>, GspQueueError> {
+        let write = self.write_pointer()?;
+        let read = self.read_pointer()?;
+        if write == read {
+            return Ok(None);
+        }
+        let available = queue_distance(read, write)?;
+        let first_offset = queue_slot_offset(read)?;
+        let element_count = read_le_u32(self.bytes, first_offset + 40);
+        let pages = usize::try_from(element_count).map_err(|_| GspRpcError::SizeOverflow)?;
+        if pages == 0 || pages > NVIDIA_GSP_MAX_MESSAGE_PAGES {
+            return Err(GspRpcError::InvalidElementCount {
+                count: element_count,
+                pages,
+            }
+            .into());
+        }
+        if pages > available {
+            return Err(GspQueueError::MessageNotReady {
+                required: pages,
+                available,
+            });
+        }
+        let message_bytes = pages
+            .checked_mul(NVIDIA_GSP_PAGE_SIZE)
+            .ok_or(GspRpcError::SizeOverflow)?;
+        let mut message = Vec::new();
+        message.resize(message_bytes, 0);
+        for page in 0..pages {
+            let slot = queue_advance(read, page)?;
+            let offset = queue_slot_offset(slot)?;
+            let destination_start = page * NVIDIA_GSP_PAGE_SIZE;
+            message[destination_start..destination_start + NVIDIA_GSP_PAGE_SIZE]
+                .copy_from_slice(&self.bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE]);
+        }
+        let parsed = GspRpcMessage::parse(&message)?;
+        if !parsed.checksum_valid() {
+            return Err(GspRpcError::ChecksumMismatch {
+                expected: checksum(&message),
+                actual: parsed.checksum(),
+            }
+            .into());
+        }
+        let next = queue_advance(read, pages)?;
+        write_le_u32(self.bytes, NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET, next);
+        Ok(Some(message))
+    }
+
+    fn pointer(&self, offset: usize) -> Result<u32, GspQueueError> {
+        let pointer = read_le_u32(self.bytes, offset);
+        let out_of_range = match usize::try_from(pointer) {
+            Ok(value) => value >= NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+            Err(_) => true,
+        };
+        if out_of_range {
+            return Err(GspQueueError::PointerOutOfRange {
+                pointer,
+                count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+            });
+        }
+        Ok(pointer)
+    }
+}
+
+fn queue_distance(from: u32, to: u32) -> Result<usize, GspQueueError> {
+    let from = usize::try_from(from).map_err(|_| GspQueueError::PointerOutOfRange {
+        pointer: from,
+        count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+    })?;
+    let to = usize::try_from(to).map_err(|_| GspQueueError::PointerOutOfRange {
+        pointer: to,
+        count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+    })?;
+    if from >= NVIDIA_GSP_QUEUE_ENTRY_COUNT {
+        return Err(GspQueueError::PointerOutOfRange {
+            pointer: from as u32,
+            count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        });
+    }
+    if to >= NVIDIA_GSP_QUEUE_ENTRY_COUNT {
+        return Err(GspQueueError::PointerOutOfRange {
+            pointer: to as u32,
+            count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        });
+    }
+    Ok(if to >= from {
+        to - from
+    } else {
+        NVIDIA_GSP_QUEUE_ENTRY_COUNT - from + to
+    })
+}
+
+fn queue_advance(pointer: u32, entries: usize) -> Result<u32, GspQueueError> {
+    let pointer = usize::try_from(pointer).map_err(|_| GspQueueError::PointerOutOfRange {
+        pointer,
+        count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+    })?;
+    if pointer >= NVIDIA_GSP_QUEUE_ENTRY_COUNT {
+        return Err(GspQueueError::PointerOutOfRange {
+            pointer: pointer as u32,
+            count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        });
+    }
+    let next = (pointer + entries) % NVIDIA_GSP_QUEUE_ENTRY_COUNT;
+    u32::try_from(next).map_err(|_| GspQueueError::PointerOutOfRange {
+        pointer: next as u32,
+        count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+    })
+}
+
+fn queue_slot_offset(slot: u32) -> Result<usize, GspQueueError> {
+    let slot = usize::try_from(slot).map_err(|_| GspQueueError::PointerOutOfRange {
+        pointer: slot,
+        count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+    })?;
+    if slot >= NVIDIA_GSP_QUEUE_ENTRY_COUNT {
+        return Err(GspQueueError::PointerOutOfRange {
+            pointer: slot as u32,
+            count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        });
+    }
+    NVIDIA_GSP_QUEUE_ENTRY_OFFSET
+        .checked_add(slot.checked_mul(NVIDIA_GSP_QUEUE_ENTRY_SIZE).ok_or(
+            GspQueueError::BufferTooSmall {
+                required: usize::MAX,
+                actual: NVIDIA_GSP_SHARED_QUEUE_BYTES,
+            },
+        )?)
+        .ok_or(GspQueueError::BufferTooSmall {
+            required: usize::MAX,
+            actual: NVIDIA_GSP_SHARED_QUEUE_BYTES,
+        })
 }
 
 fn align_page(value: usize) -> Option<usize> {
@@ -1856,11 +2140,72 @@ mod tests {
         let message = GspRpcMessage::parse(&message).expect("message");
         assert_eq!(message.bytes().len(), NVIDIA_GSP_PAGE_SIZE);
         assert_eq!(message.sequence(), 7);
+        assert_eq!(message.transport_sequence(), 7);
+        assert_eq!(message.rpc_sequence(), 0);
         assert_eq!(message.element_count(), 1);
         assert_eq!(message.function(), 0x1234);
-        assert_eq!(&message.payload()[..5], b"hello");
-        assert!(message.payload()[5..].iter().all(|byte| *byte == 0));
+        assert_eq!(message.payload(), b"hello");
         assert!(message.checksum_valid());
+    }
+
+    #[test]
+    fn encodes_distinct_transport_and_rpc_sequences() {
+        let bytes = encode_gsp_rpc_with_sequences(65, 11, 0, b"static-info").expect("rpc");
+        let message = GspRpcMessage::parse(&bytes).expect("message");
+        assert_eq!(message.transport_sequence(), 11);
+        assert_eq!(message.rpc_sequence(), 0);
+        assert_eq!(message.function(), NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO);
+    }
+
+    #[test]
+    fn enqueues_and_receives_wrapped_r570_queue_elements() {
+        let message = encode_gsp_rpc_with_sequences(
+            NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            3,
+            3,
+            b"static-info",
+        )
+        .expect("rpc");
+        let mut command_queue = vec![0u8; NVIDIA_GSP_SHARED_QUEUE_BYTES];
+        let mut command = GspQueue::new(&mut command_queue).expect("command queue");
+        assert_eq!(command.available_entries().expect("capacity"), 62);
+        assert_eq!(command.write_message(&message).expect("enqueue"), 1);
+        assert_eq!(command.write_pointer().expect("write pointer"), 1);
+        drop(command);
+        let command_message_offset = queue_slot_offset(0).expect("slot");
+        assert_eq!(
+            GspRpcMessage::parse(
+                &command_queue
+                    [command_message_offset..command_message_offset + NVIDIA_GSP_PAGE_SIZE]
+            )
+            .expect("queued message")
+            .function(),
+            NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO
+        );
+
+        let mut status_queue = vec![0u8; NVIDIA_GSP_SHARED_QUEUE_BYTES];
+        let wrapped_slot =
+            queue_slot_offset((NVIDIA_GSP_QUEUE_ENTRY_COUNT - 1) as u32).expect("wrapped slot");
+        status_queue[wrapped_slot..wrapped_slot + NVIDIA_GSP_PAGE_SIZE].copy_from_slice(&message);
+        write_le_u32(
+            &mut status_queue,
+            NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET,
+            0,
+        );
+        write_le_u32(
+            &mut status_queue,
+            NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET,
+            62,
+        );
+        let mut status = GspQueue::new(&mut status_queue).expect("status queue");
+        let received = status
+            .try_receive_message()
+            .expect("receive")
+            .expect("message available");
+        let received = GspRpcMessage::parse(&received).expect("received message");
+        assert_eq!(received.function(), NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO);
+        assert_eq!(received.transport_sequence(), 3);
+        assert_eq!(status.read_pointer().expect("read pointer"), 0);
     }
 
     #[test]

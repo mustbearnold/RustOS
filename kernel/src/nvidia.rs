@@ -1,4 +1,7 @@
 #[cfg(target_os = "none")]
+use alloc::vec::Vec;
+
+#[cfg(target_os = "none")]
 use bootloader_api::info::MemoryRegion;
 
 #[cfg(target_os = "none")]
@@ -54,17 +57,37 @@ pub enum NvidiaError {
     MemorySpaceDisabled,
     MissingBar0,
     FspPacketEmpty,
-    FspPacketUnaligned { size: usize },
-    FspPacketTooLarge { size: usize },
-    FspQueuePointerInvalid { head: u32, tail: u32 },
+    FspPacketUnaligned {
+        size: usize,
+    },
+    FspPacketTooLarge {
+        size: usize,
+    },
+    FspQueuePointerInvalid {
+        head: u32,
+        tail: u32,
+    },
     FspQueueTimeout,
     FspSecureBootTimeout,
     FspUnavailable,
     FspResponseTimeout,
-    FspResponseBufferTooSmall { required: usize, actual: usize },
+    FspResponseBufferTooSmall {
+        required: usize,
+        actual: usize,
+    },
     FspResponse(rustos_gpu_protocol::GspFspResponseError),
+    GspRpc(rustos_gpu_protocol::GspRpcError),
+    GspQueue(rustos_gpu_protocol::GspQueueError),
+    GspSharedMemoryOutOfRange {
+        offset: usize,
+        size: usize,
+        available: usize,
+    },
     GspFmcBootTimeout,
-    GspFmcBootFailed { mailbox0: u32, mailbox1: u32 },
+    GspFmcBootFailed {
+        mailbox0: u32,
+        mailbox1: u32,
+    },
     GspRiscvInactiveTimeout,
 }
 
@@ -155,6 +178,38 @@ impl NvidiaGspStaging {
 
     pub fn next_frame_address(&self) -> u64 {
         self.next_frame_address
+    }
+
+    fn shared_memory_mut(&mut self) -> Result<&mut [u8], NvidiaError> {
+        let available = self.system_memory.range.byte_length();
+        let offset = self
+            .plan
+            .shared_memory
+            .address
+            .checked_sub(self.plan.system_base)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: usize::MAX,
+                size: self.plan.shared_memory.size,
+                available,
+            })?;
+        let size = self.plan.shared_memory.size;
+        let end = offset
+            .checked_add(size)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset,
+                size,
+                available,
+            })?;
+        let bytes = self.system_memory.as_mut_slice();
+        match bytes.get_mut(offset..end) {
+            Some(shared) => Ok(shared),
+            None => Err(NvidiaError::GspSharedMemoryOutOfRange {
+                offset,
+                size,
+                available,
+            }),
+        }
     }
 }
 
@@ -588,6 +643,84 @@ impl NvidiaFspTransport {
             | NvidiaGspFmcPollState::RiscvLockdown
             | NvidiaGspFmcPollState::Ready(_) => Err(NvidiaError::GspFmcBootTimeout),
         }
+    }
+
+    // Wire-ready GSP-RM transport. Boot keeps this uncalled until the r570 RM bootstrap
+    // supplies SetSystemInfo and SetRegistry; queue writes are still explicit opt-in.
+    #[cfg(target_os = "none")]
+    pub fn send_gsp_rpc(
+        &self,
+        staging: &mut NvidiaGspStaging,
+        function: u32,
+        transport_sequence: u32,
+        rpc_sequence: u32,
+        payload: &[u8],
+    ) -> Result<(), NvidiaError> {
+        let message = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            function,
+            transport_sequence,
+            rpc_sequence,
+            payload,
+        )
+        .map_err(NvidiaError::GspRpc)?;
+        let layout = staging.plan.layout.shared_memory;
+        let queue_end = layout
+            .command_queue_offset
+            .checked_add(rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.command_queue_offset,
+                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                available: staging.plan.shared_memory.size,
+            })?;
+        let shared = staging.shared_memory_mut()?;
+        let available = shared.len();
+        let queue_bytes = shared
+            .get_mut(layout.command_queue_offset..queue_end)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.command_queue_offset,
+                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                available,
+            })?;
+        let mut queue =
+            rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
+        queue
+            .write_message(&message)
+            .map_err(NvidiaError::GspQueue)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        self.mmio.write_u32(
+            u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_QUEUE_HEAD),
+            0,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn try_receive_gsp_rpc(
+        &self,
+        staging: &mut NvidiaGspStaging,
+    ) -> Result<Option<Vec<u8>>, NvidiaError> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let layout = staging.plan.layout.shared_memory;
+        let queue_end = layout
+            .status_queue_offset
+            .checked_add(rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.status_queue_offset,
+                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                available: staging.plan.shared_memory.size,
+            })?;
+        let shared = staging.shared_memory_mut()?;
+        let available = shared.len();
+        let queue_bytes = shared
+            .get_mut(layout.status_queue_offset..queue_end)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.status_queue_offset,
+                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                available,
+            })?;
+        let mut queue =
+            rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
+        queue.try_receive_message().map_err(NvidiaError::GspQueue)
     }
 
     pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
