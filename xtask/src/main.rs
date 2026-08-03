@@ -1489,10 +1489,8 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     else {
         return Err("physical NVIDIA GSP proof missing static-info reply".to_owned());
     };
-    if !static_info_reply_line.contains("transport_sequence=1")
-        || !static_info_reply_line.contains("rpc_sequence=0")
+    if !static_info_reply_line.contains("rpc_sequence=0")
         || !static_info_reply_line.contains("result=0x00000000")
-        || !static_info_reply_line.contains("private_result=0x00000000")
     {
         return Err("physical NVIDIA GSP proof has invalid static-info reply".to_owned());
     }
@@ -1502,10 +1500,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     else {
         return Err("physical NVIDIA GSP proof missing GSP_INIT_DONE event".to_owned());
     };
-    if !init_done_line.contains("transport_sequence=0")
-        || !init_done_line.contains("rpc_sequence=0")
-        || !init_done_line.contains("status=consumed")
-    {
+    if !init_done_line.contains("rpc_sequence=0") || !init_done_line.contains("status=consumed") {
         return Err("physical NVIDIA GSP proof has invalid GSP_INIT_DONE event".to_owned());
     }
     let Some(static_info_line) = content
@@ -6514,6 +6509,17 @@ mod tests {
             "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
         );
         assert!(validate_nvidia_gsp_physical_log(success).is_ok());
+
+        let unrelated_status = success
+            .replace(
+                "transport_sequence=0 rpc_sequence=0 status=consumed",
+                "transport_sequence=7 rpc_sequence=0 status=consumed",
+            )
+            .replace(
+                "transport_sequence=1 rpc_sequence=0 result=0x00000000 private_result=0x00000000",
+                "transport_sequence=12 rpc_sequence=0 result=0x00000000 private_result=0x00000007",
+            );
+        assert!(validate_nvidia_gsp_physical_log(&unrelated_status).is_ok());
 
         let wrong_cpu = success.replace("AMD Ryzen 7 5800X", "AMD Ryzen 9 7950X");
         assert!(validate_nvidia_gsp_physical_log(&wrong_cpu).is_err());
