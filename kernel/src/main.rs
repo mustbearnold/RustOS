@@ -462,6 +462,56 @@ fn configure_virtio_interrupts(runtime: &mut virtio_net::VirtioNetRuntime) -> bo
 }
 
 #[cfg(target_os = "none")]
+fn copy_cpuid_register(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_os = "none")]
+fn cpuid_text(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end])
+        .unwrap_or("unknown")
+        .trim()
+}
+
+#[cfg(target_os = "none")]
+fn platform_identity() -> ([u8; 12], [u8; 48]) {
+    let basic = core::arch::x86_64::__cpuid(0);
+    let mut vendor = [0u8; 12];
+    copy_cpuid_register(&mut vendor, 0, basic.ebx);
+    copy_cpuid_register(&mut vendor, 4, basic.edx);
+    copy_cpuid_register(&mut vendor, 8, basic.ecx);
+
+    let mut brand = [0u8; 48];
+    let extended = core::arch::x86_64::__cpuid(0x8000_0000);
+    if extended.eax >= 0x8000_0004 {
+        for (index, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+            let result = core::arch::x86_64::__cpuid(leaf);
+            let offset = index * 16;
+            copy_cpuid_register(&mut brand, offset, result.eax);
+            copy_cpuid_register(&mut brand, offset + 4, result.ebx);
+            copy_cpuid_register(&mut brand, offset + 8, result.ecx);
+            copy_cpuid_register(&mut brand, offset + 12, result.edx);
+        }
+    }
+    (vendor, brand)
+}
+
+#[cfg(target_os = "none")]
+fn log_platform_identity(summary: memory::MemorySummary) {
+    let (vendor, brand) = platform_identity();
+    kprintln!(
+        "platform: cpu_vendor={} cpu_brand={} usable_memory_kib={} status=present",
+        cpuid_text(&vendor),
+        cpuid_text(&brand),
+        summary.usable_bytes / 1024
+    );
+}
+
+#[cfg(target_os = "none")]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console::init();
     let user_mode = process::init_user_mode();
@@ -488,6 +538,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         summary.reserved_regions,
         summary.reserved_bytes / 1024
     );
+    log_platform_identity(summary);
 
     let frame_count = memory::usable_frame_count(&boot_info.memory_regions);
     let mut frame_allocator = memory::FrameAllocator::new(&boot_info.memory_regions);

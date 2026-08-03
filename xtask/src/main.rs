@@ -29,6 +29,7 @@ use std::{
 
 const TARGET: &str = "x86_64-unknown-none";
 const KERNEL_BINARY: &str = "rustos-kernel";
+const TARGET_MIN_USABLE_MEMORY_KIB: u64 = 30 * 1024 * 1024;
 const REPOSITORY_ENTRY_LENGTH: usize = 82;
 const REPOSITORY_HEADER_LENGTH: usize = 16;
 const REPOSITORY_SIGNATURE_LENGTH: usize = 64;
@@ -1435,6 +1436,7 @@ fn nvidia_gsp_physical_proof(path: &Path) -> Result<(), String> {
 
 fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     let required = [
+        "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X",
         "driver: nvidia probe 0b:00.0 device=0x2f04",
         "architecture=blackwell",
         "driver: nvidia FSP COT response",
@@ -1459,6 +1461,24 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
             return Err(format!("physical NVIDIA GSP proof missing `{marker}`"));
         };
         cursor += relative + marker.len();
+    }
+    let Some(platform_line) = content
+        .lines()
+        .find(|line| line.contains("platform: cpu_vendor="))
+    else {
+        return Err("physical NVIDIA GSP proof missing platform identity".to_owned());
+    };
+    let Some(usable_memory_kib) = platform_line
+        .split_once("usable_memory_kib=")
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Err("physical NVIDIA GSP proof missing usable memory".to_owned());
+    };
+    if usable_memory_kib < TARGET_MIN_USABLE_MEMORY_KIB {
+        return Err(format!(
+            "physical NVIDIA GSP proof has only {usable_memory_kib} KiB usable memory; target floor is {TARGET_MIN_USABLE_MEMORY_KIB} KiB"
+        ));
     }
     let Some(static_info_line) = content
         .lines()
@@ -6432,6 +6452,7 @@ mod tests {
     #[test]
     fn physical_nvidia_gsp_proof_requires_target_and_full_sequence() {
         let success = concat!(
+            "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor usable_memory_kib=32760016 status=present\n",
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
             "driver: nvidia FSP COT response status=accepted\n",
             "driver: nvidia GSP-FMC ready status=ready\n",
@@ -6445,6 +6466,13 @@ mod tests {
             "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
         );
         assert!(validate_nvidia_gsp_physical_log(success).is_ok());
+
+        let wrong_cpu = success.replace("AMD Ryzen 7 5800X", "AMD Ryzen 9 7950X");
+        assert!(validate_nvidia_gsp_physical_log(&wrong_cpu).is_err());
+
+        let too_little_memory =
+            success.replace("usable_memory_kib=32760016", "usable_memory_kib=16777216");
+        assert!(validate_nvidia_gsp_physical_log(&too_little_memory).is_err());
 
         let missing_static_info = success.replace("get-static-info", "missing-static-info");
         assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());
