@@ -1441,6 +1441,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         "status=accepted",
         "driver: nvidia GSP-FMC ready",
         "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info",
+        "gsp_rm_status=gsp-rm-ready device_writes=opt-in",
         "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04",
         "gsp_rm=ready",
         "acceleration=unavailable",
@@ -6406,6 +6407,7 @@ mod tests {
             "driver: nvidia FSP COT response status=accepted\n",
             "driver: nvidia GSP-FMC ready status=ready\n",
             "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[0]\n",
+            "driver: nvidia GSP staging gsp_rm_status=gsp-rm-ready device_writes=opt-in status=ready\n",
             "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
         );
         assert!(validate_nvidia_gsp_physical_log(success).is_ok());

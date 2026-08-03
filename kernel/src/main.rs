@@ -1429,7 +1429,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     "disabled"
                 };
                 kprintln!(
-                    "driver: nvidia GSP staging system_base=0x{:x} system_bytes={} system_pages={} system_end=0x{:x} gsp_bytes={} fmc_bytes={} bootloader_bytes={} fsp_cot_bytes={} framebuffer_size={} frts=0x{:x}+0x{:x} fsp_boot={} device_writes={} status=ready",
+                    "driver: nvidia GSP staging system_base=0x{:x} system_bytes={} system_pages={} system_end=0x{:x} gsp_bytes={} fmc_bytes={} bootloader_bytes={} fsp_cot_bytes={} framebuffer_size={} frts=0x{:x}+0x{:x} gsp_rm_status={} device_writes={} status=ready",
                     staging.system_base(),
                     staging.system_bytes(),
                     staging.system_pages(),
