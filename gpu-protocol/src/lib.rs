@@ -12,6 +12,21 @@ pub const NVIDIA_GSP_PAGE_SIZE: usize = 4096;
 pub const NVIDIA_GSP_MAX_MESSAGE_PAGES: usize = 16;
 pub const NVIDIA_GSP_MESSAGE_HEADER_SIZE: usize = 48;
 pub const NVIDIA_GSP_RPC_HEADER_SIZE: usize = 32;
+pub const NVIDIA_GSP_SHARED_QUEUE_BYTES: usize = 0x40000;
+pub const NVIDIA_GSP_SHARED_QUEUE_COUNT: usize = 2;
+pub const NVIDIA_GSP_QUEUE_HEADER_SIZE: usize = 32;
+pub const NVIDIA_GSP_QUEUE_ENTRY_OFFSET: usize = NVIDIA_GSP_PAGE_SIZE;
+pub const NVIDIA_GSP_QUEUE_ENTRY_SIZE: usize = NVIDIA_GSP_PAGE_SIZE;
+pub const NVIDIA_GSP_QUEUE_ENTRY_COUNT: usize =
+    (NVIDIA_GSP_SHARED_QUEUE_BYTES - NVIDIA_GSP_QUEUE_ENTRY_OFFSET) / NVIDIA_GSP_QUEUE_ENTRY_SIZE;
+pub const NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE: usize = NVIDIA_GSP_PAGE_SIZE / 8;
+pub const NVIDIA_GSP_RADIX3_MAX_IMAGE_PAGES: usize =
+    NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE * NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE;
+pub const NVIDIA_GSP_WPR_ALIGNMENT: usize = 128 * 1024;
+pub const NVIDIA_GSP_R570_BAREMETAL_OS_CARVEOUT: usize = 22 * 1024 * 1024;
+pub const NVIDIA_GSP_R570_BASE_RM_HEAP: usize = 14 * 1024 * 1024;
+pub const NVIDIA_GSP_R570_MIN_RM_HEAP: usize = 88 * 1024 * 1024;
+pub const NVIDIA_GSP_R570_GB20X_NON_WPR_HEAP: usize = 0x220000;
 pub const NVIDIA_GSP_RPC_SIGNATURE: u32 = 0x4352_5056;
 pub const NVIDIA_GSP_RPC_HEADER_VERSION: u32 = 0x0300_0000;
 pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = 0x0000_0014;
@@ -47,6 +62,14 @@ pub enum GspFirmwareError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspBootPlanError {
+    MissingGb20xSignature,
+    EmptyGb20xSignature,
+    ImageTooLarge { pages: usize, limit: usize },
+    SizeOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareSection {
     pub offset: usize,
     pub size: usize,
@@ -64,6 +87,55 @@ pub struct GspFirmware {
     pub version: FirmwareSection,
     pub gb20x_signature: Option<FirmwareSection>,
     pub section_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspSharedMemoryLayout {
+    pub page_table_entry_count: usize,
+    pub page_table_bytes: usize,
+    pub command_queue_offset: usize,
+    pub status_queue_offset: usize,
+    pub total_bytes: usize,
+    pub queue_entry_count: usize,
+}
+
+impl GspSharedMemoryLayout {
+    pub const fn standard() -> Self {
+        let queue_pages =
+            (NVIDIA_GSP_SHARED_QUEUE_BYTES * NVIDIA_GSP_SHARED_QUEUE_COUNT) / NVIDIA_GSP_PAGE_SIZE;
+        let page_table_entry_count = queue_pages + 1;
+        let page_table_bytes = NVIDIA_GSP_PAGE_SIZE;
+        let command_queue_offset = page_table_bytes;
+        let status_queue_offset = command_queue_offset + NVIDIA_GSP_SHARED_QUEUE_BYTES;
+        let total_bytes = status_queue_offset + NVIDIA_GSP_SHARED_QUEUE_BYTES;
+        Self {
+            page_table_entry_count,
+            page_table_bytes,
+            command_queue_offset,
+            status_queue_offset,
+            total_bytes,
+            queue_entry_count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspRadix3Layout {
+    pub image_pages: usize,
+    pub level0_bytes: usize,
+    pub level1_bytes: usize,
+    pub level2_bytes: usize,
+    pub level2_pages: usize,
+    pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspFirmwareLayout {
+    pub image: FirmwareSection,
+    pub signature: FirmwareSection,
+    pub signature_allocation_bytes: usize,
+    pub radix3: GspRadix3Layout,
+    pub shared_memory: GspSharedMemoryLayout,
 }
 
 impl GspFirmware {
@@ -169,6 +241,50 @@ impl GspFirmware {
     pub const fn supports_gb20x(self) -> bool {
         self.gb20x_signature.is_some()
     }
+
+    pub fn boot_layout(self) -> Result<GspFirmwareLayout, GspBootPlanError> {
+        let signature = self
+            .gb20x_signature
+            .ok_or(GspBootPlanError::MissingGb20xSignature)?;
+        if signature.size == 0 {
+            return Err(GspBootPlanError::EmptyGb20xSignature);
+        }
+        let image_pages = ceil_div(self.image.size, NVIDIA_GSP_PAGE_SIZE)
+            .ok_or(GspBootPlanError::SizeOverflow)?;
+        if image_pages > NVIDIA_GSP_RADIX3_MAX_IMAGE_PAGES {
+            return Err(GspBootPlanError::ImageTooLarge {
+                pages: image_pages,
+                limit: NVIDIA_GSP_RADIX3_MAX_IMAGE_PAGES,
+            });
+        }
+        let level2_bytes = align_page(
+            image_pages
+                .checked_mul(core::mem::size_of::<u64>())
+                .ok_or(GspBootPlanError::SizeOverflow)?,
+        )
+        .ok_or(GspBootPlanError::SizeOverflow)?;
+        let level2_pages = level2_bytes / NVIDIA_GSP_PAGE_SIZE;
+        let signature_allocation_bytes =
+            align_value(signature.size, 256).ok_or(GspBootPlanError::SizeOverflow)?;
+        let radix3 = GspRadix3Layout {
+            image_pages,
+            level0_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level1_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level2_bytes,
+            level2_pages,
+            total_bytes: NVIDIA_GSP_PAGE_SIZE
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(level2_bytes))
+                .ok_or(GspBootPlanError::SizeOverflow)?,
+        };
+        Ok(GspFirmwareLayout {
+            image: self.image,
+            signature,
+            signature_allocation_bytes,
+            radix3,
+            shared_memory: GspSharedMemoryLayout::standard(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +383,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, GspFirmwareError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GspRpcError {
     PayloadTooLarge { size: usize, limit: usize },
+    MessageTooLarge { pages: usize, limit: usize },
     SizeOverflow,
 }
 
@@ -281,6 +398,13 @@ impl<'a> GspRpcMessage<'a> {
             || bytes.len() % NVIDIA_GSP_PAGE_SIZE != 0
         {
             return Err(GspRpcError::SizeOverflow);
+        }
+        let pages = bytes.len() / NVIDIA_GSP_PAGE_SIZE;
+        if pages > NVIDIA_GSP_MAX_MESSAGE_PAGES {
+            return Err(GspRpcError::MessageTooLarge {
+                pages,
+                limit: NVIDIA_GSP_MAX_MESSAGE_PAGES,
+            });
         }
         Ok(Self { bytes })
     }
@@ -385,6 +509,16 @@ fn align_page(value: usize) -> Option<usize> {
     value
         .checked_add(NVIDIA_GSP_PAGE_SIZE - 1)
         .map(|value| value & !(NVIDIA_GSP_PAGE_SIZE - 1))
+}
+
+fn align_value(value: usize, alignment: usize) -> Option<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+}
+
+fn ceil_div(value: usize, divisor: usize) -> Option<usize> {
+    value.checked_add(divisor - 1).map(|value| value / divisor)
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
@@ -531,6 +665,51 @@ mod tests {
     }
 
     #[test]
+    fn plans_gb20x_radix3_and_shared_memory_layout() {
+        let bytes = synthetic_firmware();
+        let firmware = GspFirmware::parse(&bytes).expect("firmware");
+        let layout = firmware.boot_layout().expect("boot layout");
+        assert_eq!(layout.radix3.image_pages, 1);
+        assert_eq!(layout.radix3.level2_bytes, NVIDIA_GSP_PAGE_SIZE);
+        assert_eq!(layout.radix3.level2_pages, 1);
+        assert_eq!(layout.radix3.total_bytes, 3 * NVIDIA_GSP_PAGE_SIZE);
+        assert_eq!(layout.signature_allocation_bytes, 256);
+        assert_eq!(layout.shared_memory.page_table_entry_count, 129);
+        assert_eq!(layout.shared_memory.page_table_bytes, NVIDIA_GSP_PAGE_SIZE);
+        assert_eq!(
+            layout.shared_memory.command_queue_offset,
+            NVIDIA_GSP_PAGE_SIZE
+        );
+        assert_eq!(
+            layout.shared_memory.status_queue_offset,
+            NVIDIA_GSP_PAGE_SIZE + NVIDIA_GSP_SHARED_QUEUE_BYTES
+        );
+        assert_eq!(layout.shared_memory.total_bytes, 129 * NVIDIA_GSP_PAGE_SIZE);
+        assert_eq!(layout.shared_memory.queue_entry_count, 63);
+    }
+
+    #[test]
+    fn boot_layout_requires_the_generation_signature() {
+        let mut bytes = synthetic_firmware();
+        let signature_name = b".fwsignature_gb20x";
+        let name_offset = name_offset(
+            b"\0.fwimage\0.fwversion\0.fwsignature_gb20x\0.shstrtab\0",
+            signature_name,
+        );
+        let section_table_offset = read_u64(&bytes, 40).expect("section table") as usize;
+        write_le_u32(
+            &mut bytes,
+            section_table_offset + 3 * NVIDIA_GSP_ELF_SECTION_HEADER_SIZE,
+            name_offset as u32 + 1,
+        );
+        let firmware = GspFirmware::parse(&bytes).expect("firmware");
+        assert_eq!(
+            firmware.boot_layout(),
+            Err(GspBootPlanError::MissingGb20xSignature)
+        );
+    }
+
+    #[test]
     fn rejects_non_riscv_firmware() {
         let mut bytes = synthetic_firmware();
         write_le_u16(&mut bytes, 18, 0x8664);
@@ -559,6 +738,19 @@ mod tests {
         assert!(matches!(
             encode_gsp_rpc(1, 0, &payload),
             Err(GspRpcError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_message_that_exceeds_the_queue_element_limit() {
+        let pages = NVIDIA_GSP_MAX_MESSAGE_PAGES + 1;
+        let bytes = vec![0u8; pages * NVIDIA_GSP_PAGE_SIZE];
+        assert!(matches!(
+            GspRpcMessage::parse(&bytes),
+            Err(GspRpcError::MessageTooLarge {
+                pages: actual_pages,
+                limit: NVIDIA_GSP_MAX_MESSAGE_PAGES
+            }) if actual_pages == pages
         ));
     }
 }

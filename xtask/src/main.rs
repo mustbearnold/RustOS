@@ -1166,18 +1166,28 @@ fn nvidia_gsp_check(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("reading NVIDIA GSP firmware {}: {error}", path.display()))?;
     let descriptor = GspFirmware::parse(&firmware)
         .map_err(|error| format!("parsing NVIDIA GSP firmware {}: {error:?}", path.display()))?;
+    let layout = descriptor
+        .boot_layout()
+        .map_err(|error| format!("planning NVIDIA GSP boot layout: {error:?}"))?;
     let command = encode_gsp_rpc(0, 1, &[])
         .map_err(|error| format!("encoding GSP RPC smoke command: {error:?}"))?;
     let message = GspRpcMessage::parse(&command)
         .map_err(|error| format!("parsing GSP RPC smoke command: {error:?}"))?;
     println!(
-        "nvidia-gsp: path={} bytes={} image_offset=0x{:x} image_bytes={} version={} gb20x_signature={} rpc_pages={} checksum={} status=ready",
+        "nvidia-gsp: path={} bytes={} image_offset=0x{:x} image_bytes={} image_pages={} version={} gb20x_signature={} signature_bytes={} radix3_bytes={} radix3_level2_pages={} shared_bytes={} shared_ptes={} queue_entries={} rpc_pages={} checksum={} status=ready",
         path.display(),
         firmware.len(),
         descriptor.image.offset,
         descriptor.image.size,
+        layout.radix3.image_pages,
         String::from_utf8_lossy(descriptor.version_bytes(&firmware)),
         descriptor.supports_gb20x(),
+        layout.signature.size,
+        layout.radix3.total_bytes,
+        layout.radix3.level2_pages,
+        layout.shared_memory.total_bytes,
+        layout.shared_memory.page_table_entry_count,
+        layout.shared_memory.queue_entry_count,
         message.element_count(),
         message.checksum_valid()
     );

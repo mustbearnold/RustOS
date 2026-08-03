@@ -4,6 +4,12 @@ use crate::pci::{
 
 pub const GSP_RPC_PAGE_SIZE: usize = rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE;
 pub const GSP_RPC_MAX_MESSAGE_PAGES: usize = rustos_gpu_protocol::NVIDIA_GSP_MAX_MESSAGE_PAGES;
+pub const GSP_SHARED_MEMORY_BYTES: usize =
+    rustos_gpu_protocol::GspSharedMemoryLayout::standard().total_bytes;
+pub const GSP_SHARED_MEMORY_PTES: usize =
+    rustos_gpu_protocol::GspSharedMemoryLayout::standard().page_table_entry_count;
+pub const GSP_QUEUE_ENTRY_COUNT: usize =
+    rustos_gpu_protocol::GspSharedMemoryLayout::standard().queue_entry_count;
 
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
