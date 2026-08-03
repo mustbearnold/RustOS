@@ -7,6 +7,7 @@ use spin::Mutex;
 
 use crate::{
     e1000::{E1000Error, E1000Runtime},
+    igc::{IgcError, IgcRuntime},
     net::Ipv4Address,
     virtio_net::{VirtioNetError, VirtioNetRuntime},
 };
@@ -27,6 +28,7 @@ pub enum NetworkError {
     Unavailable,
     BufferTooSmall { required: usize, available: usize },
     E1000(E1000Error),
+    Igc(IgcError),
     Virtio(VirtioNetError),
 }
 
@@ -42,11 +44,19 @@ impl From<VirtioNetError> for NetworkError {
     }
 }
 
+impl From<IgcError> for NetworkError {
+    fn from(error: IgcError) -> Self {
+        Self::Igc(error)
+    }
+}
+
 impl NetworkError {
     pub fn is_no_packet(self) -> bool {
         matches!(
             self,
-            Self::E1000(E1000Error::NoPacket) | Self::Virtio(VirtioNetError::NoPacket)
+            Self::E1000(E1000Error::NoPacket)
+                | Self::Igc(IgcError::NoPacket)
+                | Self::Virtio(VirtioNetError::NoPacket)
         )
     }
 
@@ -55,6 +65,7 @@ impl NetworkError {
             self,
             Self::Unavailable
                 | Self::E1000(E1000Error::ExternalNetworkNotEnabled)
+                | Self::Igc(IgcError::ExternalNetworkNotEnabled)
                 | Self::Virtio(
                     VirtioNetError::NetworkUnavailable | VirtioNetError::ExternalNetworkNotEnabled
                 )
@@ -66,6 +77,7 @@ impl NetworkError {
             self,
             Self::BufferTooSmall { .. }
                 | Self::E1000(E1000Error::NetworkBufferTooSmall { .. })
+                | Self::Igc(IgcError::NetworkBufferTooSmall { .. })
                 | Self::Virtio(VirtioNetError::NetworkBufferTooSmall { .. })
         )
     }
@@ -74,6 +86,7 @@ impl NetworkError {
 #[derive(Debug)]
 pub enum NetworkBackend {
     E1000(E1000Runtime),
+    Igc(IgcRuntime),
     Virtio(VirtioNetRuntime),
 }
 
@@ -81,6 +94,7 @@ impl NetworkBackend {
     pub fn name(&self) -> &'static str {
         match self {
             Self::E1000(_) => "e1000",
+            Self::Igc(_) => "igc",
             Self::Virtio(_) => "virtio",
         }
     }
@@ -88,6 +102,7 @@ impl NetworkBackend {
     fn interface_name(&self) -> &'static str {
         match self {
             Self::E1000(_) => "e1000e0",
+            Self::Igc(_) => "igc0",
             Self::Virtio(_) => "virtio0",
         }
     }
@@ -95,6 +110,7 @@ impl NetworkBackend {
     fn mac_address(&self) -> [u8; 6] {
         match self {
             Self::E1000(runtime) => runtime.mac_address,
+            Self::Igc(runtime) => runtime.mac_address,
             Self::Virtio(runtime) => runtime.mac_address,
         }
     }
@@ -102,6 +118,21 @@ impl NetworkBackend {
     fn snapshot(&self) -> NetworkSnapshot {
         match self {
             Self::E1000(runtime) => {
+                let configuration = runtime.network_configuration();
+                NetworkSnapshot {
+                    interface_name: self.interface_name(),
+                    backend_name: self.name(),
+                    mac_address: self.mac_address(),
+                    address: configuration.address,
+                    subnet_mask: configuration.subnet_mask,
+                    gateway: configuration.gateway,
+                    dns: configuration.dns,
+                    dhcp_server: configuration.dhcp_server,
+                    lease_seconds: configuration.lease_seconds,
+                    dhcp: configuration.dhcp,
+                }
+            }
+            Self::Igc(runtime) => {
                 let configuration = runtime.network_configuration();
                 NetworkSnapshot {
                     interface_name: self.interface_name(),
@@ -144,6 +175,9 @@ impl NetworkBackend {
             Self::E1000(runtime) => runtime
                 .send_udp(destination, destination_port, payload)
                 .map_err(NetworkError::E1000),
+            Self::Igc(runtime) => runtime
+                .send_udp(destination, destination_port, payload)
+                .map_err(NetworkError::Igc),
             Self::Virtio(runtime) => runtime
                 .send_udp(destination, destination_port, payload)
                 .map_err(NetworkError::Virtio),
@@ -153,6 +187,7 @@ impl NetworkBackend {
     fn receive_udp(&mut self, buffer: &mut [u8]) -> Result<usize, NetworkError> {
         match self {
             Self::E1000(runtime) => runtime.receive_udp(buffer).map_err(NetworkError::E1000),
+            Self::Igc(runtime) => runtime.receive_udp(buffer).map_err(NetworkError::Igc),
             Self::Virtio(runtime) => runtime.receive_udp(buffer).map_err(NetworkError::Virtio),
         }
     }
@@ -163,6 +198,7 @@ impl NetworkBackend {
                 .renew_dhcp()
                 .map(|_| ())
                 .map_err(NetworkError::E1000),
+            Self::Igc(runtime) => runtime.renew_dhcp().map(|_| ()).map_err(NetworkError::Igc),
             Self::Virtio(runtime) => runtime
                 .renew_dhcp()
                 .map(|_| ())

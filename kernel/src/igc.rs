@@ -1,10 +1,15 @@
 use bootloader_api::info::MemoryRegion;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU16, Ordering, fence};
 #[cfg(target_os = "none")]
 use spin::Mutex;
 
+use crate::dhcp::{
+    self, DHCP_ACK, DHCP_CLIENT_PORT, DHCP_MESSAGE_BUFFER_LENGTH, DHCP_OFFER, DHCP_SERVER_PORT,
+};
 use crate::memory::{FrameAllocator, PAGE_SIZE};
-use crate::net::{EthernetFrame, EthernetFrameError, NetworkInterface};
+use crate::net::{
+    EthernetFrame, EthernetFrameError, Ipv4PacketError, NetworkInterface, UdpDatagramError,
+};
 use crate::pci::{
     MmioError, MmioRegion, PciDevice, PciDeviceResources, PciInterruptMode, PciInventory,
     PciResourceError,
@@ -48,6 +53,7 @@ const STATUS_SPEED_2500: u32 = 1 << 22;
 const IGC_CTRL_SLU: u32 = 1 << 6;
 const IGC_CTRL_FRCSPD: u32 = 1 << 11;
 const IGC_CTRL_FRCDPX: u32 = 1 << 12;
+const IGC_CTRL_RST: u32 = 1 << 26;
 const IGC_RAH_AV: u32 = 1 << 31;
 const IGC_RCTL_ENABLE: u32 = 1 << 1;
 const IGC_RCTL_BROADCAST_ACCEPT: u32 = 1 << 15;
@@ -85,6 +91,16 @@ const RX_DESCRIPTOR_ERROR_MASK: u32 = 0x8000_0000;
 const RX_DESCRIPTOR_TYPE_ONE_BUFFER: u32 = 1 << 25;
 const RX_DESCRIPTOR_PACKET_BUFFER_2048: u32 = (RX_BUFFER_SIZE as u32) / 1024;
 
+const DEFAULT_NETWORK_SUBNET_MASK: crate::net::Ipv4Address = [255, 255, 255, 0];
+const DEFAULT_NETWORK_GATEWAY: crate::net::Ipv4Address = [10, 0, 2, 2];
+const DEFAULT_NETWORK_DNS: crate::net::Ipv4Address = [10, 0, 2, 3];
+const DHCP_ZERO_IP: crate::net::Ipv4Address = [0, 0, 0, 0];
+const DHCP_BROADCAST_IP: crate::net::Ipv4Address = [255, 255, 255, 255];
+const ETHERNET_BROADCAST: [u8; 6] = [u8::MAX; 6];
+const NETWORK_SOURCE_PORT: u16 = 49_000;
+const NETWORK_RECEIVE_HEADER_LENGTH: usize = 6;
+const MAX_NETWORK_PAYLOAD_LENGTH: usize = 1024;
+
 const IGC_INTERRUPT_TXDW: u32 = 1 << 0;
 const IGC_INTERRUPT_RXT0: u32 = 1 << 7;
 const IGC_INTERRUPT_LSC: u32 = 1 << 2;
@@ -96,6 +112,7 @@ const NETWORK_INTERFACE_NAME: &str = "igc0";
 static IGC_INTERRUPT_MMIO: Mutex<Option<MmioRegion>> = Mutex::new(None);
 static IGC_INTERRUPT_CAUSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static IGC_INTERRUPT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NETWORK_IDENTIFICATION: AtomicU16 = AtomicU16::new(0x2250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgcError {
@@ -103,8 +120,14 @@ pub enum IgcError {
     Mmio(MmioError),
     Dma(IgcDmaError),
     Frame(EthernetFrameError),
+    Ipv4(Ipv4PacketError),
+    Udp(UdpDatagramError),
+    Dhcp(crate::dhcp::DhcpError),
     MemorySpaceDisabled,
     InvalidMac,
+    ResetTimeout {
+        control: u32,
+    },
     TxRingFull,
     TxCompletionTimeout {
         descriptor: usize,
@@ -122,13 +145,17 @@ pub enum IgcError {
     NoPacket,
     #[cfg(target_os = "none")]
     InterruptsNotPrepared,
-    #[cfg(target_os = "none")]
     InterruptTimeout {
         cause: u32,
         rctl: u32,
         tdh: u32,
         rdh: u32,
         rdt: u32,
+    },
+    ExternalNetworkNotEnabled,
+    NetworkBufferTooSmall {
+        required: usize,
+        available: usize,
     },
     #[cfg(target_os = "none")]
     InterruptRegistration(crate::interrupts::DeviceInterruptError),
@@ -155,6 +182,24 @@ impl From<IgcDmaError> for IgcError {
 impl From<EthernetFrameError> for IgcError {
     fn from(error: EthernetFrameError) -> Self {
         Self::Frame(error)
+    }
+}
+
+impl From<Ipv4PacketError> for IgcError {
+    fn from(error: Ipv4PacketError) -> Self {
+        Self::Ipv4(error)
+    }
+}
+
+impl From<UdpDatagramError> for IgcError {
+    fn from(error: UdpDatagramError) -> Self {
+        Self::Udp(error)
+    }
+}
+
+impl From<crate::dhcp::DhcpError> for IgcError {
+    fn from(error: crate::dhcp::DhcpError) -> Self {
+        Self::Dhcp(error)
     }
 }
 
@@ -325,6 +370,31 @@ pub struct IgcInitFailure {
     pub next_frame_address: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkConfiguration {
+    pub address: crate::net::Ipv4Address,
+    pub subnet_mask: crate::net::Ipv4Address,
+    pub gateway: crate::net::Ipv4Address,
+    pub dns: crate::net::Ipv4Address,
+    pub dhcp_server: crate::net::Ipv4Address,
+    pub lease_seconds: u32,
+    pub dhcp: bool,
+}
+
+impl NetworkConfiguration {
+    const fn static_default() -> Self {
+        Self {
+            address: DHCP_ZERO_IP,
+            subnet_mask: DEFAULT_NETWORK_SUBNET_MASK,
+            gateway: DEFAULT_NETWORK_GATEWAY,
+            dns: DEFAULT_NETWORK_DNS,
+            dhcp_server: DEFAULT_NETWORK_GATEWAY,
+            lease_seconds: 0,
+            dhcp: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct IgcRuntime {
     pub address: crate::pci::PciAddress,
@@ -349,6 +419,8 @@ pub struct IgcRuntime {
     pub interrupt_count: u64,
     pub interrupt_cause: u32,
     pub interrupt_driven: bool,
+    pub external_network: bool,
+    pub network: NetworkConfiguration,
     next_frame_address: Option<u64>,
     pci_resources: PciDeviceResources,
     mmio: MmioRegion,
@@ -359,6 +431,8 @@ pub struct IgcRuntime {
     tx_next_index: usize,
     rx_next_index: usize,
     pending_interrupt_cause: u32,
+    gateway_mac: Option<[u8; 6]>,
+    external_receive_diagnostics: u8,
 }
 
 impl IgcRuntime {
@@ -474,6 +548,205 @@ impl IgcRuntime {
         self.interrupt_count = IGC_INTERRUPT_COUNT.load(Ordering::SeqCst);
     }
 
+    pub fn enable_external_network(&mut self) -> Result<(), IgcError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.interrupt_driven {
+            return Err(IgcError::ExternalNetworkNotEnabled);
+        }
+        self.status = self.mmio.read_u32(REG_STATUS)?;
+        self.external_network = true;
+        self.gateway_mac = None;
+        self.external_receive_diagnostics = 0;
+        self.network = NetworkConfiguration::static_default();
+        Ok(())
+    }
+
+    pub fn acquire_dhcp(&mut self) -> Result<NetworkConfiguration, IgcError> {
+        if !self.external_network {
+            return Err(IgcError::ExternalNetworkNotEnabled);
+        }
+
+        let transaction_id = 0x5255_5354u32
+            .wrapping_add(NETWORK_IDENTIFICATION.fetch_add(1, Ordering::AcqRel) as u32);
+        for _attempt in 0..3 {
+            let (discover, discover_length) =
+                dhcp::build_discover(transaction_id, self.mac_address);
+            self.transmit_dhcp(&discover[..discover_length])?;
+            let Ok(offer) = self.receive_dhcp_reply(transaction_id, DHCP_OFFER) else {
+                continue;
+            };
+            let Some(server) = offer.server else {
+                continue;
+            };
+
+            let (request, request_length) =
+                dhcp::build_request(transaction_id, self.mac_address, offer.address, server);
+            self.transmit_dhcp(&request[..request_length])?;
+            let Ok(ack) = self.receive_dhcp_reply(transaction_id, DHCP_ACK) else {
+                continue;
+            };
+            if ack.address != offer.address {
+                continue;
+            }
+
+            let configuration = NetworkConfiguration {
+                address: ack.address,
+                subnet_mask: ack.subnet_mask.unwrap_or(DEFAULT_NETWORK_SUBNET_MASK),
+                gateway: ack.gateway.unwrap_or(DEFAULT_NETWORK_GATEWAY),
+                dns: ack.dns.unwrap_or(DEFAULT_NETWORK_DNS),
+                dhcp_server: ack.server.unwrap_or(server),
+                lease_seconds: ack.lease_seconds.unwrap_or(0),
+                dhcp: true,
+            };
+            self.network = configuration;
+            self.gateway_mac = None;
+            return Ok(configuration);
+        }
+        Err(IgcError::NoPacket)
+    }
+
+    pub fn renew_dhcp(&mut self) -> Result<NetworkConfiguration, IgcError> {
+        if !self.external_network {
+            return Err(IgcError::ExternalNetworkNotEnabled);
+        }
+        if !self.network.dhcp {
+            return Err(IgcError::NoPacket);
+        }
+
+        let transaction_id = 0x5255_5354u32
+            .wrapping_add(NETWORK_IDENTIFICATION.fetch_add(1, Ordering::AcqRel) as u32);
+        let (request, request_length) =
+            dhcp::build_renew_request(transaction_id, self.mac_address, self.network.address);
+        self.transmit_dhcp_renewal(&request[..request_length])?;
+        let ack = self.receive_dhcp_reply(transaction_id, DHCP_ACK)?;
+        if ack.address != self.network.address {
+            return Err(IgcError::NoPacket);
+        }
+
+        let previous = self.network;
+        let configuration = NetworkConfiguration {
+            address: previous.address,
+            subnet_mask: ack.subnet_mask.unwrap_or(previous.subnet_mask),
+            gateway: ack.gateway.unwrap_or(previous.gateway),
+            dns: ack.dns.unwrap_or(previous.dns),
+            dhcp_server: ack.server.unwrap_or(previous.dhcp_server),
+            lease_seconds: ack.lease_seconds.unwrap_or(previous.lease_seconds),
+            dhcp: true,
+        };
+        self.network = configuration;
+        self.gateway_mac = None;
+        Ok(configuration)
+    }
+
+    fn transmit_dhcp(&mut self, payload: &[u8]) -> Result<(), IgcError> {
+        if payload.len() > DHCP_MESSAGE_BUFFER_LENGTH {
+            return Err(IgcError::NetworkBufferTooSmall {
+                required: payload.len(),
+                available: DHCP_MESSAGE_BUFFER_LENGTH,
+            });
+        }
+        let udp = crate::net::UdpDatagram::new(
+            DHCP_CLIENT_PORT,
+            DHCP_SERVER_PORT,
+            DHCP_ZERO_IP,
+            DHCP_BROADCAST_IP,
+            payload,
+        )?;
+        let packet = crate::net::Ipv4Packet::new(
+            DHCP_ZERO_IP,
+            DHCP_BROADCAST_IP,
+            crate::net::IP_PROTOCOL_UDP,
+            udp.as_bytes(),
+            NETWORK_IDENTIFICATION.fetch_add(1, Ordering::AcqRel),
+        )?;
+        let frame = EthernetFrame::new(
+            ETHERNET_BROADCAST,
+            self.mac_address,
+            crate::net::ETHER_TYPE_IPV4,
+            packet.as_bytes(),
+        )?;
+        self.transmit(&frame)
+    }
+
+    fn transmit_dhcp_renewal(&mut self, payload: &[u8]) -> Result<(), IgcError> {
+        if payload.len() > DHCP_MESSAGE_BUFFER_LENGTH {
+            return Err(IgcError::NetworkBufferTooSmall {
+                required: payload.len(),
+                available: DHCP_MESSAGE_BUFFER_LENGTH,
+            });
+        }
+        let udp = crate::net::UdpDatagram::new(
+            DHCP_CLIENT_PORT,
+            DHCP_SERVER_PORT,
+            self.network.address,
+            self.network.dhcp_server,
+            payload,
+        )?;
+        let packet = crate::net::Ipv4Packet::new(
+            self.network.address,
+            self.network.dhcp_server,
+            crate::net::IP_PROTOCOL_UDP,
+            udp.as_bytes(),
+            NETWORK_IDENTIFICATION.fetch_add(1, Ordering::AcqRel),
+        )?;
+        let frame = EthernetFrame::new(
+            ETHERNET_BROADCAST,
+            self.mac_address,
+            crate::net::ETHER_TYPE_IPV4,
+            packet.as_bytes(),
+        )?;
+        self.transmit(&frame)
+    }
+
+    fn receive_dhcp_reply(
+        &mut self,
+        transaction_id: u32,
+        expected_message_type: u8,
+    ) -> Result<crate::dhcp::DhcpReply, IgcError> {
+        for _ in 0..8 {
+            let frame = match self.receive() {
+                Ok(frame) => frame,
+                Err(IgcError::InterruptTimeout { .. }) => return Err(IgcError::NoPacket),
+                Err(error) => return Err(error),
+            };
+            if frame.ether_type() != crate::net::ETHER_TYPE_IPV4 {
+                continue;
+            }
+            let Ok(packet) = crate::net::Ipv4Packet::parse(frame.payload()) else {
+                continue;
+            };
+            if packet.protocol() != crate::net::IP_PROTOCOL_UDP {
+                continue;
+            }
+            let Ok(datagram) = crate::net::UdpDatagram::parse(
+                packet.payload(),
+                packet.source(),
+                packet.destination(),
+            ) else {
+                continue;
+            };
+            if datagram.source_port() != DHCP_SERVER_PORT
+                || datagram.destination_port() != DHCP_CLIENT_PORT
+            {
+                continue;
+            }
+            let Ok(reply) = dhcp::parse_reply(datagram.payload(), transaction_id, self.mac_address)
+            else {
+                continue;
+            };
+            if reply.message_type == expected_message_type {
+                return Ok(reply);
+            }
+        }
+        Err(IgcError::NoPacket)
+    }
+
+    pub fn network_configuration(&self) -> NetworkConfiguration {
+        self.network
+    }
+
     pub fn transmit(&mut self, frame: &EthernetFrame) -> Result<(), IgcError> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -563,6 +836,208 @@ impl IgcRuntime {
         self.rx_packet_length = packet_length;
         self.rx_frames = self.rx_frames.saturating_add(1);
         Ok(frame)
+    }
+
+    pub fn send_udp(
+        &mut self,
+        destination: crate::net::Ipv4Address,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Result<usize, IgcError> {
+        if !self.external_network {
+            return Err(IgcError::ExternalNetworkNotEnabled);
+        }
+        if payload.len() > MAX_NETWORK_PAYLOAD_LENGTH {
+            return Err(IgcError::NetworkBufferTooSmall {
+                required: payload.len(),
+                available: MAX_NETWORK_PAYLOAD_LENGTH,
+            });
+        }
+        let gateway_mac = self.resolve_gateway_mac()?;
+        let udp = crate::net::UdpDatagram::new(
+            NETWORK_SOURCE_PORT,
+            destination_port,
+            self.network.address,
+            destination,
+            payload,
+        )?;
+        let packet = crate::net::Ipv4Packet::new(
+            self.network.address,
+            destination,
+            crate::net::IP_PROTOCOL_UDP,
+            udp.as_bytes(),
+            NETWORK_IDENTIFICATION.fetch_add(1, Ordering::AcqRel),
+        )?;
+        let frame = EthernetFrame::new(
+            gateway_mac,
+            self.mac_address,
+            crate::net::ETHER_TYPE_IPV4,
+            packet.as_bytes(),
+        )?;
+        self.transmit(&frame)?;
+        Ok(payload.len())
+    }
+
+    fn resolve_gateway_mac(&mut self) -> Result<[u8; 6], IgcError> {
+        if let Some(mac) = self.gateway_mac {
+            return Ok(mac);
+        }
+        let mut request = [0u8; 28];
+        request[0..2].copy_from_slice(&1u16.to_be_bytes());
+        request[2..4].copy_from_slice(&crate::net::ETHER_TYPE_IPV4.to_be_bytes());
+        request[4] = 6;
+        request[5] = 4;
+        request[6..8].copy_from_slice(&1u16.to_be_bytes());
+        request[8..14].copy_from_slice(&self.mac_address);
+        request[14..18].copy_from_slice(&self.network.address);
+        request[24..28].copy_from_slice(&self.network.gateway);
+        let frame = EthernetFrame::new(
+            ETHERNET_BROADCAST,
+            self.mac_address,
+            crate::net::ETHER_TYPE_ARP,
+            &request,
+        )?;
+        for _ in 0..2 {
+            self.transmit(&frame)?;
+            for _ in 0..2 {
+                let received = match self.receive() {
+                    Ok(frame) => frame,
+                    Err(IgcError::InterruptTimeout { .. }) => break,
+                    Err(error) => return Err(error),
+                };
+                if received.ether_type() != crate::net::ETHER_TYPE_ARP {
+                    continue;
+                }
+                let payload = received.payload();
+                if payload.len() < 28
+                    || u16::from_be_bytes([payload[0], payload[1]]) != 1
+                    || u16::from_be_bytes([payload[2], payload[3]]) != crate::net::ETHER_TYPE_IPV4
+                    || payload[4] != 6
+                    || payload[5] != 4
+                    || u16::from_be_bytes([payload[6], payload[7]]) != 2
+                    || payload[14..18] != self.network.gateway
+                    || payload[24..28] != self.network.address
+                {
+                    continue;
+                }
+                let mac: [u8; 6] = payload[8..14]
+                    .try_into()
+                    .expect("validated ARP gateway MAC");
+                self.gateway_mac = Some(mac);
+                #[cfg(target_os = "none")]
+                crate::kprintln!(
+                    "net: arp gateway resolved interface=igc0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} status=ready",
+                    mac[0],
+                    mac[1],
+                    mac[2],
+                    mac[3],
+                    mac[4],
+                    mac[5]
+                );
+                return Ok(mac);
+            }
+        }
+        Err(IgcError::NoPacket)
+    }
+
+    pub fn receive_udp(&mut self, buffer: &mut [u8]) -> Result<usize, IgcError> {
+        if !self.external_network {
+            return Err(IgcError::ExternalNetworkNotEnabled);
+        }
+        if buffer.len() < NETWORK_RECEIVE_HEADER_LENGTH {
+            return Err(IgcError::NetworkBufferTooSmall {
+                required: NETWORK_RECEIVE_HEADER_LENGTH,
+                available: buffer.len(),
+            });
+        }
+        loop {
+            let frame = match self.receive() {
+                Ok(frame) => frame,
+                Err(error @ IgcError::InterruptTimeout { .. }) => {
+                    if self.external_receive_diagnostics < 4 {
+                        self.external_receive_diagnostics += 1;
+                        #[cfg(not(target_os = "none"))]
+                        let _ = error;
+                        #[cfg(target_os = "none")]
+                        crate::kprintln!(
+                            "net: external rx timeout interface=igc0 detail={:?} status=degraded",
+                            error
+                        );
+                    }
+                    return Err(IgcError::NoPacket);
+                }
+                Err(error) => return Err(error),
+            };
+            if frame.ether_type() == crate::net::ETHER_TYPE_ARP {
+                self.respond_to_arp(&frame)?;
+                continue;
+            }
+            if frame.ether_type() != crate::net::ETHER_TYPE_IPV4 {
+                continue;
+            }
+            let Ok(packet) = crate::net::Ipv4Packet::parse(frame.payload()) else {
+                continue;
+            };
+            if packet.destination() != self.network.address
+                || packet.protocol() != crate::net::IP_PROTOCOL_UDP
+            {
+                continue;
+            }
+            let Ok(datagram) = crate::net::UdpDatagram::parse(
+                packet.payload(),
+                packet.source(),
+                packet.destination(),
+            ) else {
+                continue;
+            };
+            if datagram.destination_port() != NETWORK_SOURCE_PORT {
+                continue;
+            }
+            let required = NETWORK_RECEIVE_HEADER_LENGTH + datagram.payload().len();
+            if required > buffer.len() {
+                return Err(IgcError::NetworkBufferTooSmall {
+                    required,
+                    available: buffer.len(),
+                });
+            }
+            buffer[..4].copy_from_slice(&packet.source());
+            buffer[4..6].copy_from_slice(&datagram.source_port().to_be_bytes());
+            buffer[NETWORK_RECEIVE_HEADER_LENGTH..required].copy_from_slice(datagram.payload());
+            return Ok(required);
+        }
+    }
+
+    fn respond_to_arp(&mut self, frame: &EthernetFrame) -> Result<(), IgcError> {
+        let payload = frame.payload();
+        if payload.len() < 28
+            || u16::from_be_bytes([payload[0], payload[1]]) != 1
+            || u16::from_be_bytes([payload[2], payload[3]]) != crate::net::ETHER_TYPE_IPV4
+            || payload[4] != 6
+            || payload[5] != 4
+            || u16::from_be_bytes([payload[6], payload[7]]) != 1
+            || payload[24..28] != self.network.address
+        {
+            return Ok(());
+        }
+        let sender_mac: [u8; 6] = payload[8..14].try_into().expect("validated ARP sender MAC");
+        let sender_ip: [u8; 4] = payload[14..18].try_into().expect("validated ARP sender IP");
+        let mut response = [0u8; 28];
+        response[0..2].copy_from_slice(&1u16.to_be_bytes());
+        response[2..4].copy_from_slice(&crate::net::ETHER_TYPE_IPV4.to_be_bytes());
+        response[4] = 6;
+        response[5] = 4;
+        response[6..8].copy_from_slice(&2u16.to_be_bytes());
+        response[8..14].copy_from_slice(&self.mac_address);
+        response[14..18].copy_from_slice(&self.network.address);
+        response[18..24].copy_from_slice(&sender_mac);
+        response[24..28].copy_from_slice(&sender_ip);
+        let response_frame = EthernetFrame::new(
+            sender_mac,
+            self.mac_address,
+            crate::net::ETHER_TYPE_ARP,
+            &response,
+        )?;
+        self.transmit(&response_frame)
     }
 }
 
@@ -663,6 +1138,8 @@ pub fn initialize(
         interrupt_count: 0,
         interrupt_cause: 0,
         interrupt_driven: false,
+        external_network: false,
+        network: NetworkConfiguration::static_default(),
         next_frame_address: frame_allocator.next_available_address(),
         pci_resources: resources,
         mmio,
@@ -673,6 +1150,8 @@ pub fn initialize(
         tx_next_index: 0,
         rx_next_index: 0,
         pending_interrupt_cause: 0,
+        gateway_mac: None,
+        external_receive_diagnostics: 0,
     };
 
     if let Err(error) = configure(&mut runtime) {
@@ -727,6 +1206,7 @@ fn allocate_page(
 }
 
 fn configure(runtime: &mut IgcRuntime) -> Result<(), IgcError> {
+    reset_device(runtime.mmio)?;
     runtime.mmio.write_u32(REG_IMC, u32::MAX)?;
     let _ = runtime.mmio.read_u32(REG_ICR)?;
     runtime.mmio.write_u32(REG_RCTL, 0)?;
@@ -761,6 +1241,26 @@ fn configure(runtime: &mut IgcRuntime) -> Result<(), IgcError> {
     runtime.tx_queue_ready = true;
     runtime.rx_queue_ready = true;
     Ok(())
+}
+
+fn reset_device(mmio: MmioRegion) -> Result<(), IgcError> {
+    mmio.write_u32(REG_IMC, u32::MAX)?;
+    mmio.write_u32(REG_RCTL, 0)?;
+    mmio.write_u32(REG_TCTL, IGC_TCTL_PAD_SHORT_PACKETS)?;
+    let control = mmio.read_u32(REG_CTRL)?;
+    mmio.write_u32(REG_CTRL, control | IGC_CTRL_RST)?;
+
+    for _ in 0..POLL_SPINS {
+        let control = mmio.read_u32(REG_CTRL)?;
+        if control & IGC_CTRL_RST == 0 {
+            let _ = mmio.read_u32(REG_ICR)?;
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(IgcError::ResetTimeout {
+        control: mmio.read_u32(REG_CTRL)?,
+    })
 }
 
 fn configure_tx_ring(runtime: &mut IgcRuntime) -> Result<(), IgcError> {

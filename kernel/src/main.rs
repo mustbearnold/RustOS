@@ -1850,10 +1850,50 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
     if let Some(runtime) = igc_runtime.as_mut() {
+        if runtime.is_ready() && igc_interrupt_ready {
+            match runtime.enable_external_network() {
+                Ok(()) => match runtime.acquire_dhcp() {
+                    Ok(configuration) => kprintln!(
+                        "net: igc dhcp lease ip={}.{}.{}.{} mask={}.{}.{}.{} gateway={}.{}.{}.{} dns={}.{}.{}.{} server={}.{}.{}.{} lease_seconds={} tx_frames={} rx_frames={} status=ready",
+                        configuration.address[0],
+                        configuration.address[1],
+                        configuration.address[2],
+                        configuration.address[3],
+                        configuration.subnet_mask[0],
+                        configuration.subnet_mask[1],
+                        configuration.subnet_mask[2],
+                        configuration.subnet_mask[3],
+                        configuration.gateway[0],
+                        configuration.gateway[1],
+                        configuration.gateway[2],
+                        configuration.gateway[3],
+                        configuration.dns[0],
+                        configuration.dns[1],
+                        configuration.dns[2],
+                        configuration.dns[3],
+                        configuration.dhcp_server[0],
+                        configuration.dhcp_server[1],
+                        configuration.dhcp_server[2],
+                        configuration.dhcp_server[3],
+                        configuration.lease_seconds,
+                        runtime.tx_frames,
+                        runtime.rx_frames
+                    ),
+                    Err(error) => kprintln!(
+                        "net: igc dhcp unavailable ({:?}) fallback=static status=degraded",
+                        error
+                    ),
+                },
+                Err(error) => kprintln!(
+                    "net: igc external mode failed ({:?}) status=degraded",
+                    error
+                ),
+            }
+        }
         runtime.sync_interrupt_state();
         hardware::set_i225(runtime.probe_snapshot());
         kprintln!(
-            "driver: igc {:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} irq_line={} irq_pin={} irq_gsi={:?} irq_vector={:?} irq_mode={:?} irq_count={} irq_cause=0x{:08x} interrupt_driven={} busmaster={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} tx_queue={} rx_queue={} tx_frames={} rx_frames={} status={} failure={:?}",
+            "driver: igc {:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} irq_line={} irq_pin={} irq_gsi={:?} irq_vector={:?} irq_mode={:?} irq_count={} irq_cause=0x{:08x} interrupt_driven={} external_network={} dhcp={} busmaster={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} tx_queue={} rx_queue={} tx_frames={} rx_frames={} status={} failure={:?}",
             runtime.address.bus,
             runtime.address.device,
             runtime.address.function,
@@ -1867,6 +1907,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             runtime.interrupt_count,
             runtime.interrupt_cause,
             runtime.interrupt_driven,
+            runtime.external_network,
+            runtime.network.dhcp,
             runtime.bus_master_enabled,
             runtime.mac_address[0],
             runtime.mac_address[1],
@@ -1879,7 +1921,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             runtime.tx_frames,
             runtime.rx_frames,
             if runtime.is_ready() && igc_interrupt_ready {
-                "interrupt-ready"
+                if runtime.external_network && runtime.network.dhcp {
+                    "dhcp-ready"
+                } else {
+                    "interrupt-ready"
+                }
             } else if runtime.is_ready() {
                 "queue-ready-polling"
             } else {
@@ -1900,6 +1946,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let backend = network_runtime::NetworkBackend::E1000(runtime);
             if default_network_backend.is_some() {
                 secondary_network_backend = Some(backend);
+            } else {
+                default_network_backend = Some(backend);
+            }
+        }
+    }
+    if let Some(runtime) = igc_runtime.take() {
+        if runtime.external_network && runtime.network.dhcp && runtime.is_ready() {
+            let backend = network_runtime::NetworkBackend::Igc(runtime);
+            if default_network_backend.is_some() {
+                if secondary_network_backend.is_none() {
+                    secondary_network_backend = Some(backend);
+                }
             } else {
                 default_network_backend = Some(backend);
             }
