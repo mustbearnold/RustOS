@@ -1,8 +1,8 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
 use rustos_gpu_protocol::{
-    GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspFspCot, GspRpcMessage,
-    encode_gsp_rpc,
+    GspBootSystemMemoryPlan, GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspFspCot,
+    GspRpcMessage, encode_gsp_rpc,
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -1295,6 +1295,18 @@ fn nvidia_gsp_bundle_check(
         .gsp
         .boot_layout()
         .map_err(|error| format!("planning NVIDIA GSP bundle layout: {error:?}"))?;
+    let staging = GspBootSystemMemoryPlan::r570_gb20x(bundle, 0x1000_0000)
+        .map_err(|error| format!("planning NVIDIA GSP system memory staging: {error:?}"))?;
+    let radix3 = staging
+        .radix3_tables()
+        .map_err(|error| format!("materializing NVIDIA GSP staged radix-3 tables: {error:?}"))?;
+    let shared_memory = staging
+        .shared_memory_image()
+        .map_err(|error| format!("materializing NVIDIA GSP staged shared memory: {error:?}"))?;
+    let cached_arguments = staging
+        .cached_arguments()
+        .map_err(|error| format!("encoding NVIDIA GSP staged cached arguments: {error:?}"))?;
+    let fmc_boot_params = staging.fmc_boot_params();
     let cot = GspFspCot::gb20x(
         0x2000_0000,
         0x1000_0000,
@@ -1307,7 +1319,7 @@ fn nvidia_gsp_bundle_check(
     .encode()
     .map_err(|error| format!("encoding NVIDIA GSP-FMC COT request: {error:?}"))?;
     println!(
-        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} fsp_cot_bytes={} fsp_cot_version={} fsp_hash_bytes={} fsp_public_key_bytes={} fsp_signature_bytes={} status=ready",
+        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} staged_system_base=0x{:x} staged_system_bytes={} staged_system_end=0x{:x} staged_radix3_bytes={} staged_shared_bytes={} staged_cached_args_bytes={} staged_fmc_args_bytes={} fsp_cot_bytes={} fsp_cot_version={} fsp_hash_bytes={} fsp_public_key_bytes={} fsp_signature_bytes={} status=ready",
         String::from_utf8_lossy(expected_version),
         gsp.len(),
         bundle.gsp.image.size,
@@ -1319,6 +1331,15 @@ fn nvidia_gsp_bundle_check(
         bundle.bootloader.descriptor.version,
         bundle.bootloader.descriptor.app_version,
         layout.radix3.total_bytes,
+        staging.fmc_image.address,
+        staging.total_bytes,
+        staging.end_address,
+        radix3.level0.len() + radix3.level1.len() + radix3.level2.len(),
+        shared_memory.page_table.len()
+            + shared_memory.command_queue.len()
+            + shared_memory.status_queue.len(),
+        cached_arguments.len(),
+        fmc_boot_params.len(),
         cot.len(),
         rustos_gpu_protocol::NVIDIA_GSP_FSP_COT_VERSION_GB20X,
         bundle.fmc.hash.size,

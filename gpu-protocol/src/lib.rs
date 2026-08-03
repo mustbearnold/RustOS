@@ -8,7 +8,8 @@ mod fsp;
 
 pub use boot::{
     GspBootloader, GspBootloaderError, GspFirmwareBundle, GspFirmwareBundleError, GspFmcBootParams,
-    GspRmDescriptorField, GspRmUcodeDescriptor, GspWprMeta,
+    GspRmDescriptorField, GspRmUcodeDescriptor, GspWprMeta, NVIDIA_GSP_FMC_BOOT_PARAMS_SIZE,
+    NVIDIA_GSP_WPR_META_SIZE,
 };
 pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection};
 pub use fsp::{
@@ -53,6 +54,17 @@ pub const NVIDIA_GSP_R570_BAREMETAL_OS_CARVEOUT: usize = 22 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_BASE_RM_HEAP: usize = 14 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_MIN_RM_HEAP: usize = 88 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_GB20X_NON_WPR_HEAP: usize = 0x220000;
+pub const NVIDIA_GSP_R570_HEAP_PER_GB_FB: u64 = 96 * 1024;
+pub const NVIDIA_GSP_R570_CLIENT_ALLOC_HEAP: u64 = (48 * 1024) * 2048;
+pub const NVIDIA_GSP_R570_GB20X_WPR_HEAP_MIN: u64 = (88 + 12 + 70) as u64 * 1024 * 1024;
+pub const NVIDIA_GSP_R570_GB20X_PMU_RESERVED_SIZE: u64 = 0x01a00000;
+pub const NVIDIA_GSP_R570_FSP_CARVEOUT_ALIGNMENT: u64 = 0x00200000;
+pub const NVIDIA_GSP_GB20X_FRTS_SIZE: u64 = 0x00100000;
+pub const NVIDIA_GSP_GB20X_WPR_HEAP_ALIGNMENT: u64 = 0x00100000;
+pub const NVIDIA_GSP_GB20X_ELF_ALIGNMENT: u64 = 0x00010000;
+pub const NVIDIA_GSP_LIBOS_ARGUMENTS_SIZE: usize = NVIDIA_GSP_PAGE_SIZE;
+pub const NVIDIA_GSP_RM_ARGUMENTS_SIZE: usize = NVIDIA_GSP_PAGE_SIZE;
+pub const NVIDIA_GSP_LOG_BUFFER_SIZE: usize = 0x10000;
 pub const NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE: usize = 72;
 pub const NVIDIA_GSP_R570_QUEUE_RX_HEADER_OFFSET: u32 = 32;
 pub const NVIDIA_GSP_RPC_SIGNATURE: u32 = 0x4352_5056;
@@ -104,6 +116,24 @@ pub enum GspMemoryError {
     BufferTooSmall { required: usize, actual: usize },
     PageCountMismatch { expected: usize, actual: usize },
     ValueTooLarge { value: usize, limit: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspSystemMemoryPlanError {
+    BootLayout(GspBootPlanError),
+    BaseUnaligned { address: u64 },
+    AddressOverflow,
+    EmptyRegion,
+    SizeOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspFramebufferLayoutError {
+    AddressOverflow,
+    AddressUnderflow,
+    InvalidBiosAddress { address: u64, framebuffer_size: u64 },
+    TooSmall { required: u64, available: u64 },
+    SizeOverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +461,415 @@ pub struct GspFirmwareLayout {
     pub signature_allocation_bytes: usize,
     pub radix3: GspRadix3Layout,
     pub shared_memory: GspSharedMemoryLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspMemoryRegion {
+    pub address: u64,
+    pub size: usize,
+}
+
+impl GspMemoryRegion {
+    pub fn end(self) -> Option<u64> {
+        self.address.checked_add(u64::try_from(self.size).ok()?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspFramebufferLayout {
+    pub framebuffer_size: u64,
+    pub non_wpr_heap_address: u64,
+    pub non_wpr_heap_size: u64,
+    pub wpr_start: u64,
+    pub wpr_size: u64,
+    pub wpr_heap_address: u64,
+    pub wpr_heap_size: u64,
+    pub gsp_image_address: u64,
+    pub gsp_image_size: u64,
+    pub bootloader_address: u64,
+    pub bootloader_size: u64,
+    pub frts_address: u64,
+    pub frts_size: u64,
+    pub wpr_end: u64,
+    pub vga_workspace_address: u64,
+    pub vga_workspace_size: u64,
+    pub pmu_reserved_size: u64,
+    pub fsp_carveout_size: u64,
+}
+
+impl GspFramebufferLayout {
+    pub fn r570_gb20x(
+        framebuffer_size: u64,
+        bios_address: u64,
+        gsp_image_size: usize,
+        bootloader_size: usize,
+    ) -> Result<Self, GspFramebufferLayoutError> {
+        if framebuffer_size == 0 || bios_address > framebuffer_size {
+            return Err(GspFramebufferLayoutError::InvalidBiosAddress {
+                address: bios_address,
+                framebuffer_size,
+            });
+        }
+        let gsp_image_size =
+            u64::try_from(gsp_image_size).map_err(|_| GspFramebufferLayoutError::SizeOverflow)?;
+        let bootloader_size =
+            u64::try_from(bootloader_size).map_err(|_| GspFramebufferLayoutError::SizeOverflow)?;
+        let wpr_end = align_down_u64(bios_address, NVIDIA_GSP_WPR_ALIGNMENT as u64);
+        let frts_size = NVIDIA_GSP_GB20X_FRTS_SIZE;
+        let frts_address = wpr_end
+            .checked_sub(frts_size)
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)?;
+        let bootloader_address = align_down_u64(
+            frts_address
+                .checked_sub(bootloader_size)
+                .ok_or(GspFramebufferLayoutError::AddressUnderflow)?,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        );
+        let gsp_image_address = align_down_u64(
+            bootloader_address
+                .checked_sub(gsp_image_size)
+                .ok_or(GspFramebufferLayoutError::AddressUnderflow)?,
+            NVIDIA_GSP_GB20X_ELF_ALIGNMENT,
+        );
+        let framebuffer_gib = ceil_div_u64(framebuffer_size, 1 << 30)
+            .ok_or(GspFramebufferLayoutError::AddressOverflow)?;
+        let per_gib_heap = align_up_u64(
+            NVIDIA_GSP_R570_HEAP_PER_GB_FB
+                .checked_mul(framebuffer_gib)
+                .ok_or(GspFramebufferLayoutError::AddressOverflow)?,
+            1 << 20,
+        )
+        .ok_or(GspFramebufferLayoutError::AddressOverflow)?;
+        let client_heap = align_up_u64(NVIDIA_GSP_R570_CLIENT_ALLOC_HEAP, 1 << 20)
+            .ok_or(GspFramebufferLayoutError::AddressOverflow)?;
+        let calculated_heap_size = (NVIDIA_GSP_R570_BAREMETAL_OS_CARVEOUT as u64)
+            .checked_add(NVIDIA_GSP_R570_BASE_RM_HEAP as u64)
+            .and_then(|size| size.checked_add(per_gib_heap))
+            .and_then(|size| size.checked_add(client_heap))
+            .ok_or(GspFramebufferLayoutError::AddressOverflow)?;
+        let requested_heap_size = calculated_heap_size.max(NVIDIA_GSP_R570_GB20X_WPR_HEAP_MIN);
+        let wpr_heap_address = align_down_u64(
+            gsp_image_address
+                .checked_sub(requested_heap_size)
+                .ok_or(GspFramebufferLayoutError::AddressUnderflow)?,
+            NVIDIA_GSP_GB20X_WPR_HEAP_ALIGNMENT,
+        );
+        let wpr_heap_size = gsp_image_address
+            .checked_sub(wpr_heap_address)
+            .map(|size| size & !(NVIDIA_GSP_GB20X_WPR_HEAP_ALIGNMENT - 1))
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)?;
+        let wpr_start = align_down_u64(
+            wpr_heap_address
+                .checked_sub(NVIDIA_GSP_WPR_META_SIZE as u64)
+                .ok_or(GspFramebufferLayoutError::AddressUnderflow)?,
+            NVIDIA_GSP_GB20X_WPR_HEAP_ALIGNMENT,
+        );
+        if wpr_start >= wpr_end {
+            return Err(GspFramebufferLayoutError::TooSmall {
+                required: wpr_start,
+                available: wpr_end,
+            });
+        }
+        let non_wpr_heap_size = NVIDIA_GSP_R570_GB20X_NON_WPR_HEAP as u64;
+        let non_wpr_heap_address = wpr_start
+            .checked_sub(non_wpr_heap_size)
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)?;
+        let pmu_reserved_size = NVIDIA_GSP_R570_GB20X_PMU_RESERVED_SIZE;
+        let fsp_carveout_size = align_up_u64(
+            non_wpr_heap_size
+                .checked_add(pmu_reserved_size)
+                .ok_or(GspFramebufferLayoutError::AddressOverflow)?,
+            NVIDIA_GSP_R570_FSP_CARVEOUT_ALIGNMENT,
+        )
+        .ok_or(GspFramebufferLayoutError::AddressOverflow)?;
+        let vga_workspace_size = framebuffer_size
+            .checked_sub(bios_address)
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)?;
+        let wpr_size = wpr_end
+            .checked_sub(wpr_start)
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)?;
+        Ok(Self {
+            framebuffer_size,
+            non_wpr_heap_address,
+            non_wpr_heap_size,
+            wpr_start,
+            wpr_size,
+            wpr_heap_address,
+            wpr_heap_size,
+            gsp_image_address,
+            gsp_image_size,
+            bootloader_address,
+            bootloader_size,
+            frts_address,
+            frts_size,
+            wpr_end,
+            vga_workspace_address: bios_address,
+            vga_workspace_size,
+            pmu_reserved_size,
+            fsp_carveout_size,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspBootSystemMemoryPlan {
+    pub layout: GspFirmwareLayout,
+    pub gsp_image_bytes: usize,
+    pub fmc_image_bytes: usize,
+    pub bootloader_bytes: usize,
+    pub bootloader_code_offset: u64,
+    pub bootloader_data_offset: u64,
+    pub bootloader_manifest_offset: u64,
+    pub fmc_image: GspMemoryRegion,
+    pub gsp_image: GspMemoryRegion,
+    pub radix3_level0: GspMemoryRegion,
+    pub radix3_level1: GspMemoryRegion,
+    pub radix3_level2: GspMemoryRegion,
+    pub signature: GspMemoryRegion,
+    pub bootloader: GspMemoryRegion,
+    pub wpr_meta: GspMemoryRegion,
+    pub fmc_args: GspMemoryRegion,
+    pub libos_args: GspMemoryRegion,
+    pub loginit: GspMemoryRegion,
+    pub logintr: GspMemoryRegion,
+    pub logrm: GspMemoryRegion,
+    pub shared_memory: GspMemoryRegion,
+    pub rm_args: GspMemoryRegion,
+    pub end_address: u64,
+    pub total_bytes: usize,
+}
+
+impl GspBootSystemMemoryPlan {
+    pub fn r570_gb20x(
+        bundle: GspFirmwareBundle,
+        system_base: u64,
+    ) -> Result<Self, GspSystemMemoryPlanError> {
+        let layout = bundle
+            .gsp
+            .boot_layout()
+            .map_err(GspSystemMemoryPlanError::BootLayout)?;
+        let mut plan = Self::r570_from_layout(
+            layout,
+            bundle.fmc.image.size,
+            bundle.bootloader.payload.size,
+            system_base,
+        )?;
+        plan.bootloader_code_offset = u64::from(bundle.bootloader.descriptor.monitor_code_offset);
+        plan.bootloader_data_offset = u64::from(bundle.bootloader.descriptor.monitor_data_offset);
+        plan.bootloader_manifest_offset = u64::from(bundle.bootloader.descriptor.manifest_offset);
+        Ok(plan)
+    }
+
+    pub fn r570_from_layout(
+        layout: GspFirmwareLayout,
+        fmc_image_bytes: usize,
+        bootloader_bytes: usize,
+        system_base: u64,
+    ) -> Result<Self, GspSystemMemoryPlanError> {
+        if system_base & (NVIDIA_GSP_PAGE_SIZE as u64 - 1) != 0 {
+            return Err(GspSystemMemoryPlanError::BaseUnaligned {
+                address: system_base,
+            });
+        }
+        if layout.image.size == 0
+            || fmc_image_bytes == 0
+            || bootloader_bytes == 0
+            || layout.signature_allocation_bytes == 0
+        {
+            return Err(GspSystemMemoryPlanError::EmptyRegion);
+        }
+        let gsp_image_bytes = layout.image.size;
+        let gsp_image_allocation =
+            align_page(gsp_image_bytes).ok_or(GspSystemMemoryPlanError::SizeOverflow)?;
+        let mut next = system_base;
+        let fmc_image = stage_region(
+            &mut next,
+            align_page(fmc_image_bytes).ok_or(GspSystemMemoryPlanError::SizeOverflow)?,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let gsp_image = stage_region(&mut next, gsp_image_allocation, NVIDIA_GSP_PAGE_SIZE as u64)?;
+        let radix3_level0 = stage_region(
+            &mut next,
+            layout.radix3.level0_bytes,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let radix3_level1 = stage_region(
+            &mut next,
+            layout.radix3.level1_bytes,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let radix3_level2 = stage_region(
+            &mut next,
+            layout.radix3.level2_bytes,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let signature = stage_region(
+            &mut next,
+            layout.signature_allocation_bytes,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let bootloader = stage_region(&mut next, bootloader_bytes, NVIDIA_GSP_PAGE_SIZE as u64)?;
+        let wpr_meta = stage_region(
+            &mut next,
+            NVIDIA_GSP_WPR_META_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let fmc_args = stage_region(
+            &mut next,
+            NVIDIA_GSP_FMC_BOOT_PARAMS_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let libos_args = stage_region(
+            &mut next,
+            NVIDIA_GSP_LIBOS_ARGUMENTS_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let loginit = stage_region(
+            &mut next,
+            NVIDIA_GSP_LOG_BUFFER_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let logintr = stage_region(
+            &mut next,
+            NVIDIA_GSP_LOG_BUFFER_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let logrm = stage_region(
+            &mut next,
+            NVIDIA_GSP_LOG_BUFFER_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let shared_memory = stage_region(
+            &mut next,
+            layout.shared_memory.total_bytes,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let rm_args = stage_region(
+            &mut next,
+            NVIDIA_GSP_RM_ARGUMENTS_SIZE,
+            NVIDIA_GSP_PAGE_SIZE as u64,
+        )?;
+        let total_bytes = usize::try_from(
+            next.checked_sub(system_base)
+                .ok_or(GspSystemMemoryPlanError::AddressOverflow)?,
+        )
+        .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
+        Ok(Self {
+            layout,
+            gsp_image_bytes,
+            fmc_image_bytes,
+            bootloader_bytes,
+            bootloader_code_offset: 0,
+            bootloader_data_offset: 0,
+            bootloader_manifest_offset: 0,
+            fmc_image,
+            gsp_image,
+            radix3_level0,
+            radix3_level1,
+            radix3_level2,
+            signature,
+            bootloader,
+            wpr_meta,
+            fmc_args,
+            libos_args,
+            loginit,
+            logintr,
+            logrm,
+            shared_memory,
+            rm_args,
+            end_address: next,
+            total_bytes,
+        })
+    }
+
+    pub fn radix3_tables(self) -> Result<GspRadix3Tables, GspMemoryError> {
+        let level2_addresses =
+            contiguous_page_addresses(self.radix3_level2, self.layout.radix3.level2_pages)?;
+        let image_page_addresses =
+            contiguous_page_addresses(self.gsp_image, self.layout.radix3.image_pages)?;
+        self.layout.radix3.materialize(
+            self.radix3_level0.address,
+            self.radix3_level1.address,
+            &level2_addresses,
+            &image_page_addresses,
+        )
+    }
+
+    pub fn shared_memory_image(self) -> Result<GspSharedMemoryImage, GspMemoryError> {
+        let page_addresses = contiguous_page_addresses(
+            self.shared_memory,
+            self.layout.shared_memory.page_table_entry_count,
+        )?;
+        self.layout.shared_memory.materialize(&page_addresses)
+    }
+
+    pub fn cached_arguments(
+        self,
+    ) -> Result<[u8; NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE], GspMemoryError> {
+        GspCachedArguments::r570(self.shared_memory.address, self.layout.shared_memory)
+            .map(GspCachedArguments::encode)
+    }
+
+    pub fn fmc_boot_params(self) -> [u8; NVIDIA_GSP_FMC_BOOT_PARAMS_SIZE] {
+        GspFmcBootParams::r570(
+            self.wpr_meta.address,
+            NVIDIA_GSP_WPR_META_SIZE as u32,
+            self.libos_args.address,
+        )
+        .encode()
+    }
+
+    pub fn wpr_meta(
+        self,
+        framebuffer: GspFramebufferLayout,
+    ) -> Result<GspWprMeta, GspSystemMemoryPlanError> {
+        let gsp_image_bytes = u64::try_from(self.gsp_image_bytes)
+            .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
+        let bootloader_bytes = u64::try_from(self.bootloader_bytes)
+            .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
+        let signature_bytes = u64::try_from(self.signature.size)
+            .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
+        let pmu_reserved_size = u32::try_from(framebuffer.pmu_reserved_size)
+            .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
+        Ok(GspWprMeta {
+            sysmem_addr_of_radix3_elf: self.radix3_level0.address,
+            size_of_radix3_elf: gsp_image_bytes,
+            sysmem_addr_of_bootloader: self.bootloader.address,
+            size_of_bootloader: bootloader_bytes,
+            bootloader_code_offset: self.bootloader_code_offset,
+            bootloader_data_offset: self.bootloader_data_offset,
+            bootloader_manifest_offset: self.bootloader_manifest_offset,
+            sysmem_addr_of_signature: self.signature.address,
+            size_of_signature: signature_bytes,
+            gsp_fw_rsvd_start: framebuffer.non_wpr_heap_address,
+            non_wpr_heap_offset: framebuffer.non_wpr_heap_address,
+            non_wpr_heap_size: framebuffer.non_wpr_heap_size,
+            gsp_fw_wpr_start: framebuffer.wpr_start,
+            gsp_fw_heap_offset: framebuffer.wpr_heap_address,
+            gsp_fw_heap_size: framebuffer.wpr_heap_size,
+            gsp_fw_offset: framebuffer.gsp_image_address,
+            boot_bin_offset: framebuffer.bootloader_address,
+            frts_offset: framebuffer.frts_address,
+            frts_size: framebuffer.frts_size,
+            gsp_fw_wpr_end: framebuffer.wpr_end,
+            fb_size: framebuffer.framebuffer_size,
+            vga_workspace_offset: framebuffer.vga_workspace_address,
+            vga_workspace_size: framebuffer.vga_workspace_size,
+            boot_count: 0,
+            partition_rpc_addr: 0,
+            partition_rpc_request_offset: 0,
+            partition_rpc_reply_offset: 0,
+            elf_code_offset: 0,
+            elf_data_offset: 0,
+            elf_code_size: 0,
+            elf_data_size: 0,
+            ls_ucode_version: 0,
+            gsp_fw_heap_vf_partition_count: 0,
+            flags: 0,
+            pmu_reserved_size,
+            verified: 0,
+        })
+    }
 }
 
 impl GspFirmware {
@@ -855,6 +1294,64 @@ fn validate_page_address(address: u64) -> Result<(), GspMemoryError> {
     Ok(())
 }
 
+fn stage_region(
+    next: &mut u64,
+    size: usize,
+    alignment: u64,
+) -> Result<GspMemoryRegion, GspSystemMemoryPlanError> {
+    let address =
+        align_up_u64(*next, alignment).ok_or(GspSystemMemoryPlanError::AddressOverflow)?;
+    let end = address
+        .checked_add(u64::try_from(size).map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?)
+        .ok_or(GspSystemMemoryPlanError::AddressOverflow)?;
+    *next = end;
+    Ok(GspMemoryRegion { address, size })
+}
+
+fn contiguous_page_addresses(
+    region: GspMemoryRegion,
+    page_count: usize,
+) -> Result<Vec<u64>, GspMemoryError> {
+    let required = page_count
+        .checked_mul(NVIDIA_GSP_PAGE_SIZE)
+        .ok_or(GspMemoryError::AddressOverflow)?;
+    if required > region.size {
+        return Err(GspMemoryError::BufferTooSmall {
+            required,
+            actual: region.size,
+        });
+    }
+    validate_page_address(region.address)?;
+    let mut addresses = Vec::new();
+    addresses.reserve(page_count);
+    for index in 0..page_count {
+        let offset = index
+            .checked_mul(NVIDIA_GSP_PAGE_SIZE)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(GspMemoryError::AddressOverflow)?;
+        let address = region
+            .address
+            .checked_add(offset)
+            .ok_or(GspMemoryError::AddressOverflow)?;
+        addresses.push(address);
+    }
+    Ok(addresses)
+}
+
+fn align_down_u64(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| align_down_u64(value, alignment))
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> Option<u64> {
+    value.checked_add(divisor - 1).map(|value| value / divisor)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -1165,6 +1662,98 @@ mod tests {
                 pages: actual_pages,
                 limit: NVIDIA_GSP_MAX_MESSAGE_PAGES
             }) if actual_pages == pages
+        ));
+    }
+
+    #[test]
+    fn plans_r570_system_memory_and_materializes_boot_inputs() {
+        let bytes = synthetic_firmware();
+        let firmware = GspFirmware::parse(&bytes).expect("firmware");
+        let layout = firmware.boot_layout().expect("boot layout");
+        let plan = GspBootSystemMemoryPlan::r570_from_layout(layout, 0x20_000, 0x3000, 0x1000_0000)
+            .expect("system-memory plan");
+        let regions = [
+            plan.fmc_image,
+            plan.gsp_image,
+            plan.radix3_level0,
+            plan.radix3_level1,
+            plan.radix3_level2,
+            plan.signature,
+            plan.bootloader,
+            plan.wpr_meta,
+            plan.fmc_args,
+            plan.libos_args,
+            plan.loginit,
+            plan.logintr,
+            plan.logrm,
+            plan.shared_memory,
+            plan.rm_args,
+        ];
+        for pair in regions.windows(2) {
+            assert!(pair[0].end().expect("region end") <= pair[1].address);
+        }
+        assert_eq!(plan.total_bytes, (plan.end_address - 0x1000_0000) as usize);
+
+        let radix3 = plan.radix3_tables().expect("radix-3 tables");
+        assert_eq!(read_test_u64(&radix3.level0, 0), plan.radix3_level1.address);
+        assert_eq!(read_test_u64(&radix3.level2, 0), plan.gsp_image.address);
+        let shared = plan.shared_memory_image().expect("shared memory");
+        assert_eq!(shared.page_table_address, plan.shared_memory.address);
+        let cached_arguments = plan.cached_arguments().expect("cached arguments");
+        assert_eq!(
+            read_test_u64(&cached_arguments, 0),
+            plan.shared_memory.address
+        );
+
+        let framebuffer = GspFramebufferLayout::r570_gb20x(
+            16 * (1u64 << 30),
+            16 * (1u64 << 30) - 0x20_000,
+            plan.gsp_image_bytes,
+            plan.bootloader_bytes,
+        )
+        .expect("framebuffer layout");
+        assert_eq!(
+            framebuffer.non_wpr_heap_address + framebuffer.non_wpr_heap_size,
+            framebuffer.wpr_start
+        );
+        assert_eq!(
+            framebuffer.wpr_end,
+            framebuffer.frts_address + framebuffer.frts_size
+        );
+        let meta = plan.wpr_meta(framebuffer).expect("WPR metadata");
+        assert_eq!(
+            read_test_u64(&meta.encode(), 16),
+            plan.radix3_level0.address
+        );
+        let fmc_args = plan.fmc_boot_params();
+        assert_eq!(read_test_u64(&fmc_args, 16), plan.wpr_meta.address);
+        assert_eq!(read_test_u64(&fmc_args, 48), plan.libos_args.address);
+    }
+
+    #[test]
+    fn rejects_unaligned_system_memory_base() {
+        let bytes = synthetic_firmware();
+        let layout = GspFirmware::parse(&bytes)
+            .expect("firmware")
+            .boot_layout()
+            .expect("boot layout");
+        assert_eq!(
+            GspBootSystemMemoryPlan::r570_from_layout(layout, 1, 1, 0x1001),
+            Err(GspSystemMemoryPlanError::BaseUnaligned { address: 0x1001 })
+        );
+    }
+
+    #[test]
+    fn rejects_framebuffer_that_cannot_fit_the_gb20x_wpr() {
+        assert!(matches!(
+            GspFramebufferLayout::r570_gb20x(
+                32 * 1024 * 1024,
+                31 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024
+            ),
+            Err(GspFramebufferLayoutError::AddressUnderflow)
+                | Err(GspFramebufferLayoutError::TooSmall { .. })
         ));
     }
 
