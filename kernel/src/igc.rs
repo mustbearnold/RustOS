@@ -1,11 +1,16 @@
 use bootloader_api::info::MemoryRegion;
 use core::sync::atomic::{Ordering, fence};
+#[cfg(target_os = "none")]
+use spin::Mutex;
 
 use crate::memory::{FrameAllocator, PAGE_SIZE};
 use crate::net::{EthernetFrame, EthernetFrameError, NetworkInterface};
 use crate::pci::{
-    MmioError, MmioRegion, PciDevice, PciDeviceResources, PciInventory, PciResourceError,
+    MmioError, MmioRegion, PciDevice, PciDeviceResources, PciInterruptMode, PciInventory,
+    PciResourceError,
 };
+#[cfg(target_os = "none")]
+use crate::pci::{PciMsiRoute, PciMsixRoute};
 
 const INTEL_VENDOR_ID: u16 = 0x8086;
 pub const I225_V_DEVICE_ID: u16 = 0x15f3;
@@ -14,6 +19,7 @@ pub const I225_MMIO_LENGTH: u64 = 0x10_0000;
 const REG_STATUS: u64 = 0x0008;
 const REG_CTRL: u64 = 0x0000;
 const REG_ICR: u64 = 0x1500;
+const REG_IMS: u64 = 0x1508;
 const REG_IMC: u64 = 0x150c;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
@@ -79,7 +85,17 @@ const RX_DESCRIPTOR_ERROR_MASK: u32 = 0x8000_0000;
 const RX_DESCRIPTOR_TYPE_ONE_BUFFER: u32 = 1 << 25;
 const RX_DESCRIPTOR_PACKET_BUFFER_2048: u32 = (RX_BUFFER_SIZE as u32) / 1024;
 
+const IGC_INTERRUPT_TXDW: u32 = 1 << 0;
+const IGC_INTERRUPT_RXT0: u32 = 1 << 7;
+const IGC_INTERRUPT_LSC: u32 = 1 << 2;
+const IGC_INTERRUPT_MASK: u32 = IGC_INTERRUPT_TXDW | IGC_INTERRUPT_RXT0 | IGC_INTERRUPT_LSC;
+
 const NETWORK_INTERFACE_NAME: &str = "igc0";
+
+#[cfg(target_os = "none")]
+static IGC_INTERRUPT_MMIO: Mutex<Option<MmioRegion>> = Mutex::new(None);
+static IGC_INTERRUPT_CAUSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IGC_INTERRUPT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgcError {
@@ -90,11 +106,32 @@ pub enum IgcError {
     MemorySpaceDisabled,
     InvalidMac,
     TxRingFull,
-    TxCompletionTimeout { descriptor: usize, status: u32 },
-    RxFrameTooLarge { length: u16 },
-    RxPacketNotSingleDescriptor { status: u32 },
-    RxError { status: u32 },
+    TxCompletionTimeout {
+        descriptor: usize,
+        status: u32,
+    },
+    RxFrameTooLarge {
+        length: u16,
+    },
+    RxPacketNotSingleDescriptor {
+        status: u32,
+    },
+    RxError {
+        status: u32,
+    },
     NoPacket,
+    #[cfg(target_os = "none")]
+    InterruptsNotPrepared,
+    #[cfg(target_os = "none")]
+    InterruptTimeout {
+        cause: u32,
+        rctl: u32,
+        tdh: u32,
+        rdh: u32,
+        rdt: u32,
+    },
+    #[cfg(target_os = "none")]
+    InterruptRegistration(crate::interrupts::DeviceInterruptError),
 }
 
 impl From<PciResourceError> for IgcError {
@@ -118,6 +155,13 @@ impl From<IgcDmaError> for IgcError {
 impl From<EthernetFrameError> for IgcError {
     fn from(error: EthernetFrameError) -> Self {
         Self::Frame(error)
+    }
+}
+
+#[cfg(target_os = "none")]
+impl From<crate::interrupts::DeviceInterruptError> for IgcError {
+    fn from(error: crate::interrupts::DeviceInterruptError) -> Self {
+        Self::InterruptRegistration(error)
     }
 }
 
@@ -187,6 +231,7 @@ pub struct I225Probe {
     pub bus_master_enabled: bool,
     pub tx_queue_ready: bool,
     pub rx_queue_ready: bool,
+    pub interrupt_ready: bool,
 }
 
 impl I225Probe {
@@ -197,6 +242,7 @@ impl I225Probe {
         mac_address: [u8; 6],
         tx_queue_ready: bool,
         rx_queue_ready: bool,
+        interrupt_ready: bool,
     ) -> Self {
         Self {
             address: device.address,
@@ -207,6 +253,7 @@ impl I225Probe {
             bus_master_enabled: device.bus_master_enabled(),
             tx_queue_ready,
             rx_queue_ready,
+            interrupt_ready,
         }
     }
 }
@@ -235,6 +282,7 @@ pub fn probe(
         mmio,
         status,
         mac_address,
+        false,
         false,
         false,
     )))
@@ -280,6 +328,8 @@ pub struct IgcInitFailure {
 #[derive(Debug)]
 pub struct IgcRuntime {
     pub address: crate::pci::PciAddress,
+    pub interrupt_line: u8,
+    pub interrupt_pin: u8,
     pub mmio_base: u64,
     pub mmio_length: u64,
     pub control: u32,
@@ -293,6 +343,12 @@ pub struct IgcRuntime {
     pub rx_frames: u64,
     pub rx_packet_length: u16,
     pub failure: Option<IgcError>,
+    pub interrupt_gsi: Option<u32>,
+    pub interrupt_vector: Option<u8>,
+    pub interrupt_mode: PciInterruptMode,
+    pub interrupt_count: u64,
+    pub interrupt_cause: u32,
+    pub interrupt_driven: bool,
     next_frame_address: Option<u64>,
     pci_resources: PciDeviceResources,
     mmio: MmioRegion,
@@ -302,6 +358,7 @@ pub struct IgcRuntime {
     rx_buffers: [DmaPage; RX_RING_SIZE],
     tx_next_index: usize,
     rx_next_index: usize,
+    pending_interrupt_cause: u32,
 }
 
 impl IgcRuntime {
@@ -325,7 +382,96 @@ impl IgcRuntime {
             self.mac_address,
             self.tx_queue_ready,
             self.rx_queue_ready,
+            self.interrupt_driven,
         )
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn prepare_interrupts(&mut self) -> Result<u8, IgcError> {
+        if let Some(vector) = self.interrupt_vector {
+            return Ok(vector);
+        }
+
+        let vector = crate::interrupts::register_device_handler(igc_interrupt_handler)
+            .map_err(IgcError::InterruptRegistration)?;
+        *IGC_INTERRUPT_MMIO.lock() = Some(self.mmio);
+        let _ = self.mmio.read_u32(REG_ICR)?;
+        IGC_INTERRUPT_CAUSE.store(0, Ordering::SeqCst);
+        IGC_INTERRUPT_COUNT.store(0, Ordering::SeqCst);
+        self.interrupt_vector = Some(vector);
+        Ok(vector)
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn enable_msi(&mut self, destination_apic_id: u32) -> Result<PciMsiRoute, IgcError> {
+        let vector = self
+            .interrupt_vector
+            .ok_or(IgcError::InterruptsNotPrepared)?;
+        self.pci_resources
+            .enable_msi(vector, destination_apic_id)
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn enable_msix(&mut self, destination_apic_id: u32) -> Result<PciMsixRoute, IgcError> {
+        let vector = self
+            .interrupt_vector
+            .ok_or(IgcError::InterruptsNotPrepared)?;
+        self.pci_resources
+            .enable_msix(vector, destination_apic_id)
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn arm_interrupts(&mut self, gsi: u32) -> Result<(), IgcError> {
+        self.arm_interrupts_with_mode(PciInterruptMode::Legacy, Some(gsi))
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn arm_msi_interrupts(&mut self, route: PciMsiRoute) -> Result<(), IgcError> {
+        if self.interrupt_vector != Some(route.vector) {
+            return Err(IgcError::InterruptsNotPrepared);
+        }
+        self.arm_interrupts_with_mode(PciInterruptMode::Msi, None)
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn arm_msix_interrupts(&mut self, route: PciMsixRoute) -> Result<(), IgcError> {
+        if self.interrupt_vector != Some(route.vector) {
+            return Err(IgcError::InterruptsNotPrepared);
+        }
+        self.arm_interrupts_with_mode(PciInterruptMode::Msix, None)
+    }
+
+    #[cfg(target_os = "none")]
+    fn arm_interrupts_with_mode(
+        &mut self,
+        mode: PciInterruptMode,
+        gsi: Option<u32>,
+    ) -> Result<(), IgcError> {
+        if self.interrupt_vector.is_none() {
+            return Err(IgcError::InterruptsNotPrepared);
+        }
+        if self.interrupt_driven {
+            return Ok(());
+        }
+
+        self.mmio.write_u32(REG_IMC, u32::MAX)?;
+        let _ = self.mmio.read_u32(REG_ICR)?;
+        IGC_INTERRUPT_CAUSE.store(0, Ordering::SeqCst);
+        IGC_INTERRUPT_COUNT.store(0, Ordering::SeqCst);
+        self.pending_interrupt_cause = 0;
+        self.mmio.write_u32(REG_IMS, IGC_INTERRUPT_MASK)?;
+        self.interrupt_gsi = gsi;
+        self.interrupt_mode = mode;
+        self.interrupt_driven = true;
+        Ok(())
+    }
+
+    pub fn sync_interrupt_state(&mut self) {
+        self.pending_interrupt_cause |= IGC_INTERRUPT_CAUSE.swap(0, Ordering::SeqCst);
+        self.interrupt_cause |= self.pending_interrupt_cause;
+        self.interrupt_count = IGC_INTERRUPT_COUNT.load(Ordering::SeqCst);
     }
 
     pub fn transmit(&mut self, frame: &EthernetFrame) -> Result<(), IgcError> {
@@ -349,22 +495,26 @@ impl IgcRuntime {
         self.mmio
             .write_u32(REG_TDT0, ((index + 1) % TX_RING_SIZE) as u32)?;
 
-        for _ in 0..POLL_SPINS {
-            fence(Ordering::Acquire);
-            let status = self.tx_ring.read_u32(descriptor_offset + 12)?;
-            if status & TX_DESCRIPTOR_DONE != 0 {
-                self.tx_next_index = (index + 1) % TX_RING_SIZE;
-                self.tx_completed = true;
-                self.tx_frames = self.tx_frames.saturating_add(1);
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        #[cfg(target_os = "none")]
+        if self.interrupt_driven {
+            wait_for_tx_completion(self, index)?;
+        } else {
+            poll_for_tx_completion(self, descriptor_offset)?;
         }
+        #[cfg(not(target_os = "none"))]
+        poll_for_tx_completion(self, descriptor_offset)?;
 
-        Err(IgcError::TxCompletionTimeout {
-            descriptor: index,
-            status: self.tx_ring.read_u32(descriptor_offset + 12)?,
-        })
+        let status = self.tx_ring.read_u32(descriptor_offset + 12)?;
+        if status & TX_DESCRIPTOR_DONE == 0 {
+            return Err(IgcError::TxCompletionTimeout {
+                descriptor: index,
+                status,
+            });
+        }
+        self.tx_next_index = (index + 1) % TX_RING_SIZE;
+        self.tx_completed = true;
+        self.tx_frames = self.tx_frames.saturating_add(1);
+        Ok(())
     }
 
     pub fn receive(&mut self) -> Result<EthernetFrame, IgcError> {
@@ -378,9 +528,17 @@ impl IgcRuntime {
         let index = self.rx_next_index;
         let descriptor_offset = index as u64 * DESCRIPTOR_SIZE;
         fence(Ordering::Acquire);
-        let status = self.rx_ring.read_u32(descriptor_offset + 8)?;
+        #[allow(unused_mut)]
+        let mut status = self.rx_ring.read_u32(descriptor_offset + 8)?;
         if status & RX_DESCRIPTOR_DONE == 0 {
-            return Err(IgcError::NoPacket);
+            #[cfg(target_os = "none")]
+            if self.interrupt_driven {
+                wait_for_interrupt(self, IGC_INTERRUPT_RXT0)?;
+                status = self.rx_ring.read_u32(descriptor_offset + 8)?;
+            }
+            if status & RX_DESCRIPTOR_DONE == 0 {
+                return Err(IgcError::NoPacket);
+            }
         }
         let packet_length = self.rx_ring.read_u16(descriptor_offset + 12)?;
         if status & RX_DESCRIPTOR_ERROR_MASK != 0 {
@@ -484,6 +642,8 @@ pub fn initialize(
 
     let mut runtime = IgcRuntime {
         address: device.address,
+        interrupt_line: device.interrupt_line,
+        interrupt_pin: device.interrupt_pin,
         mmio_base: mmio.physical_base(),
         mmio_length: mmio.length(),
         control,
@@ -497,6 +657,12 @@ pub fn initialize(
         rx_frames: 0,
         rx_packet_length: 0,
         failure: None,
+        interrupt_gsi: None,
+        interrupt_vector: None,
+        interrupt_mode: PciInterruptMode::None,
+        interrupt_count: 0,
+        interrupt_cause: 0,
+        interrupt_driven: false,
         next_frame_address: frame_allocator.next_available_address(),
         pci_resources: resources,
         mmio,
@@ -506,6 +672,7 @@ pub fn initialize(
         rx_buffers: layout.rx_buffers,
         tx_next_index: 0,
         rx_next_index: 0,
+        pending_interrupt_cause: 0,
     };
 
     if let Err(error) = configure(&mut runtime) {
@@ -686,6 +853,20 @@ fn write_advanced_tx_descriptor(
     Ok(())
 }
 
+fn poll_for_tx_completion(runtime: &IgcRuntime, descriptor_offset: u64) -> Result<(), IgcError> {
+    for _ in 0..POLL_SPINS {
+        fence(Ordering::Acquire);
+        if runtime.tx_ring.read_u32(descriptor_offset + 12)? & TX_DESCRIPTOR_DONE != 0 {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(IgcError::TxCompletionTimeout {
+        descriptor: (descriptor_offset / DESCRIPTOR_SIZE) as usize,
+        status: runtime.tx_ring.read_u32(descriptor_offset + 12)?,
+    })
+}
+
 fn advanced_tx_command(packet_length: usize) -> Result<u32, IgcDmaError> {
     let packet_length = u32::try_from(packet_length).map_err(|_| IgcDmaError::AddressOverflow)?;
     Ok(TX_DESCRIPTOR_DATA_TYPE
@@ -706,6 +887,76 @@ fn recycle_rx_descriptor(runtime: &mut IgcRuntime, index: usize) -> Result<(), I
     runtime.mmio.write_u32(REG_RDT0, index as u32)?;
     runtime.rx_next_index = (index + 1) % RX_RING_SIZE;
     Ok(())
+}
+
+#[cfg(target_os = "none")]
+fn igc_interrupt_handler() {
+    let mmio = IGC_INTERRUPT_MMIO.lock().as_ref().copied();
+    let Some(mmio) = mmio else {
+        return;
+    };
+    let Ok(cause) = mmio.read_u32(REG_ICR) else {
+        return;
+    };
+    if cause != 0 {
+        IGC_INTERRUPT_CAUSE.fetch_or(cause, Ordering::SeqCst);
+        IGC_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "none")]
+fn wait_for_interrupt(runtime: &mut IgcRuntime, required_cause: u32) -> Result<u32, IgcError> {
+    let mut cause = runtime.pending_interrupt_cause;
+    for _ in 0..POLL_SPINS {
+        runtime.pending_interrupt_cause |= IGC_INTERRUPT_CAUSE.swap(0, Ordering::SeqCst);
+        cause = runtime.pending_interrupt_cause;
+        if cause & required_cause != 0 {
+            runtime.pending_interrupt_cause &= !required_cause;
+            runtime.interrupt_cause |= cause;
+            runtime.interrupt_count = IGC_INTERRUPT_COUNT.load(Ordering::SeqCst);
+            return Ok(cause);
+        }
+        if x86_64::instructions::interrupts::are_enabled() {
+            crate::interrupts::halt();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    Err(IgcError::InterruptTimeout {
+        cause,
+        rctl: runtime.mmio.read_u32(REG_RCTL)?,
+        tdh: runtime.mmio.read_u32(REG_TDH0)?,
+        rdh: runtime.mmio.read_u32(REG_RDH0)?,
+        rdt: runtime.mmio.read_u32(REG_RDT0)?,
+    })
+}
+
+#[cfg(target_os = "none")]
+fn wait_for_tx_completion(runtime: &mut IgcRuntime, index: usize) -> Result<u32, IgcError> {
+    let mut cause = runtime.pending_interrupt_cause;
+    let descriptor_offset = index as u64 * DESCRIPTOR_SIZE;
+    for _ in 0..POLL_SPINS {
+        runtime.pending_interrupt_cause |= IGC_INTERRUPT_CAUSE.swap(0, Ordering::SeqCst);
+        cause = runtime.pending_interrupt_cause;
+        if runtime.tx_ring.read_u32(descriptor_offset + 12)? & TX_DESCRIPTOR_DONE != 0 {
+            runtime.pending_interrupt_cause &= !IGC_INTERRUPT_TXDW;
+            runtime.interrupt_cause |= cause;
+            runtime.interrupt_count = IGC_INTERRUPT_COUNT.load(Ordering::SeqCst);
+            return Ok(cause);
+        }
+        if x86_64::instructions::interrupts::are_enabled() {
+            crate::interrupts::halt();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    Err(IgcError::InterruptTimeout {
+        cause,
+        rctl: runtime.mmio.read_u32(REG_RCTL)?,
+        tdh: runtime.mmio.read_u32(REG_TDH0)?,
+        rdh: runtime.mmio.read_u32(REG_RDH0)?,
+        rdt: runtime.mmio.read_u32(REG_RDT0)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -892,5 +1143,13 @@ mod tests {
         assert_ne!(status_error & RX_DESCRIPTOR_END_OF_PACKET, 0);
         assert_eq!(packet_length, 128);
         assert_eq!(core::mem::size_of::<[u8; 16]>(), 16);
+    }
+
+    #[test]
+    fn enables_tx_rx_and_link_status_interrupts() {
+        assert_eq!(
+            IGC_INTERRUPT_MASK,
+            IGC_INTERRUPT_TXDW | IGC_INTERRUPT_RXT0 | IGC_INTERRUPT_LSC
+        );
     }
 }

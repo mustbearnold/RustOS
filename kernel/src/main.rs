@@ -235,6 +235,147 @@ fn configure_e1000_interrupts(
 }
 
 #[cfg(target_os = "none")]
+fn configure_igc_interrupts(
+    runtime: &mut igc::IgcRuntime,
+    physical_memory: acpi::PhysicalMemory,
+    acpi_info: &acpi::AcpiInfo,
+    legacy_available: bool,
+) -> bool {
+    let vector = match runtime.prepare_interrupts() {
+        Ok(vector) => vector,
+        Err(error) => {
+            runtime.failure = Some(error);
+            kprintln!(
+                "driver: igc interrupt registration failed ({:?}) status=degraded",
+                error
+            );
+            return false;
+        }
+    };
+
+    let msix_attempt =
+        apic::local_apic_id_u32().map(|destination| runtime.enable_msix(destination));
+    match msix_attempt {
+        Some(Ok(route)) => match runtime.arm_msix_interrupts(route) {
+            Ok(()) => {
+                kprintln!(
+                    "driver: igc interrupt mode=msix vector={} destination_apic={} table_bar={} table_offset=0x{:x} address=0x{:x} data=0x{:04x} status=ready",
+                    route.vector,
+                    route.destination_apic_id,
+                    route.table_bar,
+                    route.table_offset,
+                    route.address,
+                    route.data
+                );
+                return true;
+            }
+            Err(error) => {
+                runtime.failure = Some(error);
+                kprintln!(
+                    "driver: igc MSI-X interrupt arm failed ({:?}) status=degraded",
+                    error
+                );
+                return false;
+            }
+        },
+        Some(Err(igc::IgcError::Resources(error))) => kprintln!(
+            "driver: igc MSI-X unavailable ({:?}); evaluating MSI fallback",
+            error
+        ),
+        None => kprintln!(
+            "driver: igc MSI-X unavailable (no APIC destination); evaluating MSI fallback"
+        ),
+        Some(Err(error)) => {
+            runtime.failure = Some(error);
+            kprintln!(
+                "driver: igc MSI-X configuration failed ({:?}) status=degraded",
+                error
+            );
+            return false;
+        }
+    }
+
+    let msi_attempt = apic::local_apic_id_u32().map(|destination| runtime.enable_msi(destination));
+    match msi_attempt {
+        Some(Ok(route)) => match runtime.arm_msi_interrupts(route) {
+            Ok(()) => {
+                kprintln!(
+                    "driver: igc interrupt mode=msi vector={} destination_apic={} address=0x{:x} data=0x{:04x} status=ready",
+                    route.vector,
+                    route.destination_apic_id,
+                    route.address,
+                    route.data
+                );
+                return true;
+            }
+            Err(error) => {
+                runtime.failure = Some(error);
+                kprintln!(
+                    "driver: igc MSI interrupt arm failed ({:?}) status=degraded",
+                    error
+                );
+                return false;
+            }
+        },
+        Some(Err(igc::IgcError::Resources(error))) => kprintln!(
+            "driver: igc MSI unavailable ({:?}); evaluating legacy IO-APIC fallback status=degraded",
+            error
+        ),
+        None => kprintln!(
+            "driver: igc MSI unavailable (no APIC destination); evaluating legacy IO-APIC fallback status=degraded"
+        ),
+        Some(Err(error)) => {
+            runtime.failure = Some(error);
+            kprintln!(
+                "driver: igc MSI configuration failed ({:?}) status=degraded",
+                error
+            );
+            return false;
+        }
+    }
+
+    if !legacy_available {
+        kprintln!("driver: igc has no MSI or legacy IO-APIC route status=degraded");
+        return false;
+    }
+    let Some((gsi, flags)) = acpi_info.legacy_irq_route(runtime.interrupt_line) else {
+        kprintln!("driver: igc interrupt line unavailable for legacy routing status=degraded");
+        return false;
+    };
+    let route = match ioapic::route_gsi(physical_memory, acpi_info, gsi, vector, flags) {
+        Ok(route) => route,
+        Err(error) => {
+            kprintln!(
+                "driver: igc legacy interrupt route failed ({:?}) status=degraded",
+                error
+            );
+            return false;
+        }
+    };
+    match runtime.arm_interrupts(gsi) {
+        Ok(()) => {
+            route.unmask();
+            kprintln!(
+                "driver: igc interrupt mode=legacy irq_line={} gsi={} vector={} flags=0x{:04x} status=ready",
+                runtime.interrupt_line,
+                gsi,
+                vector,
+                flags
+            );
+            true
+        }
+        Err(error) => {
+            runtime.failure = Some(error);
+            kprintln!(
+                "driver: igc legacy interrupt arm failed ({:?}) status=degraded",
+                error
+            );
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
 fn configure_virtio_interrupts(runtime: &mut virtio_net::VirtioNetRuntime) -> bool {
     match runtime.prepare_interrupts() {
         Ok(_) => {}
@@ -1069,7 +1210,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     process::update_frame_allocator(dma_next_frame_address);
 
-    let (igc_runtime, igc_dma_next_frame_address) = match igc::initialize(
+    let (mut igc_runtime, igc_dma_next_frame_address) = match igc::initialize(
         &pci_inventory,
         physical_memory_offset,
         &boot_info.memory_regions,
@@ -1186,6 +1327,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let mut e1000_interrupt_ready = false;
+    let mut igc_interrupt_ready = false;
     if apic_active {
         if let Some(acpi_info) = acpi_info.as_ref() {
             match scheduler::init(acpi_info) {
@@ -1278,6 +1420,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
+        if let Some(runtime) = igc_runtime.as_mut() {
+            if runtime.failure.is_none() {
+                if let Some(acpi_info) = acpi_info.as_ref() {
+                    igc_interrupt_ready = configure_igc_interrupts(
+                        runtime,
+                        physical_memory,
+                        acpi_info,
+                        io_apic_active,
+                    );
+                }
+            }
+        }
+
         if usb::hid_present() {
             match apic::local_apic_id_u32() {
                 Some(destination_apic_id) => match usb::configure_interrupts(
@@ -1308,7 +1463,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             match smp::init(
                 physical_memory,
                 &boot_info.memory_regions,
-                dma_next_frame_address,
+                gpu_dma_next_frame_address,
                 acpi_info,
             ) {
                 Ok(stats) => {
@@ -1688,6 +1843,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             runtime.packet_length,
             if runtime.is_ready() {
                 "ready"
+            } else {
+                "degraded"
+            },
+            runtime.failure
+        );
+    }
+    if let Some(runtime) = igc_runtime.as_mut() {
+        runtime.sync_interrupt_state();
+        hardware::set_i225(runtime.probe_snapshot());
+        kprintln!(
+            "driver: igc {:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} irq_line={} irq_pin={} irq_gsi={:?} irq_vector={:?} irq_mode={:?} irq_count={} irq_cause=0x{:08x} interrupt_driven={} busmaster={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} tx_queue={} rx_queue={} tx_frames={} rx_frames={} status={} failure={:?}",
+            runtime.address.bus,
+            runtime.address.device,
+            runtime.address.function,
+            runtime.mmio_base,
+            runtime.mmio_length,
+            runtime.interrupt_line,
+            runtime.interrupt_pin,
+            runtime.interrupt_gsi,
+            runtime.interrupt_vector,
+            runtime.interrupt_mode,
+            runtime.interrupt_count,
+            runtime.interrupt_cause,
+            runtime.interrupt_driven,
+            runtime.bus_master_enabled,
+            runtime.mac_address[0],
+            runtime.mac_address[1],
+            runtime.mac_address[2],
+            runtime.mac_address[3],
+            runtime.mac_address[4],
+            runtime.mac_address[5],
+            runtime.tx_queue_ready,
+            runtime.rx_queue_ready,
+            runtime.tx_frames,
+            runtime.rx_frames,
+            if runtime.is_ready() && igc_interrupt_ready {
+                "interrupt-ready"
+            } else if runtime.is_ready() {
+                "queue-ready-polling"
             } else {
                 "degraded"
             },
