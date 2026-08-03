@@ -27,6 +27,8 @@ mod hardware;
 mod hda;
 #[cfg(target_os = "none")]
 mod heap;
+#[cfg(any(target_os = "none", test))]
+mod igc;
 mod initramfs;
 #[cfg(any(target_os = "none", test))]
 mod input;
@@ -608,6 +610,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             display.vendor_id,
             display.device_id
         );
+    }
+    match igc::probe(&pci_inventory, physical_memory_offset) {
+        Ok(Some(probe)) => {
+            hardware::set_i225(probe);
+            kprintln!(
+                "driver: igc probe {:02x}:{:02x}.{} mmio=0x{:x} status=0x{:08x} link_up={} speed_mbps={} full_duplex={} busmaster={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} status=ready",
+                probe.address.bus,
+                probe.address.device,
+                probe.address.function,
+                probe.mmio_base,
+                probe.status,
+                probe.link.up,
+                probe.link.speed.mbps(),
+                probe.link.full_duplex,
+                probe.bus_master_enabled,
+                probe.mac_address[0],
+                probe.mac_address[1],
+                probe.mac_address[2],
+                probe.mac_address[3],
+                probe.mac_address[4],
+                probe.mac_address[5]
+            );
+        }
+        Ok(None) => kprintln!("driver: igc I225-V not present status=absent"),
+        Err(error) => kprintln!(
+            "driver: igc I225-V probe failed ({:?}) status=degraded",
+            error
+        ),
     }
 
     if apic_active {

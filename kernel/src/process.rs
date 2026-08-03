@@ -289,8 +289,8 @@ pub struct ProcessExit {
 /// `(rdi, rsi)`; `SYS_NET_INTERFACES` writes the bounded network-manager interface and route table
 /// to `(rdi, rsi)`; and `SYS_NET_RENEW` renews every DHCP lease through the network manager and
 /// writes its bounded result report to `(rdi, rsi)`.
-/// `SYS_HW_INFO` writes the bounded PCI, framebuffer, display, and graphics-backend capability
-/// snapshot to `(rdi, rsi)`.
+/// `SYS_HW_INFO` writes the bounded PCI, framebuffer, display, graphics-backend, and native
+/// network-probe capability snapshot to `(rdi, rsi)`.
 /// `SYS_GFX_INFO` writes the current framebuffer geometry to `(rdi, rsi)`; `SYS_GFX_ACQUIRE`
 /// reserves the framebuffer for the calling process; `SYS_GFX_FILL_RECT` reads one bounded
 /// color rectangle from `(rdi, rsi)`; `SYS_GFX_TEXT` reads a bounded text request from `(rdi, rsi)`

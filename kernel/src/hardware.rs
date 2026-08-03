@@ -4,6 +4,7 @@ use spin::Mutex;
 
 use crate::{
     framebuffer::GraphicsInfo,
+    igc::I225Probe,
     pci::{PciAddress, PciDevice, PciInventory, PciRoleCounts},
 };
 
@@ -83,6 +84,7 @@ pub struct HardwareSnapshot {
     pub pci: PciRoleCounts,
     pub framebuffer: Option<GraphicsInfo>,
     pub primary_display: Option<PciDisplaySnapshot>,
+    pub i225: Option<I225Probe>,
     pub graphics_backend: GraphicsBackend,
 }
 
@@ -102,6 +104,7 @@ impl HardwareSnapshot {
             },
             framebuffer: None,
             primary_display: None,
+            i225: None,
             graphics_backend: GraphicsBackend::None,
         }
     }
@@ -122,8 +125,13 @@ pub fn init(inventory: &PciInventory, framebuffer: Option<GraphicsInfo>) {
         pci: inventory.role_counts(),
         framebuffer,
         primary_display,
+        i225: None,
         graphics_backend,
     };
+}
+
+pub fn set_i225(probe: I225Probe) {
+    SNAPSHOT.lock().i225 = Some(probe);
 }
 
 pub fn set_graphics_backend(graphics_backend: GraphicsBackend) {
@@ -179,6 +187,28 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
         )?;
     } else {
         writeln!(writer, "display: pci=none status=absent")?;
+    }
+    if let Some(network) = snapshot.i225 {
+        writeln!(
+            writer,
+            "network: driver=igc probe=i225-v pci={:02x}:{:02x}.{} mmio=0x{:x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_up={} speed_mbps={} full_duplex={} busmaster={} status=ready",
+            network.address.bus,
+            network.address.device,
+            network.address.function,
+            network.mmio_base,
+            network.mac_address[0],
+            network.mac_address[1],
+            network.mac_address[2],
+            network.mac_address[3],
+            network.mac_address[4],
+            network.mac_address[5],
+            network.link.up,
+            network.link.speed.mbps(),
+            network.link.full_duplex,
+            network.bus_master_enabled
+        )?;
+    } else {
+        writeln!(writer, "network: driver=igc probe=i225-v status=absent")?;
     }
     writeln!(
         writer,
