@@ -1384,11 +1384,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             &boot_info.memory_regions,
             gpu_dma_next_frame_address,
         ) {
-            Ok(Some(staging)) => {
+            Ok(Some(mut staging)) => {
                 let fsp_status = if staging.fsp_boot_requested {
+                    hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Staged);
                     match nvidia_probe.as_ref() {
-                        Some(probe) => match nvidia::boot_external_gsp(probe, &staging) {
+                        Some(probe) => match nvidia::boot_external_gsp(probe, &mut staging) {
                             Ok(boot) => {
+                                hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Ready);
                                 kprintln!(
                                     "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
                                     boot.fsp_response.task_id,
@@ -1403,17 +1405,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                                     boot.gsp.riscv_active,
                                     boot.gsp.riscv_lockdown,
                                 );
-                                "gsp-ready"
+                                kprintln!(
+                                    "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name={:?} acceleration=unavailable status=ready",
+                                    boot.static_info.gpu_name,
+                                );
+                                "gsp-rm-ready"
                             }
                             Err(error) => {
+                                hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Failed);
                                 kprintln!(
-                                    "driver: nvidia FSP COT failed ({:?}) status=degraded",
+                                    "driver: nvidia GSP-RM bootstrap failed ({:?}) status=degraded",
                                     error
                                 );
-                                "cot-failed"
+                                "gsp-rm-failed"
                             }
                         },
-                        None => "probe-unavailable",
+                        None => {
+                            hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Failed);
+                            "probe-unavailable"
+                        }
                     }
                 } else {
                     "disabled"

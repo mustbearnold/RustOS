@@ -83,6 +83,14 @@ pub const NVIDIA_GSP_FUNCTION_SET_REGISTRY: u32 = 73;
 pub const NVIDIA_GSP_EVENT_FIRST: u32 = 4096;
 pub const NVIDIA_GSP_EVENT_GSP_INIT_DONE: u32 = 4097;
 pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = NVIDIA_GSP_FUNCTION_CONTINUATION_RECORD;
+pub const NVIDIA_GSP_R570_SYSTEM_INFO_SIZE: usize = 544;
+pub const NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE: usize = 1656;
+pub const NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET: usize = 1260;
+pub const NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE: u32 = 0x0009_2000;
+pub const NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE: u32 = 0x0000_1000;
+pub const NVIDIA_GSP_R570_CHIPSET_GB205: u32 = 0x0000_01b5;
+pub const NVIDIA_GSP_R570_MAX_USER_VA: u64 = (1u64 << 47) - 4096;
+pub const NVIDIA_GSP_REGISTRY_DWORD: u8 = 1;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELF_CLASS_64: u8 = 2;
@@ -1463,6 +1471,125 @@ pub fn encode_gsp_rpc_with_sequences(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspSystemInfoR570 {
+    pub gpu_phys_addr: u64,
+    pub gpu_phys_fb_addr: u64,
+    pub gpu_phys_inst_addr: u64,
+    pub nv_domain_bus_device_func: u16,
+    pub pci_device_id: u16,
+    pub pci_vendor_id: u16,
+    pub pci_subdevice_id: u16,
+    pub pci_subvendor_id: u16,
+    pub pci_revision_id: u8,
+}
+
+impl GspSystemInfoR570 {
+    pub fn r570_gb20x(
+        gpu_phys_addr: u64,
+        gpu_phys_fb_addr: u64,
+        gpu_phys_inst_addr: u64,
+        nv_domain_bus_device_func: u16,
+        pci_device_id: u16,
+        pci_vendor_id: u16,
+        pci_subdevice_id: u16,
+        pci_subvendor_id: u16,
+        pci_revision_id: u8,
+    ) -> Self {
+        Self {
+            gpu_phys_addr,
+            gpu_phys_fb_addr,
+            gpu_phys_inst_addr,
+            nv_domain_bus_device_func,
+            pci_device_id,
+            pci_vendor_id,
+            pci_subdevice_id,
+            pci_subvendor_id,
+            pci_revision_id,
+        }
+    }
+
+    pub fn encode(self) -> [u8; NVIDIA_GSP_R570_SYSTEM_INFO_SIZE] {
+        let mut bytes = [0u8; NVIDIA_GSP_R570_SYSTEM_INFO_SIZE];
+        write_le_u64(&mut bytes, 0, self.gpu_phys_addr);
+        write_le_u64(&mut bytes, 8, self.gpu_phys_fb_addr);
+        write_le_u64(&mut bytes, 16, self.gpu_phys_inst_addr);
+        write_le_u64(&mut bytes, 32, u64::from(self.nv_domain_bus_device_func));
+        write_le_u64(&mut bytes, 72, NVIDIA_GSP_R570_MAX_USER_VA);
+        write_le_u32(&mut bytes, 80, NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE);
+        write_le_u32(&mut bytes, 84, NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE);
+        write_le_u32(
+            &mut bytes,
+            88,
+            (u32::from(self.pci_device_id) << 16) | u32::from(self.pci_vendor_id),
+        );
+        write_le_u32(
+            &mut bytes,
+            92,
+            (u32::from(self.pci_subdevice_id) << 16) | u32::from(self.pci_subvendor_id),
+        );
+        write_le_u32(&mut bytes, 96, u32::from(self.pci_revision_id));
+        write_le_u32(&mut bytes, 120, NVIDIA_GSP_R570_CHIPSET_GB205);
+        bytes
+    }
+}
+
+pub fn encode_gsp_registry() -> Vec<u8> {
+    const KEYS: [&[u8]; 3] = [
+        b"RMSecBusResetEnable",
+        b"RMForcePcieConfigSave",
+        b"RMDevidCheckIgnore",
+    ];
+    const ENTRY_SIZE: usize = 16;
+    let string_size = KEYS[0].len() + 1 + KEYS[1].len() + 1 + KEYS[2].len() + 1;
+    let variable_size = KEYS.len() * ENTRY_SIZE + string_size;
+    let mut bytes = Vec::new();
+    bytes.resize(8 + variable_size, 0);
+    write_le_u32(&mut bytes, 0, variable_size as u32);
+    write_le_u32(&mut bytes, 4, KEYS.len() as u32);
+
+    let string_start = 8 + KEYS.len() * ENTRY_SIZE;
+    let mut string_offset = string_start;
+    for (index, key) in KEYS.iter().enumerate() {
+        let entry_offset = 8 + index * ENTRY_SIZE;
+        write_le_u32(&mut bytes, entry_offset, string_offset as u32);
+        bytes[entry_offset + 4] = NVIDIA_GSP_REGISTRY_DWORD;
+        write_le_u32(&mut bytes, entry_offset + 8, 1);
+        let end = string_offset + key.len();
+        bytes[string_offset..end].copy_from_slice(key);
+        bytes[end] = 0;
+        string_offset = end + 1;
+    }
+    bytes
+}
+
+pub fn encode_gsp_static_info_request() -> [u8; NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE] {
+    [0u8; NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspStaticInfoError {
+    PayloadTooSmall { required: usize, actual: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspStaticInfo {
+    pub gpu_name: [u8; 64],
+}
+
+pub fn parse_gsp_static_info(payload: &[u8]) -> Result<GspStaticInfo, GspStaticInfoError> {
+    let name_end = NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET + 64;
+    if payload.len() < NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE {
+        return Err(GspStaticInfoError::PayloadTooSmall {
+            required: NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE,
+            actual: payload.len(),
+        });
+    }
+    let mut gpu_name = [0u8; 64];
+    gpu_name.copy_from_slice(&payload[NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET..name_end]);
+    Ok(GspStaticInfo { gpu_name })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GspQueueError {
     BufferTooSmall {
         required: usize,
@@ -2131,6 +2258,72 @@ mod tests {
         assert_eq!(
             GspFirmware::parse(&bytes),
             Err(GspFirmwareError::UnsupportedMachine { value: 0x8664 })
+        );
+    }
+
+    #[test]
+    fn encodes_exact_r570_system_info_fields() {
+        let bytes = GspSystemInfoR570::r570_gb20x(
+            0x1234_5678_9abc_def0,
+            0x2222_0000,
+            0x3333_0000,
+            0x0b00,
+            0x2f04,
+            0x10de,
+            0x1234,
+            0x5678,
+            0xa1,
+        )
+        .encode();
+        assert_eq!(bytes.len(), NVIDIA_GSP_R570_SYSTEM_INFO_SIZE);
+        assert_eq!(read_test_u64(&bytes, 0), 0x1234_5678_9abc_def0);
+        assert_eq!(read_test_u64(&bytes, 8), 0x2222_0000);
+        assert_eq!(read_test_u64(&bytes, 16), 0x3333_0000);
+        assert_eq!(read_test_u64(&bytes, 32), 0x0b00);
+        assert_eq!(read_test_u64(&bytes, 72), NVIDIA_GSP_R570_MAX_USER_VA);
+        assert_eq!(
+            read_test_u32(&bytes, 80),
+            NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE
+        );
+        assert_eq!(
+            read_test_u32(&bytes, 84),
+            NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE
+        );
+        assert_eq!(read_test_u32(&bytes, 88), 0x2f04_10de);
+        assert_eq!(read_test_u32(&bytes, 92), 0x1234_5678);
+        assert_eq!(read_test_u32(&bytes, 96), 0xa1);
+        assert_eq!(read_test_u32(&bytes, 120), NVIDIA_GSP_R570_CHIPSET_GB205);
+        assert!(bytes[128..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn encodes_linux_r570_registry_table_layout() {
+        let bytes = encode_gsp_registry();
+        assert_eq!(bytes.len(), 117);
+        assert_eq!(read_test_u32(&bytes, 0), 109);
+        assert_eq!(read_test_u32(&bytes, 4), 3);
+        assert_eq!(read_test_u32(&bytes, 8), 56);
+        assert_eq!(bytes[12], NVIDIA_GSP_REGISTRY_DWORD);
+        assert_eq!(read_test_u32(&bytes, 16), 1);
+        assert_eq!(read_test_u32(&bytes, 24), 76);
+        assert_eq!(read_test_u32(&bytes, 40), 98);
+        assert_eq!(&bytes[56..76], b"RMSecBusResetEnable\0");
+        assert_eq!(&bytes[76..98], b"RMForcePcieConfigSave\0");
+        assert_eq!(&bytes[98..117], b"RMDevidCheckIgnore\0");
+    }
+
+    #[test]
+    fn parses_r570_static_info_gpu_name_at_wire_offset() {
+        let mut payload = encode_gsp_static_info_request().to_vec();
+        payload[NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET..][..13].copy_from_slice(b"NVIDIA GB205\0");
+        let info = parse_gsp_static_info(&payload).expect("static info");
+        assert_eq!(&info.gpu_name[..13], b"NVIDIA GB205\0");
+        assert_eq!(
+            parse_gsp_static_info(&payload[..NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE - 1]),
+            Err(GspStaticInfoError::PayloadTooSmall {
+                required: NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE,
+                actual: NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE - 1,
+            })
         );
     }
 

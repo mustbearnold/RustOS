@@ -33,6 +33,7 @@ pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = rustos_gpu_protocol::NVIDIA_GSP_FSP_BA
 #[allow(dead_code)]
 const NVIDIA_GSP_FSP_POLL_SPINS: usize = 10_000_000;
 const NVIDIA_GSP_FMC_POLL_SPINS: usize = 10_000_000;
+const NVIDIA_GSP_RPC_POLL_SPINS: usize = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -83,6 +84,15 @@ pub enum NvidiaError {
         size: usize,
         available: usize,
     },
+    GspRpcTimeout {
+        function: u32,
+    },
+    GspRpcFailed {
+        function: u32,
+        result: u32,
+        private_result: u32,
+    },
+    GspStaticInfo(rustos_gpu_protocol::GspStaticInfoError),
     GspFmcBootTimeout,
     GspFmcBootFailed {
         mailbox0: u32,
@@ -525,6 +535,7 @@ pub struct NvidiaGspReady {
 pub struct NvidiaGspBootResult {
     pub fsp_response: rustos_gpu_protocol::GspFspResponse,
     pub gsp: NvidiaGspReady,
+    pub static_info: rustos_gpu_protocol::GspStaticInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +734,25 @@ impl NvidiaFspTransport {
         queue.try_receive_message().map_err(NvidiaError::GspQueue)
     }
 
+    #[cfg(target_os = "none")]
+    fn wait_for_gsp_function(
+        &self,
+        staging: &mut NvidiaGspStaging,
+        function: u32,
+    ) -> Result<Vec<u8>, NvidiaError> {
+        for _ in 0..NVIDIA_GSP_RPC_POLL_SPINS {
+            if let Some(message) = self.try_receive_gsp_rpc(staging)? {
+                let parsed = rustos_gpu_protocol::GspRpcMessage::parse(&message)
+                    .map_err(NvidiaError::GspRpc)?;
+                if parsed.function() == function {
+                    return Ok(message);
+                }
+            }
+            core::hint::spin_loop();
+        }
+        Err(NvidiaError::GspRpcTimeout { function })
+    }
+
     pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
         validate_packet(packet)?;
         for _ in 0..NVIDIA_GSP_FSP_POLL_SPINS {
@@ -867,7 +897,7 @@ impl NvidiaFspTransport {
 #[cfg(target_os = "none")]
 pub fn boot_external_gsp(
     probe: &NvidiaProbe,
-    staging: &NvidiaGspStaging,
+    staging: &mut NvidiaGspStaging,
 ) -> Result<NvidiaGspBootResult, NvidiaError> {
     let transport = probe.fsp_transport().ok_or(NvidiaError::FspUnavailable)?;
     transport.wait_secure_boot()?;
@@ -876,7 +906,63 @@ pub fn boot_external_gsp(
         &staging.fsp_cot,
     )?;
     let gsp = transport.wait_gsp_fmc_ready(staging.plan.fmc_args.address)?;
-    Ok(NvidiaGspBootResult { fsp_response, gsp })
+    let system_info = rustos_gpu_protocol::GspSystemInfoR570::r570_gb20x(
+        probe.bar0_base,
+        probe.bar1_base.unwrap_or(0),
+        probe.bar3_base.unwrap_or(0),
+        probe.address.dev_id(),
+        probe.device_id,
+        probe.vendor_id,
+        probe.subsystem_device_id,
+        probe.subsystem_vendor_id,
+        probe.revision_id,
+    )
+    .encode();
+    transport.send_gsp_rpc(
+        staging,
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO,
+        0,
+        0,
+        &system_info,
+    )?;
+    let registry = rustos_gpu_protocol::encode_gsp_registry();
+    transport.send_gsp_rpc(
+        staging,
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_SET_REGISTRY,
+        1,
+        0,
+        &registry,
+    )?;
+    transport
+        .wait_for_gsp_function(staging, rustos_gpu_protocol::NVIDIA_GSP_EVENT_GSP_INIT_DONE)?;
+    let static_info_request = rustos_gpu_protocol::encode_gsp_static_info_request();
+    transport.send_gsp_rpc(
+        staging,
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+        2,
+        0,
+        &static_info_request,
+    )?;
+    let static_info_message = transport.wait_for_gsp_function(
+        staging,
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+    )?;
+    let static_info_message = rustos_gpu_protocol::GspRpcMessage::parse(&static_info_message)
+        .map_err(NvidiaError::GspRpc)?;
+    if static_info_message.rpc_result() != 0 {
+        return Err(NvidiaError::GspRpcFailed {
+            function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            result: static_info_message.rpc_result(),
+            private_result: static_info_message.rpc_result_private(),
+        });
+    }
+    let static_info = rustos_gpu_protocol::parse_gsp_static_info(static_info_message.payload())
+        .map_err(NvidiaError::GspStaticInfo)?;
+    Ok(NvidiaGspBootResult {
+        fsp_response,
+        gsp,
+        static_info,
+    })
 }
 
 #[allow(dead_code)]
@@ -898,6 +984,8 @@ pub struct NvidiaProbe {
     pub address: PciAddress,
     pub vendor_id: u16,
     pub device_id: u16,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_device_id: u16,
     pub revision_id: u8,
     pub architecture: NvidiaArchitecture,
     pub bar0_base: u64,
@@ -941,6 +1029,8 @@ impl NvidiaProbe {
             address: device.address,
             vendor_id: device.vendor_id,
             device_id: device.device_id,
+            subsystem_vendor_id: device.subsystem_vendor_id,
+            subsystem_device_id: device.subsystem_device_id,
             revision_id: device.revision_id,
             architecture: architecture_for(device.device_id),
             bar0_base,
@@ -1031,6 +1121,8 @@ mod tests {
             address: PciAddress::new(0x0b, 0, 0),
             vendor_id: NVIDIA_VENDOR_ID,
             device_id,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
             revision_id: 0xa1,
             prog_if: 0,
             command: (1 << 1) | (1 << 2),

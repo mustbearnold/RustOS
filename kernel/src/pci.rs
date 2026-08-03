@@ -42,6 +42,11 @@ impl PciAddress {
             function,
         }
     }
+
+    /// Linux's `pci_dev_id()`: bus number plus device/function, without domain.
+    pub const fn dev_id(self) -> u16 {
+        ((self.bus as u16) << 8) | ((self.device as u16) << 3) | self.function as u16
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +237,8 @@ pub struct PciDevice {
     pub address: PciAddress,
     pub vendor_id: u16,
     pub device_id: u16,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_device_id: u16,
     pub revision_id: u8,
     pub prog_if: u8,
     pub command: u16,
@@ -963,6 +970,7 @@ impl LegacyConfigAccess {
 
 fn read_device(config: &mut LegacyConfigAccess, address: PciAddress) -> PciDevice {
     let identity = config.read_u32(address, 0x00);
+    let subsystem = config.read_u32(address, 0x2c);
     let class_register = config.read_u32(address, 0x08);
     let command_status = config.read_u32(address, 0x04);
     let class_code = (class_register >> 24) as u8;
@@ -977,6 +985,8 @@ fn read_device(config: &mut LegacyConfigAccess, address: PciAddress) -> PciDevic
         address,
         vendor_id: identity as u16,
         device_id: (identity >> 16) as u16,
+        subsystem_vendor_id: subsystem as u16,
+        subsystem_device_id: (subsystem >> 16) as u16,
         revision_id,
         prog_if,
         command: command_status as u16,
@@ -1276,6 +1286,8 @@ mod tests {
             address: PciAddress::new(bus, 0, 0),
             vendor_id,
             device_id: 1,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
             revision_id: 0,
             prog_if: 0,
             command: 0,

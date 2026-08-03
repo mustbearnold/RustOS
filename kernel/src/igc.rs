@@ -1590,6 +1590,8 @@ mod tests {
             address: crate::pci::PciAddress::new(0, 0, 0),
             vendor_id,
             device_id,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
             revision_id: 0,
             prog_if: 0,
             command: 0,

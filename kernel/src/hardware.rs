@@ -49,6 +49,25 @@ impl GraphicsBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvidiaGspStatus {
+    NotRequested,
+    Staged,
+    Ready,
+    Failed,
+}
+
+impl NvidiaGspStatus {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Staged => "staged",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciDisplaySnapshot {
     pub address: PciAddress,
     pub vendor_id: u16,
@@ -86,6 +105,7 @@ pub struct HardwareSnapshot {
     pub framebuffer: Option<GraphicsInfo>,
     pub primary_display: Option<PciDisplaySnapshot>,
     pub nvidia: Option<NvidiaProbe>,
+    pub nvidia_gsp: NvidiaGspStatus,
     pub i225: Option<I225Probe>,
     pub graphics_backend: GraphicsBackend,
 }
@@ -107,6 +127,7 @@ impl HardwareSnapshot {
             framebuffer: None,
             primary_display: None,
             nvidia: None,
+            nvidia_gsp: NvidiaGspStatus::NotRequested,
             i225: None,
             graphics_backend: GraphicsBackend::None,
         }
@@ -129,6 +150,7 @@ pub fn init(inventory: &PciInventory, framebuffer: Option<GraphicsInfo>) {
         framebuffer,
         primary_display,
         nvidia: None,
+        nvidia_gsp: NvidiaGspStatus::NotRequested,
         i225: None,
         graphics_backend,
     };
@@ -140,6 +162,10 @@ pub fn set_i225(probe: I225Probe) {
 
 pub fn set_nvidia(probe: NvidiaProbe) {
     SNAPSHOT.lock().nvidia = Some(probe);
+}
+
+pub fn set_nvidia_gsp_status(status: NvidiaGspStatus) {
+    SNAPSHOT.lock().nvidia_gsp = status;
 }
 
 pub fn set_graphics_backend(graphics_backend: GraphicsBackend) {
@@ -199,7 +225,7 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
     if let Some(graphics) = snapshot.nvidia {
         writeln!(
             writer,
-            "nvidia: driver=probe pci={:02x}:{:02x}.{} device_id=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_transport={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} acceleration=unavailable status=probe-ready",
+            "nvidia: driver=probe pci={:02x}:{:02x}.{} device_id=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_transport={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} gsp_rm={} acceleration=unavailable status=probe-ready",
             graphics.address.bus,
             graphics.address.device,
             graphics.address.function,
@@ -228,7 +254,8 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
             graphics.fsp.message_queue_tail,
             graphics.fsp.mailbox0,
             graphics.fsp.mailbox1,
-            graphics.fsp.riscv_lockdown
+            graphics.fsp.riscv_lockdown,
+            snapshot.nvidia_gsp.name()
         )?;
     } else {
         writeln!(writer, "nvidia: driver=probe status=absent")?;
