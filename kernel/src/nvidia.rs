@@ -1,5 +1,6 @@
 use crate::pci::{
-    MmioRegion, PciAddress, PciBar, PciDevice, PciDeviceResources, PciInventory, PciResourceError,
+    MmioError, MmioRegion, PciAddress, PciBar, PciDevice, PciDeviceResources, PciInventory,
+    PciResourceError,
 };
 
 pub const GSP_RPC_PAGE_SIZE: usize = rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE;
@@ -13,7 +14,7 @@ pub const GSP_QUEUE_ENTRY_COUNT: usize =
 
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
-pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = 0x1000;
+pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = rustos_gpu_protocol::NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -33,6 +34,7 @@ impl NvidiaArchitecture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaError {
     Resources(PciResourceError),
+    Mmio(MmioError),
     MemorySpaceDisabled,
     MissingBar0,
 }
@@ -40,6 +42,61 @@ pub enum NvidiaError {
 impl From<PciResourceError> for NvidiaError {
     fn from(error: PciResourceError) -> Self {
         Self::Resources(error)
+    }
+}
+
+impl From<MmioError> for NvidiaError {
+    fn from(error: MmioError) -> Self {
+        Self::Mmio(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaFspSnapshot {
+    pub secure_boot_status: u32,
+    pub queue_head: u32,
+    pub queue_tail: u32,
+    pub message_queue_head: u32,
+    pub message_queue_tail: u32,
+    pub mailbox0: u32,
+    pub mailbox1: u32,
+    pub riscv_lockdown: bool,
+}
+
+impl NvidiaFspSnapshot {
+    const fn unavailable() -> Self {
+        Self {
+            secure_boot_status: 0,
+            queue_head: 0,
+            queue_tail: 0,
+            message_queue_head: 0,
+            message_queue_tail: 0,
+            mailbox0: 0,
+            mailbox1: 0,
+            riscv_lockdown: true,
+        }
+    }
+
+    fn read(mmio: MmioRegion) -> Result<Self, NvidiaError> {
+        let hwcfg2 = mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_HWCFG2))?;
+        Ok(Self {
+            secure_boot_status: mmio.read_u32(0x0002_00bc)?,
+            queue_head: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD))?,
+            queue_tail: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_TAIL))?,
+            message_queue_head: mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD))?,
+            message_queue_tail: mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL))?,
+            mailbox0: mmio.read_u32(u64::from(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_MAILBOX0,
+            ))?,
+            mailbox1: mmio.read_u32(u64::from(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_MAILBOX1,
+            ))?,
+            riscv_lockdown: hwcfg2
+                & (1 << rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_HWCFG2_LOCKDOWN_BIT)
+                != 0,
+        })
     }
 }
 
@@ -61,11 +118,15 @@ pub struct NvidiaProbe {
     pub msi: bool,
     pub msix: bool,
     pub bar0_mapped: bool,
+    pub fsp: NvidiaFspSnapshot,
 }
 
 impl NvidiaProbe {
     fn from_device(device: PciDevice, bar0: MmioRegion) -> Result<Self, NvidiaError> {
-        Self::from_device_mapping(device, bar0.physical_base(), bar0.length(), true)
+        let mut probe =
+            Self::from_device_mapping(device, bar0.physical_base(), bar0.length(), true)?;
+        probe.fsp = NvidiaFspSnapshot::read(bar0)?;
+        Ok(probe)
     }
 
     fn from_device_mapping(
@@ -94,6 +155,7 @@ impl NvidiaProbe {
             msi: device.capabilities.msi.is_some(),
             msix: device.capabilities.msix.is_some(),
             bar0_mapped,
+            fsp: NvidiaFspSnapshot::unavailable(),
         })
     }
 }

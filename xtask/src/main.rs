@@ -1,7 +1,8 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
 use rustos_gpu_protocol::{
-    GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspRpcMessage, encode_gsp_rpc,
+    GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspFspCot, GspRpcMessage,
+    encode_gsp_rpc,
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -1294,8 +1295,19 @@ fn nvidia_gsp_bundle_check(
         .gsp
         .boot_layout()
         .map_err(|error| format!("planning NVIDIA GSP bundle layout: {error:?}"))?;
+    let cot = GspFspCot::gb20x(
+        0x2000_0000,
+        0x1000_0000,
+        0x0040_0000,
+        0x0010_0000,
+        bundle.fmc.hash.bytes(&fmc),
+        bundle.fmc.public_key.bytes(&fmc),
+        bundle.fmc.signature.bytes(&fmc),
+    )
+    .encode()
+    .map_err(|error| format!("encoding NVIDIA GSP-FMC COT request: {error:?}"))?;
     println!(
-        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} status=ready",
+        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} fsp_cot_bytes={} fsp_cot_version={} fsp_hash_bytes={} fsp_public_key_bytes={} fsp_signature_bytes={} status=ready",
         String::from_utf8_lossy(expected_version),
         gsp.len(),
         bundle.gsp.image.size,
@@ -1307,6 +1319,11 @@ fn nvidia_gsp_bundle_check(
         bundle.bootloader.descriptor.version,
         bundle.bootloader.descriptor.app_version,
         layout.radix3.total_bytes,
+        cot.len(),
+        rustos_gpu_protocol::NVIDIA_GSP_FSP_COT_VERSION_GB20X,
+        bundle.fmc.hash.size,
+        bundle.fmc.public_key.size,
+        bundle.fmc.signature.size,
     );
     Ok(())
 }

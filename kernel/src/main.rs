@@ -758,7 +758,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(Some(probe)) => {
             hardware::set_nvidia(probe);
             kprintln!(
-                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} gsp=external-firmware-riscv64 rpc_page={} rpc_max_pages={} shared_bytes={} shared_ptes={} queue_entries={} acceleration=unavailable status=probe-ready",
+                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} gsp=external-firmware-riscv64 rpc_page={} rpc_max_pages={} shared_bytes={} shared_ptes={} queue_entries={} acceleration=unavailable status=probe-ready",
                 probe.address.bus,
                 probe.address.device,
                 probe.address.function,
@@ -775,6 +775,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 probe.bus_master_enabled,
                 probe.msi,
                 probe.msix,
+                probe.fsp.secure_boot_status,
+                probe.fsp.queue_head,
+                probe.fsp.queue_tail,
+                probe.fsp.message_queue_head,
+                probe.fsp.message_queue_tail,
+                probe.fsp.mailbox0,
+                probe.fsp.mailbox1,
+                probe.fsp.riscv_lockdown,
                 nvidia::GSP_RPC_PAGE_SIZE,
                 nvidia::GSP_RPC_MAX_MESSAGE_PAGES,
                 nvidia::GSP_SHARED_MEMORY_BYTES,
