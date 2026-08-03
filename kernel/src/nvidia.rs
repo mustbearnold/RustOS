@@ -930,6 +930,7 @@ impl NvidiaFspTransport {
 pub fn boot_external_gsp(
     probe: &NvidiaProbe,
     staging: &mut NvidiaGspStaging,
+    is_primary: bool,
 ) -> Result<NvidiaGspBootResult, NvidiaError> {
     if !staging.fsp_boot_requested {
         return Err(NvidiaError::FspOptInRequired);
@@ -951,6 +952,7 @@ pub fn boot_external_gsp(
         probe.subsystem_device_id,
         probe.subsystem_vendor_id,
         probe.revision_id,
+        is_primary,
     )
     .encode();
     transport.send_gsp_rpc(
@@ -961,9 +963,10 @@ pub fn boot_external_gsp(
         &system_info,
     )?;
     crate::kprintln!(
-        "driver: nvidia GSP-RM command function={} transport_sequence=0 rpc_sequence=0 payload_bytes={} queue=shared status=sent",
+        "driver: nvidia GSP-RM command function={} transport_sequence=0 rpc_sequence=0 payload_bytes={} primary={} queue=shared status=sent",
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO,
         system_info.len(),
+        is_primary,
     );
     let registry = rustos_gpu_protocol::encode_gsp_registry();
     transport.send_gsp_rpc(

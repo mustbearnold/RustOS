@@ -1456,11 +1456,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         "target-platform-failed"
                     } else {
                         hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Staged);
+                        let nvidia_is_primary = nvidia_probe.as_ref().is_some_and(|probe| {
+                            pci_inventory
+                                .first_display()
+                                .is_some_and(|display| display.address == probe.address)
+                        });
                         match nvidia_probe.as_mut() {
                             Some(probe) => match probe.enable_bus_master() {
                                 Ok(()) => {
                                     hardware::set_nvidia(*probe);
-                                    match nvidia::boot_external_gsp(probe, &mut staging) {
+                                    match nvidia::boot_external_gsp(
+                                        probe,
+                                        &mut staging,
+                                        nvidia_is_primary,
+                                    ) {
                                         Ok(boot) => {
                                             hardware::set_nvidia_gsp_status(
                                                 hardware::NvidiaGspStatus::Ready,

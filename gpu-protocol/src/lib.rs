@@ -83,12 +83,12 @@ pub const NVIDIA_GSP_FUNCTION_SET_REGISTRY: u32 = 73;
 pub const NVIDIA_GSP_EVENT_FIRST: u32 = 4096;
 pub const NVIDIA_GSP_EVENT_GSP_INIT_DONE: u32 = 4097;
 pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = NVIDIA_GSP_FUNCTION_CONTINUATION_RECORD;
-pub const NVIDIA_GSP_R570_SYSTEM_INFO_SIZE: usize = 544;
+pub const NVIDIA_GSP_R570_SYSTEM_INFO_SIZE: usize = 928;
+pub const NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET: usize = 896;
 pub const NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE: usize = 1656;
 pub const NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET: usize = 1260;
 pub const NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE: u32 = 0x0009_2000;
 pub const NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE: u32 = 0x0000_1000;
-pub const NVIDIA_GSP_R570_CHIPSET_GB205: u32 = 0x0000_01b5;
 pub const NVIDIA_GSP_R570_MAX_USER_VA: u64 = (1u64 << 47) - 4096;
 pub const NVIDIA_GSP_REGISTRY_DWORD: u8 = 1;
 
@@ -1481,6 +1481,7 @@ pub struct GspSystemInfoR570 {
     pub pci_subdevice_id: u16,
     pub pci_subvendor_id: u16,
     pub pci_revision_id: u8,
+    pub is_primary: bool,
 }
 
 impl GspSystemInfoR570 {
@@ -1494,6 +1495,7 @@ impl GspSystemInfoR570 {
         pci_subdevice_id: u16,
         pci_subvendor_id: u16,
         pci_revision_id: u8,
+        is_primary: bool,
     ) -> Self {
         Self {
             gpu_phys_addr,
@@ -1505,6 +1507,7 @@ impl GspSystemInfoR570 {
             pci_subdevice_id,
             pci_subvendor_id,
             pci_revision_id,
+            is_primary,
         }
     }
 
@@ -1528,7 +1531,7 @@ impl GspSystemInfoR570 {
             (u32::from(self.pci_subdevice_id) << 16) | u32::from(self.pci_subvendor_id),
         );
         write_le_u32(&mut bytes, 96, u32::from(self.pci_revision_id));
-        write_le_u32(&mut bytes, 120, NVIDIA_GSP_R570_CHIPSET_GB205);
+        bytes[NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET] = u8::from(self.is_primary);
         bytes
     }
 }
@@ -2352,6 +2355,7 @@ mod tests {
             0x1234,
             0x5678,
             0xa1,
+            true,
         )
         .encode();
         let mut expected = [0u8; NVIDIA_GSP_R570_SYSTEM_INFO_SIZE];
@@ -2365,7 +2369,7 @@ mod tests {
         write_le_u32(&mut expected, 88, 0x2f04_10de);
         write_le_u32(&mut expected, 92, 0x1234_5678);
         write_le_u32(&mut expected, 96, 0xa1);
-        write_le_u32(&mut expected, 120, NVIDIA_GSP_R570_CHIPSET_GB205);
+        expected[NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET] = 1;
         assert_eq!(bytes, expected);
         assert_eq!(bytes.len(), NVIDIA_GSP_R570_SYSTEM_INFO_SIZE);
         assert_eq!(read_test_u64(&bytes, 0), 0x1234_5678_9abc_def0);
@@ -2384,8 +2388,20 @@ mod tests {
         assert_eq!(read_test_u32(&bytes, 88), 0x2f04_10de);
         assert_eq!(read_test_u32(&bytes, 92), 0x1234_5678);
         assert_eq!(read_test_u32(&bytes, 96), 0xa1);
-        assert_eq!(read_test_u32(&bytes, 120), NVIDIA_GSP_R570_CHIPSET_GB205);
-        assert!(bytes[128..].iter().all(|byte| *byte == 0));
+        assert_eq!(bytes[NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET], 1);
+        assert!(
+            bytes[121..NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            bytes[NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET + 1..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        let non_primary = GspSystemInfoR570::r570_gb20x(0, 0, 0, 0, 0, 0, 0, 0, 0, false).encode();
+        assert_eq!(non_primary[NVIDIA_GSP_R570_SYSTEM_INFO_PRIMARY_OFFSET], 0);
     }
 
     #[test]

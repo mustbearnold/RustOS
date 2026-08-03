@@ -1472,7 +1472,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         "driver: nvidia FSP COT response",
         "status=accepted",
         "driver: nvidia GSP-FMC ready",
-        "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent",
+        "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=928 primary=true queue=shared status=sent",
         "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent",
         "driver: nvidia GSP-RM event function=4097",
         "status=consumed",
@@ -6562,7 +6562,7 @@ mod tests {
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
             "driver: nvidia FSP COT response task_id=0x00000001 command=0x00000014 error=0x00000000 status=accepted\n",
             "driver: nvidia GSP-FMC ready hwcfg2=0x00000000 mailbox=0x00000000:0x00000000 riscv_active=true riscv_lockdown=false status=ready\n",
-            "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent\n",
+            "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=928 primary=true queue=shared status=sent\n",
             "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
             "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=consumed\n",
             "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=0 payload_bytes=1656 queue=shared status=sent\n",
@@ -6575,6 +6575,9 @@ mod tests {
 
         let no_bus_master = success.replace("busmaster=true", "busmaster=false");
         assert!(validate_nvidia_gsp_physical_log(&no_bus_master).is_err());
+
+        let non_primary = success.replace("primary=true", "primary=false");
+        assert!(validate_nvidia_gsp_physical_log(&non_primary).is_err());
 
         let unrelated_status = success
             .replace(
