@@ -1585,7 +1585,11 @@ fn optional_nvidia_firmware() -> Result<Option<NvidiaFirmwareCarrier>, String> {
 }
 
 fn nvidia_fsp_boot_requested() -> Result<bool, String> {
-    match env::var("RUSTOS_NVIDIA_FSP_BOOT") {
+    parse_nvidia_fsp_boot_value(env::var("RUSTOS_NVIDIA_FSP_BOOT"))
+}
+
+fn parse_nvidia_fsp_boot_value(value: Result<String, env::VarError>) -> Result<bool, String> {
+    match value {
         Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on") => Ok(true),
         Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off") => Ok(false),
         Ok(value) => Err(format!(
@@ -6446,9 +6450,9 @@ mod tests {
         REPOSITORY_ROTATED_SIGNING_KEY_BYTES, REPOSITORY_ROTATION_MATERIAL_LENGTH,
         REPOSITORY_SIGNATURE_LENGTH, ahci_interrupt_count, build_repository,
         create_partitioned_uefi_image, install_image, install_partitioned_image,
-        key_rotation_message, nvme_interrupt_count, partitioned_root_size,
-        validate_nvidia_gsp_physical_log, validate_partitioned_root_size, virtio_interrupt_count,
-        wav_data,
+        key_rotation_message, nvme_interrupt_count, parse_nvidia_fsp_boot_value,
+        partitioned_root_size, validate_nvidia_gsp_physical_log, validate_partitioned_root_size,
+        virtio_interrupt_count, wav_data,
     };
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::{
@@ -6460,6 +6464,21 @@ mod tests {
         0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
         0x51, 0x1a,
     ];
+
+    #[test]
+    fn nvidia_fsp_boot_requires_explicit_opt_in() {
+        assert_eq!(
+            parse_nvidia_fsp_boot_value(Err(std::env::VarError::NotPresent)),
+            Ok(false)
+        );
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(parse_nvidia_fsp_boot_value(Ok(value.to_owned())), Ok(true));
+        }
+        for value in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(parse_nvidia_fsp_boot_value(Ok(value.to_owned())), Ok(false));
+        }
+        assert!(parse_nvidia_fsp_boot_value(Ok("2".to_owned())).is_err());
+    }
 
     #[test]
     fn physical_nvidia_gsp_proof_requires_target_and_full_sequence() {

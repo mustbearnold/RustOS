@@ -2292,6 +2292,19 @@ mod tests {
             0xa1,
         )
         .encode();
+        let mut expected = [0u8; NVIDIA_GSP_R570_SYSTEM_INFO_SIZE];
+        write_le_u64(&mut expected, 0, 0x1234_5678_9abc_def0);
+        write_le_u64(&mut expected, 8, 0x2222_0000);
+        write_le_u64(&mut expected, 16, 0x3333_0000);
+        write_le_u64(&mut expected, 32, 0x0b00);
+        write_le_u64(&mut expected, 72, NVIDIA_GSP_R570_MAX_USER_VA);
+        write_le_u32(&mut expected, 80, NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE);
+        write_le_u32(&mut expected, 84, NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE);
+        write_le_u32(&mut expected, 88, 0x2f04_10de);
+        write_le_u32(&mut expected, 92, 0x1234_5678);
+        write_le_u32(&mut expected, 96, 0xa1);
+        write_le_u32(&mut expected, 120, NVIDIA_GSP_R570_CHIPSET_GB205);
+        assert_eq!(bytes, expected);
         assert_eq!(bytes.len(), NVIDIA_GSP_R570_SYSTEM_INFO_SIZE);
         assert_eq!(read_test_u64(&bytes, 0), 0x1234_5678_9abc_def0);
         assert_eq!(read_test_u64(&bytes, 8), 0x2222_0000);
@@ -2316,6 +2329,22 @@ mod tests {
     #[test]
     fn encodes_linux_r570_registry_table_layout() {
         let bytes = encode_gsp_registry();
+        let mut expected = vec![0u8; 117];
+        write_le_u32(&mut expected, 0, 109);
+        write_le_u32(&mut expected, 4, 3);
+        write_le_u32(&mut expected, 8, 56);
+        expected[12] = NVIDIA_GSP_REGISTRY_DWORD;
+        write_le_u32(&mut expected, 16, 1);
+        write_le_u32(&mut expected, 24, 76);
+        expected[28] = NVIDIA_GSP_REGISTRY_DWORD;
+        write_le_u32(&mut expected, 32, 1);
+        write_le_u32(&mut expected, 40, 98);
+        expected[44] = NVIDIA_GSP_REGISTRY_DWORD;
+        write_le_u32(&mut expected, 48, 1);
+        expected[56..76].copy_from_slice(b"RMSecBusResetEnable\0");
+        expected[76..98].copy_from_slice(b"RMForcePcieConfigSave\0");
+        expected[98..117].copy_from_slice(b"RMDevidCheckIgnore\0");
+        assert_eq!(bytes, expected);
         assert_eq!(bytes.len(), 117);
         assert_eq!(read_test_u32(&bytes, 0), 109);
         assert_eq!(read_test_u32(&bytes, 4), 3);
