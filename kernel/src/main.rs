@@ -42,6 +42,8 @@ mod net;
 #[cfg(target_os = "none")]
 mod network_runtime;
 #[cfg(any(target_os = "none", test))]
+mod nvidia;
+#[cfg(any(target_os = "none", test))]
 mod nvme;
 #[cfg(any(target_os = "none", test))]
 mod pci;
@@ -751,6 +753,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             display.vendor_id,
             display.device_id
         );
+    }
+    match nvidia::initialize(&pci_inventory, physical_memory_offset) {
+        Ok(Some(probe)) => {
+            hardware::set_nvidia(probe);
+            kprintln!(
+                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} acceleration=unavailable status=probe-ready",
+                probe.address.bus,
+                probe.address.device,
+                probe.address.function,
+                probe.device_id,
+                probe.revision_id,
+                probe.architecture.name(),
+                probe.bar0_base,
+                probe.bar1_base,
+                probe.bar3_base,
+                probe.bar5_io_base,
+                probe.mmio_base,
+                probe.mmio_length,
+                probe.memory_space_enabled,
+                probe.bus_master_enabled,
+                probe.msi,
+                probe.msix
+            );
+        }
+        Ok(None) => kprintln!("driver: nvidia RTX 5070 not present status=absent"),
+        Err(error) => kprintln!(
+            "driver: nvidia probe failed ({:?}) acceleration=unavailable status=degraded",
+            error
+        ),
     }
     match igc::probe(&pci_inventory, physical_memory_offset) {
         Ok(Some(probe)) => {

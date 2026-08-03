@@ -5,6 +5,7 @@ use spin::Mutex;
 use crate::{
     framebuffer::GraphicsInfo,
     igc::I225Probe,
+    nvidia::NvidiaProbe,
     pci::{PciAddress, PciDevice, PciInventory, PciRoleCounts},
 };
 
@@ -84,6 +85,7 @@ pub struct HardwareSnapshot {
     pub pci: PciRoleCounts,
     pub framebuffer: Option<GraphicsInfo>,
     pub primary_display: Option<PciDisplaySnapshot>,
+    pub nvidia: Option<NvidiaProbe>,
     pub i225: Option<I225Probe>,
     pub graphics_backend: GraphicsBackend,
 }
@@ -104,6 +106,7 @@ impl HardwareSnapshot {
             },
             framebuffer: None,
             primary_display: None,
+            nvidia: None,
             i225: None,
             graphics_backend: GraphicsBackend::None,
         }
@@ -125,6 +128,7 @@ pub fn init(inventory: &PciInventory, framebuffer: Option<GraphicsInfo>) {
         pci: inventory.role_counts(),
         framebuffer,
         primary_display,
+        nvidia: None,
         i225: None,
         graphics_backend,
     };
@@ -132,6 +136,10 @@ pub fn init(inventory: &PciInventory, framebuffer: Option<GraphicsInfo>) {
 
 pub fn set_i225(probe: I225Probe) {
     SNAPSHOT.lock().i225 = Some(probe);
+}
+
+pub fn set_nvidia(probe: NvidiaProbe) {
+    SNAPSHOT.lock().nvidia = Some(probe);
 }
 
 pub fn set_graphics_backend(graphics_backend: GraphicsBackend) {
@@ -187,6 +195,30 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
         )?;
     } else {
         writeln!(writer, "display: pci=none status=absent")?;
+    }
+    if let Some(graphics) = snapshot.nvidia {
+        writeln!(
+            writer,
+            "nvidia: driver=probe pci={:02x}:{:02x}.{} device_id=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} acceleration=unavailable status=probe-ready",
+            graphics.address.bus,
+            graphics.address.device,
+            graphics.address.function,
+            graphics.device_id,
+            graphics.revision_id,
+            graphics.architecture.name(),
+            graphics.bar0_base,
+            graphics.bar1_base,
+            graphics.bar3_base,
+            graphics.bar5_io_base,
+            graphics.mmio_base,
+            graphics.mmio_length,
+            graphics.memory_space_enabled,
+            graphics.bus_master_enabled,
+            graphics.msi,
+            graphics.msix
+        )?;
+    } else {
+        writeln!(writer, "nvidia: driver=probe status=absent")?;
     }
     if let Some(network) = snapshot.i225 {
         writeln!(
