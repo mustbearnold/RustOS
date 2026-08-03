@@ -1480,6 +1480,9 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
             "physical NVIDIA GSP proof has only {usable_memory_kib} KiB usable memory; target floor is {TARGET_MIN_USABLE_MEMORY_KIB} KiB"
         ));
     }
+    if !platform_line.contains("hypervisor=none") {
+        return Err("physical NVIDIA GSP proof requires hypervisor=none".to_owned());
+    }
     let Some(static_info_line) = content
         .lines()
         .find(|line| line.contains("driver: nvidia GSP-RM ready function_flow="))
@@ -6452,7 +6455,7 @@ mod tests {
     #[test]
     fn physical_nvidia_gsp_proof_requires_target_and_full_sequence() {
         let success = concat!(
-            "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor usable_memory_kib=32760016 status=present\n",
+            "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor usable_memory_kib=32760016 hypervisor=none status=present\n",
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
             "driver: nvidia FSP COT response status=accepted\n",
             "driver: nvidia GSP-FMC ready status=ready\n",
@@ -6473,6 +6476,9 @@ mod tests {
         let too_little_memory =
             success.replace("usable_memory_kib=32760016", "usable_memory_kib=16777216");
         assert!(validate_nvidia_gsp_physical_log(&too_little_memory).is_err());
+
+        let virtualized = success.replace("hypervisor=none", "hypervisor=present");
+        assert!(validate_nvidia_gsp_physical_log(&virtualized).is_err());
 
         let missing_static_info = success.replace("get-static-info", "missing-static-info");
         assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());

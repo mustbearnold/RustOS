@@ -478,12 +478,15 @@ fn cpuid_text(bytes: &[u8]) -> &str {
 }
 
 #[cfg(target_os = "none")]
-fn platform_identity() -> ([u8; 12], [u8; 48]) {
+fn platform_identity() -> ([u8; 12], [u8; 48], bool) {
     let basic = core::arch::x86_64::__cpuid(0);
     let mut vendor = [0u8; 12];
     copy_cpuid_register(&mut vendor, 0, basic.ebx);
     copy_cpuid_register(&mut vendor, 4, basic.edx);
     copy_cpuid_register(&mut vendor, 8, basic.ecx);
+
+    let features = core::arch::x86_64::__cpuid(1);
+    let hypervisor_present = features.ecx & (1 << 31) != 0;
 
     let mut brand = [0u8; 48];
     let extended = core::arch::x86_64::__cpuid(0x8000_0000);
@@ -497,17 +500,22 @@ fn platform_identity() -> ([u8; 12], [u8; 48]) {
             copy_cpuid_register(&mut brand, offset + 12, result.edx);
         }
     }
-    (vendor, brand)
+    (vendor, brand, hypervisor_present)
 }
 
 #[cfg(target_os = "none")]
 fn log_platform_identity(summary: memory::MemorySummary) {
-    let (vendor, brand) = platform_identity();
+    let (vendor, brand, hypervisor_present) = platform_identity();
     kprintln!(
-        "platform: cpu_vendor={} cpu_brand={} usable_memory_kib={} status=present",
+        "platform: cpu_vendor={} cpu_brand={} usable_memory_kib={} hypervisor={} status=present",
         cpuid_text(&vendor),
         cpuid_text(&brand),
-        summary.usable_bytes / 1024
+        summary.usable_bytes / 1024,
+        if hypervisor_present {
+            "present"
+        } else {
+            "none"
+        }
     );
 }
 
