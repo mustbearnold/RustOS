@@ -70,6 +70,9 @@ pub enum NvidiaError {
     Mmio(MmioError),
     MemorySpaceDisabled,
     MissingBar0,
+    MissingSystemInfoBar {
+        bar: u8,
+    },
     FspPacketEmpty,
     FspPacketUnaligned {
         size: usize,
@@ -935,6 +938,14 @@ pub fn boot_external_gsp(
     if !staging.fsp_boot_requested {
         return Err(NvidiaError::FspOptInRequired);
     }
+    let gpu_phys_fb_addr = probe
+        .bar1_base
+        .filter(|base| *base != 0)
+        .ok_or(NvidiaError::MissingSystemInfoBar { bar: 1 })?;
+    let gpu_phys_inst_addr = probe
+        .bar3_base
+        .filter(|base| *base != 0)
+        .ok_or(NvidiaError::MissingSystemInfoBar { bar: 3 })?;
     let transport = probe.fsp_transport().ok_or(NvidiaError::FspUnavailable)?;
     transport.wait_secure_boot()?;
     let fsp_response = transport.send_sync(
@@ -944,8 +955,8 @@ pub fn boot_external_gsp(
     let gsp = transport.wait_gsp_fmc_ready(staging.plan.fmc_args.address)?;
     let system_info = rustos_gpu_protocol::GspSystemInfoR570::r570_gb20x(
         probe.bar0_base,
-        probe.bar1_base.unwrap_or(0),
-        probe.bar3_base.unwrap_or(0),
+        gpu_phys_fb_addr,
+        gpu_phys_inst_addr,
         probe.address.dev_id(),
         probe.device_id,
         probe.vendor_id,
@@ -953,20 +964,36 @@ pub fn boot_external_gsp(
         probe.subsystem_vendor_id,
         probe.revision_id,
         is_primary,
-    )
-    .encode();
+    );
+    let system_info_payload = system_info.encode();
     transport.send_gsp_rpc(
         staging,
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO,
         0,
         0,
-        &system_info,
+        &system_info_payload,
     )?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM SetSystemInfo gpu_phys_addr=0x{:x} gpu_phys_fb_addr=0x{:x} gpu_phys_inst_addr=0x{:x} nv_domain_bus_device_func=0x{:04x} pci_device_id=0x{:04x} pci_vendor_id=0x{:04x} pci_subdevice_id=0x{:04x} pci_subvendor_id=0x{:04x} pci_revision_id=0x{:02x} max_user_va=0x{:x} pci_config_mirror=0x{:08x}+0x{:08x} primary={} preserve_video_memory_allocations=false status=encoded",
+        system_info.gpu_phys_addr,
+        system_info.gpu_phys_fb_addr,
+        system_info.gpu_phys_inst_addr,
+        system_info.nv_domain_bus_device_func,
+        system_info.pci_device_id,
+        system_info.pci_vendor_id,
+        system_info.pci_subdevice_id,
+        system_info.pci_subvendor_id,
+        system_info.pci_revision_id,
+        rustos_gpu_protocol::NVIDIA_GSP_R570_MAX_USER_VA,
+        rustos_gpu_protocol::NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_BASE,
+        rustos_gpu_protocol::NVIDIA_GSP_R570_PCI_CONFIG_MIRROR_SIZE,
+        system_info.is_primary,
+    );
     crate::kprintln!(
         "driver: nvidia GSP-RM command function={} transport_sequence=0 rpc_sequence=0 payload_bytes={} primary={} queue=shared status=sent",
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO,
-        system_info.len(),
-        is_primary,
+        system_info_payload.len(),
+        system_info.is_primary,
     );
     let registry = rustos_gpu_protocol::encode_gsp_registry();
     transport.send_gsp_rpc(
@@ -976,6 +1003,9 @@ pub fn boot_external_gsp(
         0,
         &registry,
     )?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM SetRegistry entries=3 keys=RMSecBusResetEnable:1,RMForcePcieConfigSave:1,RMDevidCheckIgnore:1 status=encoded"
+    );
     crate::kprintln!(
         "driver: nvidia GSP-RM command function={} transport_sequence=1 rpc_sequence=0 payload_bytes={} queue=shared status=sent",
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_SET_REGISTRY,

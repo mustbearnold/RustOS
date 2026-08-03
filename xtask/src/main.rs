@@ -1464,6 +1464,15 @@ fn nvidia_gsp_physical_proof(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_hex_field(line: &str, field: &str) -> Option<u64> {
+    line.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix(field)
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+    })
+}
+
 fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     let required = [
         "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor",
@@ -1473,6 +1482,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         "status=accepted",
         "driver: nvidia GSP-FMC ready",
         "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=928 primary=true queue=shared status=sent",
+        "driver: nvidia GSP-RM SetRegistry entries=3 keys=RMSecBusResetEnable:1,RMForcePcieConfigSave:1,RMDevidCheckIgnore:1 status=encoded",
         "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent",
         "driver: nvidia GSP-RM event function=4097",
         "status=consumed",
@@ -1491,6 +1501,54 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
             return Err(format!("physical NVIDIA GSP proof missing `{marker}`"));
         };
         cursor += relative + marker.len();
+    }
+    let Some(system_info_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia GSP-RM SetSystemInfo "))
+    else {
+        return Err("physical NVIDIA GSP proof missing SetSystemInfo field trace".to_owned());
+    };
+    for field in ["gpu_phys_addr=", "gpu_phys_fb_addr=", "gpu_phys_inst_addr="] {
+        let Some(value) = parse_hex_field(system_info_line, field) else {
+            return Err(format!(
+                "physical NVIDIA GSP proof missing SetSystemInfo field `{field}`"
+            ));
+        };
+        if value == 0 {
+            return Err(format!(
+                "physical NVIDIA GSP proof has zero SetSystemInfo field `{field}`"
+            ));
+        }
+    }
+    for (field, expected) in [
+        ("nv_domain_bus_device_func=", 0x0b00),
+        ("pci_device_id=", 0x2f04),
+        ("pci_vendor_id=", 0x10de),
+    ] {
+        if parse_hex_field(system_info_line, field) != Some(expected) {
+            return Err(format!(
+                "physical NVIDIA GSP proof has invalid SetSystemInfo field `{field}`"
+            ));
+        }
+    }
+    for field in ["pci_subdevice_id=", "pci_subvendor_id=", "pci_revision_id="] {
+        let Some(value) = parse_hex_field(system_info_line, field) else {
+            return Err(format!(
+                "physical NVIDIA GSP proof missing SetSystemInfo field `{field}`"
+            ));
+        };
+        if value == 0 {
+            return Err(format!(
+                "physical NVIDIA GSP proof has zero SetSystemInfo field `{field}`"
+            ));
+        }
+    }
+    if !system_info_line.contains("max_user_va=0x7ffffffff000")
+        || !system_info_line.contains("pci_config_mirror=0x00092000+0x00001000")
+        || !system_info_line.contains("primary=true")
+        || !system_info_line.contains("preserve_video_memory_allocations=false")
+    {
+        return Err("physical NVIDIA GSP proof has invalid SetSystemInfo constants".to_owned());
     }
     let Some(fsp_response_line) = content
         .lines()
@@ -6562,7 +6620,9 @@ mod tests {
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
             "driver: nvidia FSP COT response task_id=0x00000001 command=0x00000014 error=0x00000000 status=accepted\n",
             "driver: nvidia GSP-FMC ready hwcfg2=0x00000000 mailbox=0x00000000:0x00000000 riscv_active=true riscv_lockdown=false status=ready\n",
+            "driver: nvidia GSP-RM SetSystemInfo gpu_phys_addr=0xf8000000 gpu_phys_fb_addr=0x7800000000 gpu_phys_inst_addr=0x7c00000000 nv_domain_bus_device_func=0x0b00 pci_device_id=0x2f04 pci_vendor_id=0x10de pci_subdevice_id=0x41a9 pci_subvendor_id=0x1458 pci_revision_id=0xa1 max_user_va=0x7ffffffff000 pci_config_mirror=0x00092000+0x00001000 primary=true preserve_video_memory_allocations=false status=encoded\n",
             "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=928 primary=true queue=shared status=sent\n",
+            "driver: nvidia GSP-RM SetRegistry entries=3 keys=RMSecBusResetEnable:1,RMForcePcieConfigSave:1,RMDevidCheckIgnore:1 status=encoded\n",
             "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
             "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=consumed\n",
             "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=0 payload_bytes=1656 queue=shared status=sent\n",
@@ -6578,6 +6638,19 @@ mod tests {
 
         let non_primary = success.replace("primary=true", "primary=false");
         assert!(validate_nvidia_gsp_physical_log(&non_primary).is_err());
+
+        let missing_framebuffer_bar =
+            success.replace("gpu_phys_fb_addr=0x7800000000", "gpu_phys_fb_addr=0x0");
+        assert!(validate_nvidia_gsp_physical_log(&missing_framebuffer_bar).is_err());
+
+        let wrong_system_info = success.replace(
+            "pci_config_mirror=0x00092000+0x00001000",
+            "pci_config_mirror=0x00000000+0x00001000",
+        );
+        assert!(validate_nvidia_gsp_physical_log(&wrong_system_info).is_err());
+
+        let wrong_registry = success.replace("RMDevidCheckIgnore:1", "RMDevidCheckIgnore:0");
+        assert!(validate_nvidia_gsp_physical_log(&wrong_registry).is_err());
 
         let unrelated_status = success
             .replace(
