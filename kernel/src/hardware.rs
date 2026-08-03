@@ -199,7 +199,7 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
     if let Some(graphics) = snapshot.nvidia {
         writeln!(
             writer,
-            "nvidia: driver=probe pci={:02x}:{:02x}.{} device_id=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} acceleration=unavailable status=probe-ready",
+            "nvidia: driver=probe pci={:02x}:{:02x}.{} device_id=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_transport={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} acceleration=unavailable status=probe-ready",
             graphics.address.bus,
             graphics.address.device,
             graphics.address.function,
@@ -216,6 +216,11 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
             graphics.bus_master_enabled,
             graphics.msi,
             graphics.msix,
+            if graphics.fsp_transport().is_some() {
+                "emem-queue"
+            } else {
+                "unavailable"
+            },
             graphics.fsp.secure_boot_status,
             graphics.fsp.queue_head,
             graphics.fsp.queue_tail,

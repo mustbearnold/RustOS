@@ -19,18 +19,83 @@ pub const NVIDIA_GSP_FSP_COT_PUBLIC_KEY_SLOT_BYTES: usize = 96 * 4;
 pub const NVIDIA_GSP_FSP_COT_SIGNATURE_SLOT_BYTES: usize = 96 * 4;
 pub const NVIDIA_GSP_FSP_COT_PAYLOAD_SIZE: usize = 860;
 pub const NVIDIA_GSP_FSP_COT_PACKET_SIZE: usize = 8 + NVIDIA_GSP_FSP_COT_PAYLOAD_SIZE;
+pub const NVIDIA_GSP_FSP_RESPONSE_PACKET_SIZE: usize = 20;
+pub const NVIDIA_GSP_FSP_NVDM_TYPE_COT: u32 = 0x14;
+pub const NVIDIA_GSP_FSP_NVDM_TYPE_RESPONSE: u32 = 0x15;
+pub const NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT: u32 = 1 << 24;
+pub const NVIDIA_GSP_FSP_EMEM_PIO_READ_BIT: u32 = 1 << 25;
+pub const NVIDIA_GSP_FSP_EMEM_PIO_MAX_BYTES: usize = 0x100;
 
 const MCTP_HEADER_SOM: u32 = 1 << 31;
 const MCTP_HEADER_EOM: u32 = 1 << 30;
 const MCTP_MSG_HEADER_TYPE_VENDOR_PCI: u32 = 0x7e;
 const MCTP_MSG_HEADER_VENDOR_ID_NVIDIA: u32 = 0x10de;
-const NVDM_TYPE_COT: u32 = 0x14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GspFspCotError {
     InvalidHashSize { actual: usize },
     InvalidPublicKeySize { actual: usize },
     InvalidSignatureSize { actual: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspFspResponseError {
+    InvalidLength { actual: usize },
+    InvalidMctpHeader { value: u32 },
+    InvalidNvdmHeader { value: u32 },
+    UnexpectedCommand { expected: u32, actual: u32 },
+    CommandFailed { error_code: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspFspResponse {
+    pub task_id: u32,
+    pub command_nvdm_type: u32,
+    pub error_code: u32,
+}
+
+impl GspFspResponse {
+    pub fn parse(
+        packet: &[u8],
+        expected_command_nvdm_type: u32,
+    ) -> Result<Self, GspFspResponseError> {
+        if packet.len() != NVIDIA_GSP_FSP_RESPONSE_PACKET_SIZE {
+            return Err(GspFspResponseError::InvalidLength {
+                actual: packet.len(),
+            });
+        }
+
+        let mctp_header = read_wire_u32(packet, 0);
+        if mctp_header & (MCTP_HEADER_SOM | MCTP_HEADER_EOM) != MCTP_HEADER_SOM | MCTP_HEADER_EOM {
+            return Err(GspFspResponseError::InvalidMctpHeader { value: mctp_header });
+        }
+
+        let nvdm_header = read_wire_u32(packet, 4);
+        if nvdm_header & 0x7f != MCTP_MSG_HEADER_TYPE_VENDOR_PCI
+            || nvdm_header & 0x00ff_ff00 != MCTP_MSG_HEADER_VENDOR_ID_NVIDIA << 8
+            || nvdm_header >> 24 != NVIDIA_GSP_FSP_NVDM_TYPE_RESPONSE
+        {
+            return Err(GspFspResponseError::InvalidNvdmHeader { value: nvdm_header });
+        }
+
+        let response = Self {
+            task_id: read_wire_u32(packet, 8),
+            command_nvdm_type: read_wire_u32(packet, 12),
+            error_code: read_wire_u32(packet, 16),
+        };
+        if response.command_nvdm_type != expected_command_nvdm_type {
+            return Err(GspFspResponseError::UnexpectedCommand {
+                expected: expected_command_nvdm_type,
+                actual: response.command_nvdm_type,
+            });
+        }
+        if response.error_code != 0 {
+            return Err(GspFspResponseError::CommandFailed {
+                error_code: response.error_code,
+            });
+        }
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +156,7 @@ impl<'a> GspFspCot<'a> {
         write_le_u32(
             &mut packet,
             4,
-            (NVDM_TYPE_COT << 24)
+            (NVIDIA_GSP_FSP_NVDM_TYPE_COT << 24)
                 | (MCTP_MSG_HEADER_VENDOR_ID_NVIDIA << 8)
                 | MCTP_MSG_HEADER_TYPE_VENDOR_PCI,
         );
@@ -120,6 +185,10 @@ fn write_le_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn write_le_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_wire_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
 }
 
 #[cfg(test)]
@@ -203,6 +272,69 @@ mod tests {
             GspFspCot::gb20x(0, 0, 0, 0, &hash, &public_key, &signature).encode(),
             Err(GspFspCotError::InvalidSignatureSize {
                 actual: NVIDIA_GSP_FSP_COT_SIGNATURE_BYTES - 1,
+            })
+        );
+    }
+
+    fn response_packet(command_nvdm_type: u32, error_code: u32) -> [u8; 20] {
+        let mut packet = [0u8; NVIDIA_GSP_FSP_RESPONSE_PACKET_SIZE];
+        write_le_u32(&mut packet, 0, MCTP_HEADER_SOM | MCTP_HEADER_EOM);
+        write_le_u32(
+            &mut packet,
+            4,
+            (NVIDIA_GSP_FSP_NVDM_TYPE_RESPONSE << 24)
+                | (MCTP_MSG_HEADER_VENDOR_ID_NVIDIA << 8)
+                | MCTP_MSG_HEADER_TYPE_VENDOR_PCI,
+        );
+        write_le_u32(&mut packet, 8, 0xfeed_beef);
+        write_le_u32(&mut packet, 12, command_nvdm_type);
+        write_le_u32(&mut packet, 16, error_code);
+        packet
+    }
+
+    #[test]
+    fn parses_successful_fsp_command_response() {
+        let mut packet = response_packet(NVIDIA_GSP_FSP_NVDM_TYPE_COT, 0);
+        let nvdm_header = read_wire_u32(&packet, 4);
+        write_le_u32(&mut packet, 4, nvdm_header | (1 << 7));
+        assert_eq!(
+            GspFspResponse::parse(&packet, NVIDIA_GSP_FSP_NVDM_TYPE_COT),
+            Ok(GspFspResponse {
+                task_id: 0xfeed_beef,
+                command_nvdm_type: NVIDIA_GSP_FSP_NVDM_TYPE_COT,
+                error_code: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_fsp_command_response_headers_and_errors() {
+        let mut packet = response_packet(NVIDIA_GSP_FSP_NVDM_TYPE_COT, 0);
+        write_le_u32(&mut packet, 0, 0);
+        assert_eq!(
+            GspFspResponse::parse(&packet, NVIDIA_GSP_FSP_NVDM_TYPE_COT),
+            Err(GspFspResponseError::InvalidMctpHeader { value: 0 })
+        );
+
+        let mut packet = response_packet(NVIDIA_GSP_FSP_NVDM_TYPE_COT, 0);
+        write_le_u32(&mut packet, 4, 0);
+        assert_eq!(
+            GspFspResponse::parse(&packet, NVIDIA_GSP_FSP_NVDM_TYPE_COT),
+            Err(GspFspResponseError::InvalidNvdmHeader { value: 0 })
+        );
+
+        let packet = response_packet(NVIDIA_GSP_FSP_NVDM_TYPE_COT, 0xdead);
+        assert_eq!(
+            GspFspResponse::parse(&packet, NVIDIA_GSP_FSP_NVDM_TYPE_COT),
+            Err(GspFspResponseError::CommandFailed { error_code: 0xdead })
+        );
+
+        let packet = response_packet(NVIDIA_GSP_FSP_NVDM_TYPE_RESPONSE, 0);
+        assert_eq!(
+            GspFspResponse::parse(&packet, NVIDIA_GSP_FSP_NVDM_TYPE_COT),
+            Err(GspFspResponseError::UnexpectedCommand {
+                expected: NVIDIA_GSP_FSP_NVDM_TYPE_COT,
+                actual: NVIDIA_GSP_FSP_NVDM_TYPE_RESPONSE,
             })
         );
     }

@@ -15,6 +15,8 @@ pub const GSP_QUEUE_ENTRY_COUNT: usize =
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
 pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = rustos_gpu_protocol::NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH;
+#[allow(dead_code)]
+const NVIDIA_GSP_FSP_POLL_SPINS: usize = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -32,11 +34,20 @@ impl NvidiaArchitecture {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum NvidiaError {
     Resources(PciResourceError),
     Mmio(MmioError),
     MemorySpaceDisabled,
     MissingBar0,
+    FspPacketEmpty,
+    FspPacketUnaligned { size: usize },
+    FspPacketTooLarge { size: usize },
+    FspQueuePointerInvalid { head: u32, tail: u32 },
+    FspQueueTimeout,
+    FspResponseTimeout,
+    FspResponseBufferTooSmall { required: usize, actual: usize },
+    FspResponse(rustos_gpu_protocol::GspFspResponseError),
 }
 
 impl From<PciResourceError> for NvidiaError {
@@ -48,6 +59,12 @@ impl From<PciResourceError> for NvidiaError {
 impl From<MmioError> for NvidiaError {
     fn from(error: MmioError) -> Self {
         Self::Mmio(error)
+    }
+}
+
+impl From<rustos_gpu_protocol::GspFspResponseError> for NvidiaError {
+    fn from(error: rustos_gpu_protocol::GspFspResponseError) -> Self {
+        Self::FspResponse(error)
     }
 }
 
@@ -101,6 +118,174 @@ impl NvidiaFspSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct NvidiaFspTransport {
+    mmio: MmioRegion,
+}
+
+#[allow(dead_code)]
+impl NvidiaFspTransport {
+    // Deliberately opt-in: probing must remain read-only until firmware staging is complete.
+    fn new(mmio: MmioRegion) -> Self {
+        Self { mmio }
+    }
+
+    pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
+        validate_packet(packet)?;
+        for _ in 0..NVIDIA_GSP_FSP_POLL_SPINS {
+            let head = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD))?;
+            let tail = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_TAIL))?;
+            if head == tail {
+                self.write_emem(packet)?;
+                self.mmio.write_u32(
+                    u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_TAIL),
+                    u32::try_from(packet.len() - core::mem::size_of::<u32>())
+                        .map_err(|_| NvidiaError::FspPacketTooLarge { size: packet.len() })?,
+                )?;
+                self.mmio
+                    .write_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD), 0)?;
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(NvidiaError::FspQueueTimeout)
+    }
+
+    pub fn try_receive(&self, buffer: &mut [u8]) -> Result<Option<usize>, NvidiaError> {
+        let head = self
+            .mmio
+            .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD))?;
+        let tail = self
+            .mmio
+            .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL))?;
+        if head == tail {
+            return Ok(None);
+        }
+        let packet_size = tail
+            .checked_sub(head)
+            .and_then(|size| size.checked_add(4))
+            .ok_or(NvidiaError::FspQueuePointerInvalid { head, tail })?;
+        if packet_size % 4 != 0 {
+            return Err(NvidiaError::FspQueuePointerInvalid { head, tail });
+        }
+        let packet_size =
+            usize::try_from(packet_size).map_err(|_| NvidiaError::FspResponseBufferTooSmall {
+                required: usize::MAX,
+                actual: buffer.len(),
+            })?;
+        if packet_size > buffer.len() {
+            return Err(NvidiaError::FspResponseBufferTooSmall {
+                required: packet_size,
+                actual: buffer.len(),
+            });
+        }
+        self.read_emem(&mut buffer[..packet_size])?;
+        self.mmio
+            .write_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL), 0)?;
+        self.mmio
+            .write_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD), 0)?;
+        Ok(Some(packet_size))
+    }
+
+    pub fn send_sync(
+        &self,
+        command_nvdm_type: u32,
+        packet: &[u8],
+    ) -> Result<rustos_gpu_protocol::GspFspResponse, NvidiaError> {
+        self.send(packet)?;
+        let mut response = [0u8; rustos_gpu_protocol::NVIDIA_GSP_FSP_RESPONSE_PACKET_SIZE];
+        for _ in 0..NVIDIA_GSP_FSP_POLL_SPINS {
+            if let Some(size) = self.try_receive(&mut response)? {
+                return rustos_gpu_protocol::GspFspResponse::parse(
+                    &response[..size],
+                    command_nvdm_type,
+                )
+                .map_err(NvidiaError::from);
+            }
+            core::hint::spin_loop();
+        }
+        Err(NvidiaError::FspResponseTimeout)
+    }
+
+    fn write_emem(&self, packet: &[u8]) -> Result<(), NvidiaError> {
+        let mut offset = 0usize;
+        while offset < packet.len() {
+            let chunk_size = core::cmp::min(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_MAX_BYTES,
+                packet.len() - offset,
+            );
+            let emem_offset = u32::try_from(offset)
+                .map_err(|_| NvidiaError::FspPacketTooLarge { size: packet.len() })?;
+            self.mmio.write_u32(
+                u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT | emem_offset,
+            )?;
+            for word_offset in (0..chunk_size).step_by(4) {
+                let word_start = offset + word_offset;
+                let word = u32::from_le_bytes([
+                    packet[word_start],
+                    packet[word_start + 1],
+                    packet[word_start + 2],
+                    packet[word_start + 3],
+                ]);
+                self.mmio.write_u32(
+                    u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
+                    word,
+                )?;
+            }
+            offset += chunk_size;
+        }
+        Ok(())
+    }
+
+    fn read_emem(&self, packet: &mut [u8]) -> Result<(), NvidiaError> {
+        let mut offset = 0usize;
+        while offset < packet.len() {
+            let chunk_size = core::cmp::min(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_MAX_BYTES,
+                packet.len() - offset,
+            );
+            let emem_offset =
+                u32::try_from(offset).map_err(|_| NvidiaError::FspResponseBufferTooSmall {
+                    required: packet.len(),
+                    actual: 0,
+                })?;
+            self.mmio.write_u32(
+                u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_READ_BIT | emem_offset,
+            )?;
+            for word_offset in (0..chunk_size).step_by(4) {
+                let word = self
+                    .mmio
+                    .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA))?;
+                packet[offset + word_offset..offset + word_offset + 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+            offset += chunk_size;
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+fn validate_packet(packet: &[u8]) -> Result<(), NvidiaError> {
+    if packet.is_empty() {
+        return Err(NvidiaError::FspPacketEmpty);
+    }
+    if packet.len() % core::mem::size_of::<u32>() != 0 {
+        return Err(NvidiaError::FspPacketUnaligned { size: packet.len() });
+    }
+    if packet.len() > u32::MAX as usize {
+        return Err(NvidiaError::FspPacketTooLarge { size: packet.len() });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NvidiaProbe {
     pub address: PciAddress,
     pub vendor_id: u16,
@@ -119,6 +304,7 @@ pub struct NvidiaProbe {
     pub msix: bool,
     pub bar0_mapped: bool,
     pub fsp: NvidiaFspSnapshot,
+    bar0: Option<MmioRegion>,
 }
 
 impl NvidiaProbe {
@@ -126,7 +312,12 @@ impl NvidiaProbe {
         let mut probe =
             Self::from_device_mapping(device, bar0.physical_base(), bar0.length(), true)?;
         probe.fsp = NvidiaFspSnapshot::read(bar0)?;
+        probe.bar0 = Some(bar0);
         Ok(probe)
+    }
+
+    pub fn fsp_transport(&self) -> Option<NvidiaFspTransport> {
+        self.bar0.map(NvidiaFspTransport::new)
     }
 
     fn from_device_mapping(
@@ -156,6 +347,7 @@ impl NvidiaProbe {
             msix: device.capabilities.msix.is_some(),
             bar0_mapped,
             fsp: NvidiaFspSnapshot::unavailable(),
+            bar0: None,
         })
     }
 }
@@ -217,6 +409,8 @@ fn io_bar_base(bar: PciBar) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::pci::PciCapabilities;
 
@@ -329,5 +523,47 @@ mod tests {
         assert!(probe.msi);
         assert!(probe.msix);
         assert!(probe.bar0_mapped);
+        assert!(probe.fsp_transport().is_none());
+    }
+
+    #[test]
+    fn validates_fsp_transport_packet_alignment() {
+        assert_eq!(validate_packet(&[]), Err(NvidiaError::FspPacketEmpty));
+        assert_eq!(
+            validate_packet(&[0; 3]),
+            Err(NvidiaError::FspPacketUnaligned { size: 3 })
+        );
+        assert_eq!(validate_packet(&[0; 4]), Ok(()));
+    }
+
+    #[test]
+    fn sends_fsp_packet_in_emem_chunks_and_updates_queue() {
+        let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
+        let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
+        let transport = NvidiaFspTransport::new(mmio);
+        let packet = [0xa5u8; rustos_gpu_protocol::NVIDIA_GSP_FSP_COT_PACKET_SIZE];
+
+        transport.send(&packet).expect("FSP packet");
+
+        let read_u32 = |offset: u32| {
+            u32::from_le_bytes(
+                mmio_bytes[offset as usize..offset as usize + 4]
+                    .try_into()
+                    .expect("u32"),
+            )
+        };
+        assert_eq!(
+            read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_TAIL),
+            (packet.len() - 4) as u32
+        );
+        assert_eq!(read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD), 0);
+        assert_eq!(
+            read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT | 768
+        );
+        assert_eq!(
+            read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
+            u32::from_le_bytes(packet[864..868].try_into().expect("last word"))
+        );
     }
 }

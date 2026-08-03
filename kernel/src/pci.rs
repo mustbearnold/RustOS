@@ -332,7 +332,7 @@ impl PciRoleCounts {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmioRegion {
     physical_base: u64,
     virtual_base: u64,
@@ -418,6 +418,15 @@ impl IoRegion {
 }
 
 impl MmioRegion {
+    #[cfg(test)]
+    pub(crate) fn for_test(virtual_base: u64, length: u64) -> Self {
+        Self {
+            physical_base: 0,
+            virtual_base,
+            length,
+        }
+    }
+
     pub fn physical_base(self) -> u64 {
         self.physical_base
     }
