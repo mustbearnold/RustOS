@@ -635,7 +635,7 @@ fn classify_gsp_fmc_state(
     }
 
     let mailbox_address = u64::from(mailbox0) | (u64::from(mailbox1) << 32);
-    if mailbox0 != 0 {
+    if mailbox_address != 0 {
         if mailbox_address != fmc_args_address {
             return NvidiaGspFmcPollState::BootFailed { mailbox0, mailbox1 };
         }
@@ -1543,6 +1543,13 @@ mod tests {
             NvidiaGspFmcPollState::BootFailed {
                 mailbox0: 0x1234,
                 mailbox1: 0,
+            }
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(0, 0, 0x1, fmc_args_address, 0),
+            NvidiaGspFmcPollState::BootFailed {
+                mailbox0: 0,
+                mailbox1: 0x1,
             }
         );
         assert_eq!(
