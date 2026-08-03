@@ -97,7 +97,7 @@ The project is intentionally staged. Each stage needs a boot or host-runtime pro
 ## 4. CachyOS-class distribution
 
 - broad hardware support and GPU-backed graphics stack
-- deterministic GB20x r570 boot staging planner for the external GSP/FMC/bootloader bundle, including non-overlapping system-memory regions, materialized radix-3/shared-memory tables, linked FMC/RM arguments, framebuffer WPR/FRTS/PMU carveout geometry, optional FAT-carried firmware files, and kernel-owned page-contiguous physical staging with an encoded FSP COT packet; ACR/Falcon firmware execution, GSP-RM RPC startup, and GPU command submission remain future work
+- deterministic GB20x r570 boot staging planner for the external GSP/FMC/bootloader bundle, including non-overlapping system-memory regions, materialized radix-3/shared-memory tables, linked FMC/RM arguments, framebuffer WPR/FRTS/PMU carveout geometry, optional FAT-carried firmware files, kernel-owned page-contiguous physical staging, corrected GB20x FSP status mapping, and an explicit opt-in COT send/response path; GSP-RM RPC startup, GPU command submission, and acceleration remain future work
 - network manager, audio, power, and device policy (Rust multi-interface enumeration, DHCP state and renewal, midpoint retry scheduling, default-route policy, unified e1000/interrupt-backed virtio-net syscalls, Rust AC'97 and Intel HDA playback, modern virtio-net DHCP, and ACPI S5 poweroff, reboot, and S3 suspend/resume foundations are complete; richer route policy, capture/mixer/USB audio stack, battery, and thermal policy remain)
 - Wayland compositor and desktop session
 - package repositories, updates, richer account/user policy, and developer tooling

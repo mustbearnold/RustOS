@@ -14,7 +14,8 @@ pub use boot::{
 pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection, NVIDIA_GSP_FMC_MAX_SIZE};
 pub use fsp::{
     GspFspCot, GspFspCotError, GspFspResponse, GspFspResponseError,
-    NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH, NVIDIA_GSP_FSP_COT_HASH_BYTES,
+    NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH, NVIDIA_GSP_FSP_BOOT_COMPLETE_REGISTER_GB20X,
+    NVIDIA_GSP_FSP_BOOT_COMPLETE_STATUS_SUCCESS, NVIDIA_GSP_FSP_COT_HASH_BYTES,
     NVIDIA_GSP_FSP_COT_PACKET_SIZE, NVIDIA_GSP_FSP_COT_PAYLOAD_SIZE,
     NVIDIA_GSP_FSP_COT_PUBLIC_KEY_BYTES, NVIDIA_GSP_FSP_COT_PUBLIC_KEY_SLOT_BYTES,
     NVIDIA_GSP_FSP_COT_SIGNATURE_BYTES, NVIDIA_GSP_FSP_COT_SIGNATURE_SLOT_BYTES,
@@ -519,6 +520,16 @@ pub struct GspFramebufferLayout {
 }
 
 impl GspFramebufferLayout {
+    /// Return the FRTS offset expected by the FSP COT packet.
+    ///
+    /// The COT wire field is measured backwards from the end of framebuffer memory, while WPR
+    /// metadata carries the absolute FRTS address.
+    pub fn frts_vidmem_offset(self) -> Result<u64, GspFramebufferLayoutError> {
+        self.framebuffer_size
+            .checked_sub(self.frts_address)
+            .ok_or(GspFramebufferLayoutError::AddressUnderflow)
+    }
+
     pub fn r570_gb20x(
         framebuffer_size: u64,
         bios_address: u64,
@@ -1924,6 +1935,10 @@ mod tests {
         assert_eq!(
             framebuffer.wpr_end,
             framebuffer.frts_address + framebuffer.frts_size
+        );
+        assert_eq!(
+            framebuffer.frts_vidmem_offset().expect("FRTS COT offset"),
+            framebuffer.framebuffer_size - framebuffer.frts_address
         );
         let meta = plan.wpr_meta(framebuffer).expect("WPR metadata");
         assert_eq!(

@@ -1380,8 +1380,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             gpu_dma_next_frame_address,
         ) {
             Ok(Some(staging)) => {
+                let fsp_status = if staging.fsp_boot_requested {
+                    match nvidia_probe.as_ref() {
+                        Some(probe) => match nvidia::boot_external_gsp(probe, &staging) {
+                            Ok(response) => {
+                                kprintln!(
+                                    "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
+                                    response.task_id,
+                                    response.command_nvdm_type,
+                                    response.error_code,
+                                );
+                                "cot-accepted"
+                            }
+                            Err(error) => {
+                                kprintln!(
+                                    "driver: nvidia FSP COT failed ({:?}) status=degraded",
+                                    error
+                                );
+                                "cot-failed"
+                            }
+                        },
+                        None => "probe-unavailable",
+                    }
+                } else {
+                    "disabled"
+                };
                 kprintln!(
-                    "driver: nvidia GSP staging system_base=0x{:x} system_bytes={} system_pages={} system_end=0x{:x} gsp_bytes={} fmc_bytes={} bootloader_bytes={} fsp_cot_bytes={} framebuffer_size={} frts=0x{:x}+0x{:x} device_writes=disabled status=ready",
+                    "driver: nvidia GSP staging system_base=0x{:x} system_bytes={} system_pages={} system_end=0x{:x} gsp_bytes={} fmc_bytes={} bootloader_bytes={} fsp_cot_bytes={} framebuffer_size={} frts=0x{:x}+0x{:x} fsp_boot={} device_writes={} status=ready",
                     staging.system_base(),
                     staging.system_bytes(),
                     staging.system_pages(),
@@ -1393,6 +1418,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     nvidia::NVIDIA_GB20X_FRAMEBUFFER_SIZE,
                     staging.framebuffer.frts_address,
                     staging.framebuffer.frts_size,
+                    fsp_status,
+                    if staging.fsp_boot_requested {
+                        "opt-in"
+                    } else {
+                        "disabled"
+                    },
                 );
                 Some(staging)
             }

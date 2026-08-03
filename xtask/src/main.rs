@@ -81,6 +81,7 @@ struct NvidiaFirmwareCarrier {
     gsp: Vec<u8>,
     fmc: Vec<u8>,
     bootloader: Vec<u8>,
+    fsp_boot_requested: bool,
 }
 
 fn main() {
@@ -718,10 +719,15 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     let nvidia_firmware = optional_nvidia_firmware()?;
     if let Some(firmware) = nvidia_firmware.as_ref() {
         println!(
-            "nvidia firmware carrier: gsp_bytes={} fmc_bytes={} bootloader_bytes={} files=GSP.BIN,FMC.BIN,BOOT.BIN status=ready",
+            "nvidia firmware carrier: gsp_bytes={} fmc_bytes={} bootloader_bytes={} files=GSP.BIN,FMC.BIN,BOOT.BIN fsp_boot={} status=ready",
             firmware.gsp.len(),
             firmware.fmc.len(),
             firmware.bootloader.len(),
+            if firmware.fsp_boot_requested {
+                "opt-in"
+            } else {
+                "disabled"
+            },
         );
     }
 
@@ -947,6 +953,9 @@ fn create_partitioned_uefi_image(
                 ("fmc.bin", firmware.fmc.as_slice()),
                 ("boot.bin", firmware.bootloader.as_slice()),
             ]);
+            if firmware.fsp_boot_requested {
+                root_files.push(("nvidia.fsp", b"enabled\n"));
+            }
         }
         create_fat32_root_partition(&root_path, root_size, &root_files)?;
         create_gpt_disk_with_root(&esp_path, &root_path, output)
@@ -1337,6 +1346,9 @@ fn nvidia_gsp_bundle_check(
         staging.bootloader_bytes,
     )
     .map_err(|error| format!("planning NVIDIA GSP framebuffer WPR: {error:?}"))?;
+    let frts_vidmem_offset = framebuffer
+        .frts_vidmem_offset()
+        .map_err(|error| format!("computing NVIDIA GSP FRTS COT offset: {error:?}"))?;
     let mut staged_memory = vec![0u8; staging.total_bytes];
     staging
         .materialize_bundle_into(
@@ -1360,10 +1372,11 @@ fn nvidia_gsp_bundle_check(
         .map_err(|error| format!("encoding NVIDIA GSP staged cached arguments: {error:?}"))?;
     let fmc_boot_params = staging.fmc_boot_params();
     let cot = GspFspCot::gb20x(
-        0x2000_0000,
-        0x1000_0000,
-        0x0040_0000,
-        0x0010_0000,
+        staging.fmc_image.address,
+        staging.fmc_args.address,
+        frts_vidmem_offset,
+        u32::try_from(framebuffer.frts_size)
+            .map_err(|_| "NVIDIA GSP FRTS size does not fit FSP COT".to_owned())?,
         bundle.fmc.hash.bytes(&fmc),
         bundle.fmc.public_key.bytes(&fmc),
         bundle.fmc.signature.bytes(&fmc),
@@ -1424,10 +1437,17 @@ fn read_firmware_blob(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn optional_nvidia_firmware() -> Result<Option<NvidiaFirmwareCarrier>, String> {
+    let fsp_boot_requested = nvidia_fsp_boot_requested()?;
     let gsp_path = env::var_os("RUSTOS_NVIDIA_GSP").map(PathBuf::from);
     let fmc_path = env::var_os("RUSTOS_NVIDIA_FMC").map(PathBuf::from);
     let bootloader_path = env::var_os("RUSTOS_NVIDIA_BOOTLOADER").map(PathBuf::from);
     if gsp_path.is_none() && fmc_path.is_none() && bootloader_path.is_none() {
+        if fsp_boot_requested {
+            return Err(
+                "RUSTOS_NVIDIA_FSP_BOOT=1 requires the three NVIDIA firmware carrier paths"
+                    .to_owned(),
+            );
+        }
         return Ok(None);
     }
     let gsp_path = gsp_path.ok_or_else(|| {
@@ -1454,7 +1474,22 @@ fn optional_nvidia_firmware() -> Result<Option<NvidiaFirmwareCarrier>, String> {
         gsp,
         fmc,
         bootloader,
+        fsp_boot_requested,
     }))
+}
+
+fn nvidia_fsp_boot_requested() -> Result<bool, String> {
+    match env::var("RUSTOS_NVIDIA_FSP_BOOT") {
+        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on") => Ok(true),
+        Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off") => Ok(false),
+        Ok(value) => Err(format!(
+            "RUSTOS_NVIDIA_FSP_BOOT must be 0/1 (got {value:?})"
+        )),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("RUSTOS_NVIDIA_FSP_BOOT is not valid UTF-8".to_owned())
+        }
+    }
 }
 
 fn add_nvidia_firmware_files(
@@ -1467,6 +1502,9 @@ fn add_nvidia_firmware_files(
     builder.set_file_contents("gsp.bin".to_owned(), firmware.gsp.clone());
     builder.set_file_contents("fmc.bin".to_owned(), firmware.fmc.clone());
     builder.set_file_contents("boot.bin".to_owned(), firmware.bootloader.clone());
+    if firmware.fsp_boot_requested {
+        builder.set_file_contents("nvidia.fsp".to_owned(), b"enabled\n".to_vec());
+    }
 }
 
 fn check() -> Result<(), String> {

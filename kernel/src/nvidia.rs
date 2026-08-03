@@ -22,6 +22,7 @@ pub const NVIDIA_GB20X_BIOS_ADDRESS: u64 = NVIDIA_GB20X_FRAMEBUFFER_SIZE - 0x20_
 const NVIDIA_GSP_FIRMWARE_PATH: &[u8] = b"/GSP.BIN";
 const NVIDIA_FMC_FIRMWARE_PATH: &[u8] = b"/FMC.BIN";
 const NVIDIA_BOOTLOADER_FIRMWARE_PATH: &[u8] = b"/BOOT.BIN";
+const NVIDIA_FSP_BOOT_REQUEST_PATH: &[u8] = b"/NVIDIA.FSP";
 
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
@@ -56,6 +57,8 @@ pub enum NvidiaError {
     FspPacketTooLarge { size: usize },
     FspQueuePointerInvalid { head: u32, tail: u32 },
     FspQueueTimeout,
+    FspSecureBootTimeout,
+    FspUnavailable,
     FspResponseTimeout,
     FspResponseBufferTooSmall { required: usize, actual: usize },
     FspResponse(rustos_gpu_protocol::GspFspResponseError),
@@ -121,6 +124,7 @@ pub struct NvidiaGspStaging {
     pub plan: rustos_gpu_protocol::GspBootSystemMemoryPlan,
     pub framebuffer: rustos_gpu_protocol::GspFramebufferLayout,
     pub fsp_cot: [u8; rustos_gpu_protocol::NVIDIA_GSP_FSP_COT_PACKET_SIZE],
+    pub fsp_boot_requested: bool,
     pub gsp_bytes: usize,
     pub fmc_bytes: usize,
     pub bootloader_bytes: usize,
@@ -338,10 +342,13 @@ pub fn stage_external_gsp(
         plan.bootloader_bytes,
     )
     .map_err(NvidiaGspStageError::Framebuffer)?;
+    let frts_vidmem_offset = framebuffer
+        .frts_vidmem_offset()
+        .map_err(NvidiaGspStageError::Framebuffer)?;
     let fsp_cot = rustos_gpu_protocol::GspFspCot::gb20x(
         plan.fmc_image.address,
         plan.fmc_args.address,
-        framebuffer.frts_address,
+        frts_vidmem_offset,
         u32::try_from(framebuffer.frts_size).map_err(|_| NvidiaGspStageError::AddressOverflow)?,
         bundle.fmc.hash.bytes(fmc_source.as_slice()),
         bundle.fmc.public_key.bytes(fmc_source.as_slice()),
@@ -359,11 +366,15 @@ pub fn stage_external_gsp(
     )
     .map_err(NvidiaGspStageError::Materialization)?;
     let next_frame_address = system_memory.end_address()?;
+    let fsp_boot_requested = crate::storage::runtime_file_size(NVIDIA_FSP_BOOT_REQUEST_PATH)
+        .map_err(|_| NvidiaGspStageError::StorageUnavailable)?
+        .is_some();
     Ok(Some(NvidiaGspStaging {
         system_memory,
         plan,
         framebuffer,
         fsp_cot,
+        fsp_boot_requested,
         gsp_bytes: gsp_size,
         fmc_bytes: fmc_size,
         bootloader_bytes: bootloader_size,
@@ -400,7 +411,9 @@ impl NvidiaFspSnapshot {
     fn read(mmio: MmioRegion) -> Result<Self, NvidiaError> {
         let hwcfg2 = mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_HWCFG2))?;
         Ok(Self {
-            secure_boot_status: mmio.read_u32(0x0002_00bc)?,
+            secure_boot_status: mmio.read_u32(u64::from(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_REGISTER_GB20X,
+            ))?,
             queue_head: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD))?,
             queue_tail: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_TAIL))?,
             message_queue_head: mmio
@@ -431,6 +444,19 @@ impl NvidiaFspTransport {
     // Deliberately opt-in: probing must remain read-only until firmware staging is complete.
     fn new(mmio: MmioRegion) -> Self {
         Self { mmio }
+    }
+
+    fn wait_secure_boot(&self) -> Result<u32, NvidiaError> {
+        for _ in 0..NVIDIA_GSP_FSP_POLL_SPINS {
+            let status = self.mmio.read_u32(u64::from(
+                rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_REGISTER_GB20X,
+            ))?;
+            if status == rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_STATUS_SUCCESS {
+                return Ok(status);
+            }
+            core::hint::spin_loop();
+        }
+        Err(NvidiaError::FspSecureBootTimeout)
     }
 
     pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
@@ -572,6 +598,19 @@ impl NvidiaFspTransport {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "none")]
+pub fn boot_external_gsp(
+    probe: &NvidiaProbe,
+    staging: &NvidiaGspStaging,
+) -> Result<rustos_gpu_protocol::GspFspResponse, NvidiaError> {
+    let transport = probe.fsp_transport().ok_or(NvidiaError::FspUnavailable)?;
+    transport.wait_secure_boot()?;
+    transport.send_sync(
+        rustos_gpu_protocol::NVIDIA_GSP_FSP_NVDM_TYPE_COT,
+        &staging.fsp_cot,
+    )
 }
 
 #[allow(dead_code)]
@@ -837,6 +876,22 @@ mod tests {
             Err(NvidiaError::FspPacketUnaligned { size: 3 })
         );
         assert_eq!(validate_packet(&[0; 4]), Ok(()));
+    }
+
+    #[test]
+    fn waits_for_the_gb20x_fsp_secure_boot_status() {
+        let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
+        let status_offset = rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_REGISTER_GB20X;
+        mmio_bytes[status_offset as usize..status_offset as usize + 4].copy_from_slice(
+            &rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_STATUS_SUCCESS.to_le_bytes(),
+        );
+        let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
+        let transport = NvidiaFspTransport::new(mmio);
+
+        assert_eq!(
+            transport.wait_secure_boot(),
+            Ok(rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_STATUS_SUCCESS)
+        );
     }
 
     #[test]
