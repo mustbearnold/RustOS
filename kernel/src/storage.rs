@@ -627,7 +627,9 @@ const FAT_LFN_CHARS_PER_ENTRY: usize = 13;
 const MAX_LONG_NAME_LENGTH: usize = 255;
 const MAX_LONG_NAME_ENTRIES: usize =
     (MAX_LONG_NAME_LENGTH + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY;
-pub const MAX_MUTABLE_FILE_SIZE: usize = 64 * 1024;
+/// FAT directory entries carry a 32-bit file size. Actual growth is additionally bounded by the
+/// mounted volume's free cluster count.
+pub const MAX_MUTABLE_FILE_SIZE: usize = u32::MAX as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatFileEntry {
@@ -883,11 +885,19 @@ enum FatDirectoryRef {
     Cluster(u32),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FatDirectorySlot {
     relative_sector: u64,
     offset: usize,
     file: Option<FatFileEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct FatWriteCursor {
+    slot: FatDirectorySlot,
+    first_cluster: u32,
+    file_size: u32,
+    last_cluster: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1019,6 +1029,8 @@ pub struct FatFileSystem<D> {
     device: D,
     partition: PartitionExtent,
     boot: FatBootSector,
+    allocation_hint: u32,
+    write_cursor: Option<FatWriteCursor>,
 }
 
 impl<D: BlockDevice> FatFileSystem<D> {
@@ -1073,6 +1085,8 @@ impl<D: BlockDevice> FatFileSystem<D> {
             device,
             partition,
             boot,
+            allocation_hint: 2,
+            write_cursor: None,
         })
     }
 
@@ -1799,10 +1813,6 @@ impl<D: BlockDevice> FatFileSystem<D> {
     }
 
     /// Write a bounded range into an existing regular FAT12/FAT16/FAT32 file.
-    ///
-    /// This intentionally does not grow or shrink files yet. Callers must provision the file in
-    /// the image first, which keeps the first writable boundary atomic at the sector level and
-    /// avoids exposing partially implemented directory or free-cluster allocation semantics.
     pub fn write_file_range(
         &mut self,
         file: FatFileEntry,
@@ -1841,7 +1851,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
         let mut current_cluster = file.first_cluster;
         self.validate_data_cluster(current_cluster)?;
         let mut cluster_index = offset / cluster_bytes;
-        let mut cluster_offset = offset % cluster_bytes;
+        let cluster_offset = offset % cluster_bytes;
         let mut traversed_clusters = 0u64;
         let mut fat_scratch = [0u8; SECTOR_SIZE];
 
@@ -1863,31 +1873,74 @@ impl<D: BlockDevice> FatFileSystem<D> {
             cluster_index -= 1;
         }
 
+        let (copied, _, _) =
+            self.write_file_range_from_cluster(current_cluster, cluster_offset, buffer)?;
+        Ok(copied)
+    }
+
+    fn write_file_range_from_cluster(
+        &mut self,
+        mut current_cluster: u32,
+        mut cluster_offset: u64,
+        buffer: &[u8],
+    ) -> Result<(usize, u32, u64), FatFileSystemError<D::Error>> {
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        if cluster_offset > cluster_bytes {
+            return Err(FatFileSystemError::InvalidGeometry);
+        }
+        if buffer.is_empty() {
+            return Ok((0, current_cluster, cluster_offset));
+        }
+
+        let mut fat_scratch = [0u8; SECTOR_SIZE];
         let mut sector_scratch = [0u8; SECTOR_SIZE];
         let mut copied = 0usize;
+        let mut traversed_clusters = 0u64;
         while copied < buffer.len() {
+            if cluster_offset == cluster_bytes {
+                current_cluster = match self.next_cluster(current_cluster, &mut fat_scratch)? {
+                    FatClusterNext::EndOfChain => {
+                        return Err(FatFileSystemError::UnexpectedEndOfChain {
+                            cluster: current_cluster,
+                        });
+                    }
+                    FatClusterNext::Next(next) => next,
+                };
+                traversed_clusters = traversed_clusters
+                    .checked_add(1)
+                    .ok_or(FatFileSystemError::ClusterChainLoop)?;
+                if traversed_clusters > self.boot.cluster_count {
+                    return Err(FatFileSystemError::ClusterChainLoop);
+                }
+                cluster_offset = 0;
+            }
             self.validate_data_cluster(current_cluster)?;
+            let available = cluster_bytes - cluster_offset;
+            let cluster_count = core::cmp::min(available, (buffer.len() - copied) as u64) as usize;
             let cluster_start = self.cluster_start_sector(current_cluster)?;
-            let mut sector_index = cluster_offset / SECTOR_SIZE as u64;
-            let mut sector_offset = (cluster_offset % SECTOR_SIZE as u64) as usize;
-
-            while sector_index < u64::from(self.boot.sectors_per_cluster) && copied < buffer.len() {
+            let mut cluster_copied = 0usize;
+            while cluster_copied < cluster_count {
+                let absolute_offset = cluster_offset + cluster_copied as u64;
+                let sector_index = absolute_offset / SECTOR_SIZE as u64;
+                let sector_offset = (absolute_offset % SECTOR_SIZE as u64) as usize;
                 let relative_sector = cluster_start
                     .checked_add(sector_index)
                     .ok_or(FatFileSystemError::InvalidGeometry)?;
                 self.read_volume_sector(relative_sector, &mut sector_scratch)?;
-                let available = SECTOR_SIZE - sector_offset;
-                let count = core::cmp::min(available, buffer.len() - copied);
-                sector_scratch[sector_offset..sector_offset + count]
-                    .copy_from_slice(&buffer[copied..copied + count]);
+                let count =
+                    core::cmp::min(SECTOR_SIZE - sector_offset, cluster_count - cluster_copied);
+                sector_scratch[sector_offset..sector_offset + count].copy_from_slice(
+                    &buffer[copied + cluster_copied..copied + cluster_copied + count],
+                );
                 self.write_volume_sector(relative_sector, &sector_scratch)?;
-                copied += count;
-                sector_index += 1;
-                sector_offset = 0;
+                cluster_copied += count;
             }
-
+            copied += cluster_count;
+            cluster_offset += cluster_count as u64;
             if copied == buffer.len() {
-                break;
+                return Ok((copied, current_cluster, cluster_offset));
             }
             current_cluster = match self.next_cluster(current_cluster, &mut fat_scratch)? {
                 FatClusterNext::EndOfChain => {
@@ -1905,8 +1958,286 @@ impl<D: BlockDevice> FatFileSystem<D> {
             }
             cluster_offset = 0;
         }
+        Ok((copied, current_cluster, cluster_offset))
+    }
 
-        Ok(copied)
+    fn rollback_file_growth(
+        &mut self,
+        slot: FatDirectorySlot,
+        file: FatFileEntry,
+        old_last_cluster: Option<u32>,
+        appended_clusters: &[u32],
+        metadata_published: bool,
+    ) {
+        let metadata_restored = !metadata_published
+            || self
+                .update_directory_entry_metadata(slot, file.first_cluster, file.size)
+                .is_ok();
+        if !metadata_restored || appended_clusters.is_empty() {
+            return;
+        }
+        let detached = old_last_cluster.map_or(true, |last_cluster| {
+            self.set_fat_entry(last_cluster, self.end_of_chain_value())
+                .is_ok()
+        });
+        if detached {
+            let _ = self.release_cluster_chain(appended_clusters);
+        }
+    }
+
+    fn write_file_range_growing_from_cursor(
+        &mut self,
+        cursor: FatWriteCursor,
+        file: FatFileEntry,
+        buffer: &[u8],
+        end_size: usize,
+    ) -> Result<(usize, usize), FatFileSystemError<D::Error>> {
+        let file_size = u64::from(file.size);
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let required_clusters = u64::try_from(end_size)
+            .map_err(|_| FatFileSystemError::InvalidGeometry)?
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let current_clusters = file_size
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let additional_clusters = required_clusters
+            .checked_sub(current_clusters)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let appended_size = usize::try_from(
+            additional_clusters
+                .checked_mul(cluster_bytes)
+                .ok_or(FatFileSystemError::InvalidGeometry)?,
+        )
+        .map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let appended_clusters = self.allocate_cluster_chain(appended_size)?;
+        for cluster in appended_clusters.iter().copied() {
+            if let Err(error) = self.zero_cluster(cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+
+        if let Some(new_first_cluster) = appended_clusters.first().copied() {
+            if let Err(error) = self.set_fat_entry(cursor.last_cluster, new_first_cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+        let start_offset = file_size % cluster_bytes;
+        let start_cluster = if start_offset == 0 {
+            appended_clusters
+                .first()
+                .copied()
+                .ok_or(FatFileSystemError::InvalidGeometry)?
+        } else {
+            cursor.last_cluster
+        };
+        let new_size = u32::try_from(end_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let grown_file = FatFileEntry {
+            first_cluster: cursor.first_cluster,
+            size: new_size,
+            ..file
+        };
+        if let Err(error) = self.update_directory_entry_metadata(
+            cursor.slot,
+            grown_file.first_cluster,
+            grown_file.size,
+        ) {
+            self.rollback_file_growth(
+                cursor.slot,
+                file,
+                Some(cursor.last_cluster),
+                &appended_clusters,
+                false,
+            );
+            return Err(error);
+        }
+
+        let (count, last_cluster, _) =
+            match self.write_file_range_from_cluster(start_cluster, start_offset, buffer) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.rollback_file_growth(
+                        cursor.slot,
+                        file,
+                        Some(cursor.last_cluster),
+                        &appended_clusters,
+                        true,
+                    );
+                    return Err(error);
+                }
+            };
+        self.write_cursor = Some(FatWriteCursor {
+            slot: cursor.slot,
+            first_cluster: cursor.first_cluster,
+            file_size: new_size,
+            last_cluster,
+        });
+        Ok((count, end_size))
+    }
+
+    /// Write a range while extending the file's existing cluster chain in place when needed.
+    ///
+    /// New clusters are zeroed before they are linked, and a sparse gap between the old EOF and
+    /// the write offset is explicitly cleared. The caller receives both the bytes written and
+    /// the newly published file size so an open disk handle can stay coherent without rereading
+    /// the directory entry.
+    fn write_file_range_growing(
+        &mut self,
+        slot: FatDirectorySlot,
+        file: FatFileEntry,
+        offset: u64,
+        buffer: &[u8],
+    ) -> Result<(usize, usize), FatFileSystemError<D::Error>> {
+        if !file.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+        if file.attributes & FAT_ATTRIBUTE_READ_ONLY != 0 {
+            return Err(FatFileSystemError::ReadOnlyFile);
+        }
+
+        let file_size = u64::from(file.size);
+        let current_size =
+            usize::try_from(file_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        if buffer.is_empty() {
+            return Ok((0, current_size));
+        }
+        let length = buffer.len() as u64;
+        let end = offset
+            .checked_add(length)
+            .ok_or(FatFileSystemError::FileWriteOutOfBounds {
+                offset,
+                length,
+                size: file_size,
+            })?;
+        let end_size = usize::try_from(end).unwrap_or(usize::MAX);
+        if end_size > MAX_MUTABLE_FILE_SIZE {
+            return Err(FatFileSystemError::FileTooLarge {
+                size: end_size,
+                max_size: MAX_MUTABLE_FILE_SIZE,
+            });
+        }
+        if end > file_size {
+            if let Some(cursor) = self.write_cursor {
+                if cursor.slot.relative_sector == slot.relative_sector
+                    && cursor.slot.offset == slot.offset
+                    && cursor.first_cluster == file.first_cluster
+                    && cursor.file_size == file.size
+                    && offset == file_size
+                {
+                    return self
+                        .write_file_range_growing_from_cursor(cursor, file, buffer, end_size);
+                }
+            }
+        }
+        if end <= file_size {
+            let count = self.write_file_range(file, offset, buffer)?;
+            return Ok((count, current_size));
+        }
+
+        let old_chain = self.collect_cluster_chain(file.first_cluster)?;
+        if file_size != 0 && old_chain.is_empty() {
+            return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
+        }
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let required_clusters = end
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let old_cluster_count =
+            u64::try_from(old_chain.len()).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let additional_clusters = required_clusters.saturating_sub(old_cluster_count);
+        let appended_size = usize::try_from(
+            additional_clusters
+                .checked_mul(cluster_bytes)
+                .ok_or(FatFileSystemError::InvalidGeometry)?,
+        )
+        .map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let appended_clusters = self.allocate_cluster_chain(appended_size)?;
+        for cluster in appended_clusters.iter().copied() {
+            if let Err(error) = self.zero_cluster(cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+
+        let old_last_cluster = old_chain.last().copied();
+        if let Some(new_first_cluster) = appended_clusters.first().copied() {
+            if let Some(old_last_cluster) = old_last_cluster {
+                if let Err(error) = self.set_fat_entry(old_last_cluster, new_first_cluster) {
+                    let _ = self.release_cluster_chain(&appended_clusters);
+                    return Err(error);
+                }
+            }
+        }
+
+        let first_cluster = old_chain
+            .first()
+            .copied()
+            .or_else(|| appended_clusters.first().copied())
+            .unwrap_or(0);
+        let new_size = u32::try_from(end).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let grown_file = FatFileEntry {
+            first_cluster,
+            size: new_size,
+            ..file
+        };
+        if let Err(error) = self.update_directory_entry_metadata(slot, first_cluster, new_size) {
+            self.rollback_file_growth(slot, file, old_last_cluster, &appended_clusters, false);
+            return Err(error);
+        }
+
+        if offset > file_size {
+            let mut gap_offset = file_size;
+            let mut gap_remaining = offset - file_size;
+            let zeroes = [0u8; SECTOR_SIZE];
+            while gap_remaining != 0 {
+                let count = core::cmp::min(gap_remaining, zeroes.len() as u64) as usize;
+                if let Err(error) = self.write_file_range(grown_file, gap_offset, &zeroes[..count])
+                {
+                    self.rollback_file_growth(
+                        slot,
+                        file,
+                        old_last_cluster,
+                        &appended_clusters,
+                        true,
+                    );
+                    return Err(error);
+                }
+                gap_offset += count as u64;
+                gap_remaining -= count as u64;
+            }
+        }
+
+        let count = match self.write_file_range(grown_file, offset, buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                self.rollback_file_growth(slot, file, old_last_cluster, &appended_clusters, true);
+                return Err(error);
+            }
+        };
+        if let Some(last_cluster) = appended_clusters
+            .last()
+            .copied()
+            .or_else(|| old_chain.last().copied())
+        {
+            self.write_cursor = Some(FatWriteCursor {
+                slot,
+                first_cluster,
+                file_size: new_size,
+                last_cluster,
+            });
+        } else {
+            self.write_cursor = None;
+        }
+        Ok((count, end_size))
     }
 
     /// Replace the contents of an existing regular root file, allocating a fresh bounded cluster
@@ -2029,13 +2360,27 @@ impl<D: BlockDevice> FatFileSystem<D> {
         let max_cluster = self.max_data_cluster()?;
         let mut clusters = Vec::with_capacity(required);
         let mut scratch = [0u8; SECTOR_SIZE];
-        for cluster in 2..=max_cluster {
+        let start_cluster = if (2..=max_cluster).contains(&self.allocation_hint) {
+            self.allocation_hint
+        } else {
+            2
+        };
+        let cluster_span = max_cluster
+            .checked_sub(1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let mut cluster = start_cluster;
+        for _ in 0..cluster_span {
             if self.fat_entry_value(cluster, &mut scratch)? == 0 {
                 clusters.push(cluster);
                 if clusters.len() == required {
                     break;
                 }
             }
+            cluster = if cluster == max_cluster {
+                2
+            } else {
+                cluster + 1
+            };
         }
         if clusters.len() != required {
             return Err(FatFileSystemError::NoFreeClusters {
@@ -2053,6 +2398,13 @@ impl<D: BlockDevice> FatFileSystem<D> {
                 let _ = self.release_cluster_chain(&clusters[..=index]);
                 return Err(error);
             }
+        }
+        if let Some(last_cluster) = clusters.last().copied() {
+            self.allocation_hint = if last_cluster == max_cluster {
+                2
+            } else {
+                last_cluster + 1
+            };
         }
         Ok(clusters)
     }
@@ -3352,70 +3704,19 @@ pub fn write_runtime_file(path: &[u8], offset: u64, buffer: &[u8]) -> Result<(us
         return Err(());
     }
     let entry = located.entry;
-    let current_size = usize::try_from(entry.size).map_err(|_| ())?;
-    let offset = usize::try_from(offset).map_err(|_| ())?;
-    if buffer.is_empty() {
-        return Ok((0, current_size));
-    }
-    let end = offset.checked_add(buffer.len()).ok_or(())?;
-    if end <= current_size {
-        let count = match filesystem.write_file_range(entry, offset as u64, buffer) {
-            Ok(count) => count,
-            Err(error) => {
-                crate::kprintln!(
-                    "storage: runtime write range failed path={:?} offset={} bytes={} error={:?} status=degraded",
-                    path,
-                    offset,
-                    buffer.len(),
-                    error
-                );
-                return Err(());
-            }
-        };
-        return Ok((count, current_size));
-    }
-    if end > MAX_MUTABLE_FILE_SIZE {
-        return Err(());
-    }
-
-    let mut contents = vec![0u8; end.max(current_size)];
-    if current_size != 0 {
-        let count = match filesystem.read_file_range(entry, 0, &mut contents[..current_size]) {
-            Ok(count) => count,
-            Err(error) => {
-                crate::kprintln!(
-                    "storage: runtime write readback failed path={:?} error={:?} status=degraded",
-                    path,
-                    error
-                );
-                return Err(());
-            }
-        };
-        if count != current_size {
-            crate::kprintln!(
-                "storage: runtime write readback short path={:?} expected={} actual={} status=degraded",
-                path,
-                current_size,
-                count
-            );
-            return Err(());
-        }
-    }
-    contents[offset..end].copy_from_slice(buffer);
-    let count = match filesystem.write_file_contents_at(located.slot, entry, &contents) {
-        Ok(count) => count,
+    match filesystem.write_file_range_growing(located.slot, entry, offset, buffer) {
+        Ok(result) => Ok(result),
         Err(error) => {
             crate::kprintln!(
-                "storage: runtime write contents failed path={:?} offset={} bytes={} error={:?} status=degraded",
+                "storage: runtime write range/grow failed path={:?} offset={} bytes={} error={:?} status=degraded",
                 path,
                 offset,
                 buffer.len(),
                 error
             );
-            return Err(());
+            Err(())
         }
-    };
-    Ok((buffer.len(), count))
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -4208,6 +4509,81 @@ mod tests {
         assert_eq!(empty.first_cluster, 0);
         assert_eq!(empty.size, 0);
         assert_eq!(filesystem.root_files().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn grows_a_fat16_file_in_place_beyond_64_kib_and_zero_fills_gap() {
+        let (disk, partition, boot) = test_fat16_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        let empty = filesystem.create_root_file(*b"GROW    BIN", &[]).unwrap();
+        let first_contents = vec![0x11; 32_000];
+        let slot = filesystem
+            .find_root_entry_slot(&empty.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filesystem.write_file_range_growing(slot, empty, 0, &first_contents),
+            Ok((first_contents.len(), first_contents.len()))
+        );
+        let first = filesystem.find_root_entry(b"GROW    BIN").unwrap().unwrap();
+        let second_contents = vec![0x22; 256];
+        let slot = filesystem
+            .find_root_entry_slot(&first.short_name)
+            .unwrap()
+            .unwrap();
+        let final_size = 70_000 + second_contents.len();
+        assert_eq!(
+            filesystem.write_file_range_growing(slot, first, 70_000, &second_contents),
+            Ok((second_contents.len(), final_size))
+        );
+
+        let updated = filesystem.find_root_entry(b"GROW    BIN").unwrap().unwrap();
+        assert_eq!(updated.first_cluster, first.first_cluster);
+        assert_eq!(updated.size, final_size as u32);
+        let mut readback = vec![0u8; final_size];
+        assert_eq!(
+            filesystem.read_file_range(updated, 0, &mut readback),
+            Ok(final_size)
+        );
+        assert!(
+            readback[..first_contents.len()]
+                .iter()
+                .all(|byte| *byte == 0x11)
+        );
+        assert!(
+            readback[first_contents.len()..70_000]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(&readback[70_000..], &second_contents);
+
+        let sequential = filesystem.create_root_file(*b"SEQUENTIAL ", &[]).unwrap();
+        let chunk = vec![0x33; 4_096];
+        let slot = filesystem
+            .find_root_entry_slot(&sequential.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filesystem.write_file_range_growing(slot, sequential, 0, &chunk),
+            Ok((chunk.len(), chunk.len()))
+        );
+        let current = filesystem.find_root_entry(b"SEQUENTIAL ").unwrap().unwrap();
+        let slot = filesystem
+            .find_root_entry_slot(&current.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filesystem.write_file_range_growing(slot, current, chunk.len() as u64, &chunk),
+            Ok((chunk.len(), chunk.len() * 2))
+        );
+        let updated = filesystem.find_root_entry(b"SEQUENTIAL ").unwrap().unwrap();
+        assert_eq!(updated.first_cluster, current.first_cluster);
+        let mut sequential_readback = vec![0u8; chunk.len() * 2];
+        assert_eq!(
+            filesystem.read_file_range(updated, 0, &mut sequential_readback),
+            Ok(sequential_readback.len())
+        );
+        assert!(sequential_readback.iter().all(|byte| *byte == 0x33));
     }
 
     #[test]

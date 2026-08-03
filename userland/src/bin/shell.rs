@@ -41,6 +41,10 @@ const PASSWD_PATH: &[u8] = b"/bin/passwd\0";
 const USERADD_PATH: &[u8] = b"/bin/useradd\0";
 const LOCK_PATH: &[u8] = b"/bin/lock\0";
 const ACCOUNT_READ_CHUNK_LENGTH: usize = 256;
+const LARGE_FILE_CHUNK_LENGTH: usize = 4 * 1024;
+const LARGE_FILE_CHUNK_COUNT: usize = 32;
+const LARGE_FILE_LENGTH: usize = LARGE_FILE_CHUNK_LENGTH * LARGE_FILE_CHUNK_COUNT;
+const LARGE_FILE_NAME: &[u8] = b"large.bin";
 
 struct ShellState {
     cwd: PathBuf,
@@ -139,7 +143,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -279,6 +283,9 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if let Some(arguments) = argument_after(line, b"write ") {
         write_file(state, arguments);
+        write_prompt(recovery_mode, state);
+    } else if line == b"grow" {
+        grow_large_file(state);
         write_prompt(recovery_mode, state);
     } else if let Some(path) = argument_after(line, b"cat ") {
         cat_file(state, path);
@@ -1051,6 +1058,69 @@ fn write_file(state: &ShellState, arguments: &[u8]) {
         write_stdout(path.as_bytes());
         write_stdout(b" status=ready\n");
     }
+}
+
+fn grow_large_file(state: &ShellState) {
+    let Some(path) = resolve_command_path(state, LARGE_FILE_NAME) else {
+        write_stdout(b"grow: path too long\n");
+        return;
+    };
+    let handle = open_resolved_path(&path, OPEN_CREATE | OPEN_WRITE);
+    if is_syscall_error(handle) {
+        write_stdout(b"grow: open failed\n");
+        return;
+    }
+
+    let mut pattern = [0u8; LARGE_FILE_CHUNK_LENGTH];
+    for (index, byte) in pattern.iter_mut().enumerate() {
+        *byte = b'a' + (index % 26) as u8;
+    }
+    let mut write_ok = true;
+    for _ in 0..LARGE_FILE_CHUNK_COUNT {
+        let count = write(handle, &pattern);
+        if is_syscall_error(count) || count != LARGE_FILE_CHUNK_LENGTH as u64 {
+            write_ok = false;
+            break;
+        }
+    }
+    if is_syscall_error(close(handle)) {
+        write_ok = false;
+    }
+    if !write_ok {
+        write_stdout(b"grow: write failed\n");
+        return;
+    }
+
+    let read_handle = open_resolved_path(&path, 0);
+    if is_syscall_error(read_handle) {
+        write_stdout(b"grow: read open failed\n");
+        return;
+    }
+    let mut read_buffer = [0u8; LARGE_FILE_CHUNK_LENGTH];
+    let mut read_ok = true;
+    for _ in 0..LARGE_FILE_CHUNK_COUNT {
+        let count = read(read_handle, &mut read_buffer);
+        if is_syscall_error(count)
+            || count != LARGE_FILE_CHUNK_LENGTH as u64
+            || read_buffer != pattern
+        {
+            read_ok = false;
+            break;
+        }
+    }
+    if is_syscall_error(close(read_handle)) {
+        read_ok = false;
+    }
+    if !read_ok {
+        write_stdout(b"grow: read verification failed\n");
+        return;
+    }
+
+    write_stdout(b"shell: large file path=");
+    write_stdout(path.as_bytes());
+    write_stdout(b" bytes=");
+    write_decimal(LARGE_FILE_LENGTH as u64);
+    write_stdout(b" status=ready\n");
 }
 
 fn write_permission_marker(path: &PathBuf) {

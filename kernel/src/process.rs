@@ -461,7 +461,7 @@ fn user_home_path(path: &[u8], uid: UserId) -> bool {
 fn runtime_access_allowed(path: &[u8], uid: UserId, access: AccessKind) -> bool {
     uid == ROOT_UID || matches!(access, AccessKind::Read) || user_home_path(path, uid)
 }
-const MAX_USER_WRITE_LENGTH: usize = 256;
+const MAX_USER_WRITE_LENGTH: usize = 4 * 1024;
 #[cfg(target_os = "none")]
 const GRAPHICS_INFO_LENGTH: usize = 16;
 #[cfg(target_os = "none")]

@@ -2285,6 +2285,10 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "shell: cwd changed path=/home/user/work status=ready",
             ),
             (
+                "grow",
+                "shell: large file path=/home/user/work/large.bin bytes=131072 status=ready",
+            ),
+            (
                 "write note daily-use",
                 "shell: relative write path=/home/user/work/note status=ready",
             ),
@@ -3696,6 +3700,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: relative read path=/home/user/documents/meeting-notes.txt status=ready",
         "shell: ls path=/home/user/documents status=ready",
         "shell: cwd changed path=/home/user/work status=ready",
+        "shell: large file path=/home/user/work/large.bin bytes=131072 status=ready",
         "shell: relative write path=/home/user/work/note status=ready",
         "shell: relative read path=/home/user/work/note status=ready",
         "shell: ls path=/home/user/work status=ready",
@@ -3721,6 +3726,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || !content.contains("note 9 data")
         || !content.contains("documents 0 dir")
         || !content.contains("meeting-notes.txt")
+        || !content.contains("large.bin 131072 data")
         || !content.contains("boot=1")
         || !content.contains("admin: state set status=ready")
         || !content.contains("admin: package operation status=ready")
