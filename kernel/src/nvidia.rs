@@ -21,6 +21,7 @@ pub const GSP_QUEUE_ENTRY_COUNT: usize =
     rustos_gpu_protocol::GspSharedMemoryLayout::standard().queue_entry_count;
 pub const NVIDIA_GB20X_FRAMEBUFFER_SIZE: u64 = 16 * (1u64 << 30);
 pub const NVIDIA_GB20X_BIOS_ADDRESS: u64 = NVIDIA_GB20X_FRAMEBUFFER_SIZE - 0x20_000;
+pub const NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES: u64 = 30 * (1u64 << 30);
 
 const NVIDIA_GSP_FIRMWARE_PATH: &[u8] = b"/GSP.BIN";
 const NVIDIA_FMC_FIRMWARE_PATH: &[u8] = b"/FMC.BIN";
@@ -34,6 +35,18 @@ pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = rustos_gpu_protocol::NVIDIA_GSP_FSP_BA
 const NVIDIA_GSP_FSP_POLL_SPINS: usize = 10_000_000;
 const NVIDIA_GSP_FMC_POLL_SPINS: usize = 10_000_000;
 const NVIDIA_GSP_RPC_POLL_SPINS: usize = 10_000_000;
+
+pub fn target_platform_matches(
+    cpu_vendor: &str,
+    cpu_brand: &str,
+    hypervisor_present: bool,
+    usable_memory_bytes: u64,
+) -> bool {
+    cpu_vendor == "AuthenticAMD"
+        && cpu_brand == "AMD Ryzen 7 5800X 8-Core Processor"
+        && !hypervisor_present
+        && usable_memory_bytes >= NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -1324,6 +1337,34 @@ mod tests {
             Err(NvidiaError::FspPacketUnaligned { size: 3 })
         );
         assert_eq!(validate_packet(&[0; 4]), Ok(()));
+    }
+
+    #[test]
+    fn native_gsp_status_requires_exact_target_platform() {
+        assert!(target_platform_matches(
+            "AuthenticAMD",
+            "AMD Ryzen 7 5800X 8-Core Processor",
+            false,
+            NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES,
+        ));
+        assert!(!target_platform_matches(
+            "AuthenticAMD",
+            "AMD Ryzen 7 5800X 8-Core Processor",
+            true,
+            NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES,
+        ));
+        assert!(!target_platform_matches(
+            "AuthenticAMD",
+            "AMD Ryzen 7 5800X3D 8-Core Processor",
+            false,
+            NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES,
+        ));
+        assert!(!target_platform_matches(
+            "AuthenticAMD",
+            "AMD Ryzen 7 5800X 8-Core Processor",
+            false,
+            NVIDIA_TARGET_MIN_USABLE_MEMORY_BYTES - 1,
+        ));
     }
 
     #[test]

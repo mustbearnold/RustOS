@@ -1436,7 +1436,7 @@ fn nvidia_gsp_physical_proof(path: &Path) -> Result<(), String> {
 
 fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     let required = [
-        "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X",
+        "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor",
         "driver: nvidia probe 0b:00.0 device=0x2f04",
         "architecture=blackwell",
         "driver: nvidia FSP COT response",
@@ -1489,8 +1489,24 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     else {
         return Err("physical NVIDIA GSP proof missing static-info reply".to_owned());
     };
-    if !static_info_reply_line.contains("rpc_sequence=0") {
-        return Err("physical NVIDIA GSP proof has wrong static-info RPC sequence".to_owned());
+    if !static_info_reply_line.contains("transport_sequence=1")
+        || !static_info_reply_line.contains("rpc_sequence=0")
+        || !static_info_reply_line.contains("result=0x00000000")
+        || !static_info_reply_line.contains("private_result=0x00000000")
+    {
+        return Err("physical NVIDIA GSP proof has invalid static-info reply".to_owned());
+    }
+    let Some(init_done_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia GSP-RM event function=4097"))
+    else {
+        return Err("physical NVIDIA GSP proof missing GSP_INIT_DONE event".to_owned());
+    };
+    if !init_done_line.contains("transport_sequence=0")
+        || !init_done_line.contains("rpc_sequence=0")
+        || !init_done_line.contains("status=consumed")
+    {
+        return Err("physical NVIDIA GSP proof has invalid GSP_INIT_DONE event".to_owned());
     }
     let Some(static_info_line) = content
         .lines()
@@ -1513,6 +1529,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         return Err("physical NVIDIA GSP proof has empty static GPU name".to_owned());
     }
     if content.contains("GSP-RM bootstrap failed")
+        || content.contains("GSP target platform gate failed")
         || content.contains("nvidia probe failed")
         || content.contains("device_writes=disabled status=degraded")
     {

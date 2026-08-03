@@ -504,12 +504,14 @@ fn platform_identity() -> ([u8; 12], [u8; 48], bool) {
 }
 
 #[cfg(target_os = "none")]
-fn log_platform_identity(summary: memory::MemorySummary) {
+fn log_platform_identity(summary: memory::MemorySummary) -> bool {
     let (vendor, brand, hypervisor_present) = platform_identity();
+    let vendor = cpuid_text(&vendor);
+    let brand = cpuid_text(&brand);
     kprintln!(
         "platform: cpu_vendor={} cpu_brand={} usable_memory_kib={} hypervisor={} status=present",
-        cpuid_text(&vendor),
-        cpuid_text(&brand),
+        vendor,
+        brand,
         summary.usable_bytes / 1024,
         if hypervisor_present {
             "present"
@@ -517,6 +519,7 @@ fn log_platform_identity(summary: memory::MemorySummary) {
             "none"
         }
     );
+    nvidia::target_platform_matches(vendor, brand, hypervisor_present, summary.usable_bytes)
 }
 
 #[cfg(target_os = "none")]
@@ -546,7 +549,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         summary.reserved_regions,
         summary.reserved_bytes / 1024
     );
-    log_platform_identity(summary);
+    let nvidia_target_platform_ready = log_platform_identity(summary);
 
     let frame_count = memory::usable_frame_count(&boot_info.memory_regions);
     let mut frame_allocator = memory::FrameAllocator::new(&boot_info.memory_regions);
@@ -1445,43 +1448,55 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ) {
             Ok(Some(mut staging)) => {
                 let fsp_status = if staging.fsp_boot_requested {
-                    hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Staged);
-                    match nvidia_probe.as_ref() {
-                        Some(probe) => match nvidia::boot_external_gsp(probe, &mut staging) {
-                            Ok(boot) => {
-                                hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Ready);
-                                kprintln!(
-                                    "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
-                                    boot.fsp_response.task_id,
-                                    boot.fsp_response.command_nvdm_type,
-                                    boot.fsp_response.error_code,
-                                );
-                                kprintln!(
-                                    "driver: nvidia GSP-FMC ready hwcfg2=0x{:08x} mailbox=0x{:08x}:0x{:08x} riscv_active={} riscv_lockdown={} status=ready",
-                                    boot.gsp.hwcfg2,
-                                    boot.gsp.mailbox0,
-                                    boot.gsp.mailbox1,
-                                    boot.gsp.riscv_active,
-                                    boot.gsp.riscv_lockdown,
-                                );
-                                kprintln!(
-                                    "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name={:?} acceleration=unavailable status=ready",
-                                    boot.static_info.gpu_name,
-                                );
-                                "gsp-rm-ready"
-                            }
-                            Err(error) => {
+                    if !nvidia_target_platform_ready {
+                        hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Failed);
+                        kprintln!(
+                            "driver: nvidia GSP target platform gate failed required=AuthenticAMD/AMD Ryzen 7 5800X 8-Core Processor/30GiB/no-hypervisor device_writes=disabled status=degraded"
+                        );
+                        "target-platform-failed"
+                    } else {
+                        hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Staged);
+                        match nvidia_probe.as_ref() {
+                            Some(probe) => match nvidia::boot_external_gsp(probe, &mut staging) {
+                                Ok(boot) => {
+                                    hardware::set_nvidia_gsp_status(
+                                        hardware::NvidiaGspStatus::Ready,
+                                    );
+                                    kprintln!(
+                                        "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
+                                        boot.fsp_response.task_id,
+                                        boot.fsp_response.command_nvdm_type,
+                                        boot.fsp_response.error_code,
+                                    );
+                                    kprintln!(
+                                        "driver: nvidia GSP-FMC ready hwcfg2=0x{:08x} mailbox=0x{:08x}:0x{:08x} riscv_active={} riscv_lockdown={} status=ready",
+                                        boot.gsp.hwcfg2,
+                                        boot.gsp.mailbox0,
+                                        boot.gsp.mailbox1,
+                                        boot.gsp.riscv_active,
+                                        boot.gsp.riscv_lockdown,
+                                    );
+                                    kprintln!(
+                                        "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name={:?} acceleration=unavailable status=ready",
+                                        boot.static_info.gpu_name,
+                                    );
+                                    "gsp-rm-ready"
+                                }
+                                Err(error) => {
+                                    hardware::set_nvidia_gsp_status(
+                                        hardware::NvidiaGspStatus::Failed,
+                                    );
+                                    kprintln!(
+                                        "driver: nvidia GSP-RM bootstrap failed ({:?}) status=degraded",
+                                        error
+                                    );
+                                    "gsp-rm-failed"
+                                }
+                            },
+                            None => {
                                 hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Failed);
-                                kprintln!(
-                                    "driver: nvidia GSP-RM bootstrap failed ({:?}) status=degraded",
-                                    error
-                                );
-                                "gsp-rm-failed"
+                                "probe-unavailable"
                             }
-                        },
-                        None => {
-                            hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Failed);
-                            "probe-unavailable"
                         }
                     }
                 } else {
@@ -1501,7 +1516,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     staging.framebuffer.frts_address,
                     staging.framebuffer.frts_size,
                     fsp_status,
-                    if staging.fsp_boot_requested {
+                    if staging.fsp_boot_requested && nvidia_target_platform_ready {
                         "opt-in"
                     } else {
                         "disabled"
