@@ -873,60 +873,42 @@ impl NvidiaFspTransport {
     }
 
     fn write_emem(&self, packet: &[u8]) -> Result<(), NvidiaError> {
-        let mut offset = 0usize;
-        while offset < packet.len() {
-            let chunk_size = core::cmp::min(
-                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_MAX_BYTES,
-                packet.len() - offset,
-            );
-            let emem_offset = u32::try_from(offset)
-                .map_err(|_| NvidiaError::FspPacketTooLarge { size: packet.len() })?;
+        validate_packet(packet)?;
+        self.mmio.write_u32(
+            u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT,
+        )?;
+        for word in packet.chunks_exact(4) {
             self.mmio.write_u32(
-                u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
-                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT | emem_offset,
+                u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
             )?;
-            for word_offset in (0..chunk_size).step_by(4) {
-                let word_start = offset + word_offset;
-                let word = u32::from_le_bytes([
-                    packet[word_start],
-                    packet[word_start + 1],
-                    packet[word_start + 2],
-                    packet[word_start + 3],
-                ]);
-                self.mmio.write_u32(
-                    u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
-                    word,
-                )?;
-            }
-            offset += chunk_size;
         }
         Ok(())
     }
 
     fn read_emem(&self, packet: &mut [u8]) -> Result<(), NvidiaError> {
-        let mut offset = 0usize;
-        while offset < packet.len() {
-            let chunk_size = core::cmp::min(
-                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_MAX_BYTES,
-                packet.len() - offset,
-            );
-            let emem_offset =
-                u32::try_from(offset).map_err(|_| NvidiaError::FspResponseBufferTooSmall {
-                    required: packet.len(),
-                    actual: 0,
-                })?;
-            self.mmio.write_u32(
-                u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
-                rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_READ_BIT | emem_offset,
-            )?;
-            for word_offset in (0..chunk_size).step_by(4) {
-                let word = self
-                    .mmio
-                    .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA))?;
-                packet[offset + word_offset..offset + word_offset + 4]
-                    .copy_from_slice(&word.to_le_bytes());
-            }
-            offset += chunk_size;
+        if packet.is_empty() {
+            return Err(NvidiaError::FspResponseBufferTooSmall {
+                required: 4,
+                actual: 0,
+            });
+        }
+        if packet.len() % core::mem::size_of::<u32>() != 0 {
+            return Err(NvidiaError::FspResponseBufferTooSmall {
+                required: packet.len() + (4 - packet.len() % 4),
+                actual: packet.len(),
+            });
+        }
+        self.mmio.write_u32(
+            u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_READ_BIT,
+        )?;
+        for word in packet.chunks_exact_mut(4) {
+            let value = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA))?;
+            word.copy_from_slice(&value.to_le_bytes());
         }
         Ok(())
     }
@@ -1548,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_fsp_packet_in_emem_chunks_and_updates_queue() {
+    fn sends_fsp_packet_in_one_auto_incrementing_emem_burst() {
         let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
         let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
         let transport = NvidiaFspTransport::new(mmio);
@@ -1570,7 +1552,7 @@ mod tests {
         assert_eq!(read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_QUEUE_HEAD), 0);
         assert_eq!(
             read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_ADDRESS),
-            rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT | 768
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_WRITE_BIT
         );
         assert_eq!(
             read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
