@@ -245,6 +245,52 @@ impl NvidiaGspStaging {
             }),
         }
     }
+
+    fn shared_queue_pair(&mut self) -> Result<rustos_gpu_protocol::GspQueuePair<'_>, NvidiaError> {
+        let layout = self.plan.layout.shared_memory;
+        let queue_size = rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES;
+        let command_end = layout.command_queue_offset.checked_add(queue_size).ok_or(
+            NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.command_queue_offset,
+                size: queue_size,
+                available: layout.total_bytes,
+            },
+        )?;
+        let status_end = layout.status_queue_offset.checked_add(queue_size).ok_or(
+            NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.status_queue_offset,
+                size: queue_size,
+                available: layout.total_bytes,
+            },
+        )?;
+        let shared = self.shared_memory_mut()?;
+        let available = shared.len();
+        if status_end > available {
+            return Err(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.status_queue_offset,
+                size: queue_size,
+                available,
+            });
+        }
+        let (before_status, status_region) = shared.split_at_mut(layout.status_queue_offset);
+        let command_queue = before_status
+            .get_mut(layout.command_queue_offset..command_end)
+            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                offset: layout.command_queue_offset,
+                size: queue_size,
+                available,
+            })?;
+        let status_queue =
+            status_region
+                .get_mut(..queue_size)
+                .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                    offset: layout.status_queue_offset,
+                    size: queue_size,
+                    available,
+                })?;
+        rustos_gpu_protocol::GspQueuePair::new(command_queue, status_queue)
+            .map_err(NvidiaError::GspQueue)
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -702,28 +748,9 @@ impl NvidiaFspTransport {
             payload,
         )
         .map_err(NvidiaError::GspRpc)?;
-        let layout = staging.plan.layout.shared_memory;
-        let queue_end = layout
-            .command_queue_offset
-            .checked_add(rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES)
-            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
-                offset: layout.command_queue_offset,
-                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
-                available: staging.plan.shared_memory.size,
-            })?;
-        let shared = staging.shared_memory_mut()?;
-        let available = shared.len();
-        let queue_bytes = shared
-            .get_mut(layout.command_queue_offset..queue_end)
-            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
-                offset: layout.command_queue_offset,
-                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
-                available,
-            })?;
-        let mut queue =
-            rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
-        queue
-            .write_message(&message)
+        let mut queues = staging.shared_queue_pair()?;
+        queues
+            .write_command_message(&message)
             .map_err(NvidiaError::GspQueue)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         self.mmio.write_u32(
@@ -739,29 +766,10 @@ impl NvidiaFspTransport {
         staging: &mut NvidiaGspStaging,
     ) -> Result<Option<Vec<u8>>, NvidiaError> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let layout = staging.plan.layout.shared_memory;
-        let queue_end = layout
-            .status_queue_offset
-            .checked_add(rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES)
-            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
-                offset: layout.status_queue_offset,
-                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
-                available: staging.plan.shared_memory.size,
-            })?;
-        let message = {
-            let shared = staging.shared_memory_mut()?;
-            let available = shared.len();
-            let queue_bytes = shared
-                .get_mut(layout.status_queue_offset..queue_end)
-                .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
-                    offset: layout.status_queue_offset,
-                    size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
-                    available,
-                })?;
-            let mut queue =
-                rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
-            queue.try_receive_message().map_err(NvidiaError::GspQueue)?
-        };
+        let mut queues = staging.shared_queue_pair()?;
+        let message = queues
+            .try_receive_status_message()
+            .map_err(NvidiaError::GspQueue)?;
         let Some(message) = message else {
             return Ok(None);
         };

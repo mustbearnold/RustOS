@@ -1628,6 +1628,46 @@ pub struct GspQueue<'a> {
     bytes: &'a mut [u8],
 }
 
+/// The r535/r570 shared transport is two linked queues, not two independent rings.
+/// Command TX uses status RX as its read pointer; status TX uses command RX as its read pointer.
+pub struct GspQueuePair<'a> {
+    command: GspQueue<'a>,
+    status: GspQueue<'a>,
+}
+
+impl<'a> GspQueuePair<'a> {
+    pub fn new(
+        command_bytes: &'a mut [u8],
+        status_bytes: &'a mut [u8],
+    ) -> Result<Self, GspQueueError> {
+        Ok(Self {
+            command: GspQueue::new(command_bytes)?,
+            status: GspQueue::new(status_bytes)?,
+        })
+    }
+
+    pub fn write_command_message(&mut self, message: &[u8]) -> Result<u32, GspQueueError> {
+        let status_read = self.status.read_pointer()?;
+        write_queue_message(self.command.bytes, status_read, message)
+    }
+
+    pub fn try_receive_status_message(&mut self) -> Result<Option<Vec<u8>>, GspQueueError> {
+        let command_read = self.command.read_pointer()?;
+        let Some((message, next)) = receive_queue_message(self.status.bytes, command_read)? else {
+            return Ok(None);
+        };
+        // Publish page reclamation only after CPU finished copying and validating the message.
+        // The GSP may reuse those pages as soon as it observes the command RX read pointer.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        write_le_u32(
+            self.command.bytes,
+            NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET,
+            next,
+        );
+        Ok(Some(message))
+    }
+}
+
 impl<'a> GspQueue<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Result<Self, GspQueueError> {
         if bytes.len() < NVIDIA_GSP_SHARED_QUEUE_BYTES {
@@ -1650,107 +1690,126 @@ impl<'a> GspQueue<'a> {
     pub fn available_entries(&self) -> Result<usize, GspQueueError> {
         let write = self.write_pointer()?;
         let read = self.read_pointer()?;
-        let used = queue_distance(read, write)?;
-        Ok(NVIDIA_GSP_QUEUE_ENTRY_COUNT - used - 1)
+        available_queue_entries(write, read)
     }
 
     pub fn write_message(&mut self, message: &[u8]) -> Result<u32, GspQueueError> {
-        let parsed = GspRpcMessage::parse(message)?;
-        if !parsed.checksum_valid() {
-            return Err(GspRpcError::ChecksumMismatch {
-                expected: checksum_for_rpc(message, parsed.rpc_length()),
-                actual: parsed.checksum(),
-            }
-            .into());
-        }
-        let pages = message.len() / NVIDIA_GSP_PAGE_SIZE;
-        let write = self.write_pointer()?;
         let read = self.read_pointer()?;
-        let available = self.available_entries()?;
-        if pages > available {
-            return Err(GspQueueError::QueueFull {
-                write_pointer: write,
-                read_pointer: read,
-            });
-        }
-        for page in 0..pages {
-            let slot = queue_advance(write, page)?;
-            let offset = queue_slot_offset(slot)?;
-            let slot_bytes = &mut self.bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE];
-            slot_bytes.fill(0);
-            let source_start = page * NVIDIA_GSP_PAGE_SIZE;
-            slot_bytes.copy_from_slice(&message[source_start..source_start + NVIDIA_GSP_PAGE_SIZE]);
-        }
-        let next = queue_advance(write, pages)?;
-        write_le_u32(self.bytes, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET, next);
-        Ok(next)
+        write_queue_message(self.bytes, read, message)
     }
 
     pub fn try_receive_message(&mut self) -> Result<Option<Vec<u8>>, GspQueueError> {
-        let write = self.write_pointer()?;
         let read = self.read_pointer()?;
-        if write == read {
+        let Some((message, next)) = receive_queue_message(self.bytes, read)? else {
             return Ok(None);
-        }
-        let available = queue_distance(read, write)?;
-        let first_offset = queue_slot_offset(read)?;
-        let element_count = read_le_u32(self.bytes, first_offset + 40);
-        let pages = usize::try_from(element_count).map_err(|_| GspRpcError::SizeOverflow)?;
-        if pages == 0 || pages > NVIDIA_GSP_MAX_MESSAGE_PAGES {
-            return Err(GspRpcError::InvalidElementCount {
-                count: element_count,
-                pages,
-            }
-            .into());
-        }
-        if pages > available {
-            return Err(GspQueueError::MessageNotReady {
-                required: pages,
-                available,
-            });
-        }
-        let message_bytes = pages
-            .checked_mul(NVIDIA_GSP_PAGE_SIZE)
-            .ok_or(GspRpcError::SizeOverflow)?;
-        let mut message = Vec::new();
-        message.resize(message_bytes, 0);
-        for page in 0..pages {
-            let slot = queue_advance(read, page)?;
-            let offset = queue_slot_offset(slot)?;
-            let destination_start = page * NVIDIA_GSP_PAGE_SIZE;
-            message[destination_start..destination_start + NVIDIA_GSP_PAGE_SIZE]
-                .copy_from_slice(&self.bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE]);
-        }
-        let parsed = GspRpcMessage::parse(&message)?;
-        if !parsed.checksum_valid() {
-            return Err(GspRpcError::ChecksumMismatch {
-                expected: checksum_for_rpc(&message, parsed.rpc_length()),
-                actual: parsed.checksum(),
-            }
-            .into());
-        }
+        };
         // Publish page reclamation only after CPU finished copying and validating the message.
         // The GSP may reuse those pages as soon as it observes the RX read pointer.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        let next = queue_advance(read, pages)?;
         write_le_u32(self.bytes, NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET, next);
         Ok(Some(message))
     }
 
     fn pointer(&self, offset: usize) -> Result<u32, GspQueueError> {
-        let pointer = read_le_u32(self.bytes, offset);
-        let out_of_range = match usize::try_from(pointer) {
-            Ok(value) => value >= NVIDIA_GSP_QUEUE_ENTRY_COUNT,
-            Err(_) => true,
-        };
-        if out_of_range {
-            return Err(GspQueueError::PointerOutOfRange {
-                pointer,
-                count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
-            });
-        }
-        Ok(pointer)
+        read_queue_pointer(self.bytes, offset)
     }
+}
+
+fn read_queue_pointer(bytes: &[u8], offset: usize) -> Result<u32, GspQueueError> {
+    let pointer = read_le_u32(bytes, offset);
+    let out_of_range = match usize::try_from(pointer) {
+        Ok(value) => value >= NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        Err(_) => true,
+    };
+    if out_of_range {
+        return Err(GspQueueError::PointerOutOfRange {
+            pointer,
+            count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
+        });
+    }
+    Ok(pointer)
+}
+
+fn write_queue_message(bytes: &mut [u8], read: u32, message: &[u8]) -> Result<u32, GspQueueError> {
+    let parsed = GspRpcMessage::parse(message)?;
+    if !parsed.checksum_valid() {
+        return Err(GspRpcError::ChecksumMismatch {
+            expected: checksum_for_rpc(message, parsed.rpc_length()),
+            actual: parsed.checksum(),
+        }
+        .into());
+    }
+    let pages = message.len() / NVIDIA_GSP_PAGE_SIZE;
+    let write = read_queue_pointer(bytes, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET)?;
+    let available = available_queue_entries(write, read)?;
+    if pages > available {
+        return Err(GspQueueError::QueueFull {
+            write_pointer: write,
+            read_pointer: read,
+        });
+    }
+    for page in 0..pages {
+        let slot = queue_advance(write, page)?;
+        let offset = queue_slot_offset(slot)?;
+        let slot_bytes = &mut bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE];
+        slot_bytes.fill(0);
+        let source_start = page * NVIDIA_GSP_PAGE_SIZE;
+        slot_bytes.copy_from_slice(&message[source_start..source_start + NVIDIA_GSP_PAGE_SIZE]);
+    }
+    let next = queue_advance(write, pages)?;
+    write_le_u32(bytes, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET, next);
+    Ok(next)
+}
+
+fn receive_queue_message(bytes: &[u8], read: u32) -> Result<Option<(Vec<u8>, u32)>, GspQueueError> {
+    let write = read_queue_pointer(bytes, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET)?;
+    if write == read {
+        return Ok(None);
+    }
+    let available = queue_distance(read, write)?;
+    let first_offset = queue_slot_offset(read)?;
+    let element_count = read_le_u32(bytes, first_offset + 40);
+    let pages = usize::try_from(element_count).map_err(|_| GspRpcError::SizeOverflow)?;
+    if pages == 0 || pages > NVIDIA_GSP_MAX_MESSAGE_PAGES {
+        return Err(GspRpcError::InvalidElementCount {
+            count: element_count,
+            pages,
+        }
+        .into());
+    }
+    if pages > available {
+        return Err(GspQueueError::MessageNotReady {
+            required: pages,
+            available,
+        });
+    }
+    let message_bytes = pages
+        .checked_mul(NVIDIA_GSP_PAGE_SIZE)
+        .ok_or(GspRpcError::SizeOverflow)?;
+    let mut message = Vec::new();
+    message.resize(message_bytes, 0);
+    for page in 0..pages {
+        let slot = queue_advance(read, page)?;
+        let offset = queue_slot_offset(slot)?;
+        let destination_start = page * NVIDIA_GSP_PAGE_SIZE;
+        message[destination_start..destination_start + NVIDIA_GSP_PAGE_SIZE]
+            .copy_from_slice(&bytes[offset..offset + NVIDIA_GSP_PAGE_SIZE]);
+    }
+    let parsed = GspRpcMessage::parse(&message)?;
+    if !parsed.checksum_valid() {
+        return Err(GspRpcError::ChecksumMismatch {
+            expected: checksum_for_rpc(&message, parsed.rpc_length()),
+            actual: parsed.checksum(),
+        }
+        .into());
+    }
+    let next = queue_advance(read, pages)?;
+    Ok(Some((message, next)))
+}
+
+fn available_queue_entries(write: u32, read: u32) -> Result<usize, GspQueueError> {
+    let used = queue_distance(read, write)?;
+    Ok(NVIDIA_GSP_QUEUE_ENTRY_COUNT - used - 1)
 }
 
 fn queue_distance(from: u32, to: u32) -> Result<usize, GspQueueError> {
@@ -2463,6 +2522,62 @@ mod tests {
         assert_eq!(received.function(), NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO);
         assert_eq!(received.transport_sequence(), 3);
         assert_eq!(status.read_pointer().expect("read pointer"), 0);
+    }
+
+    #[test]
+    fn links_command_and_status_queue_read_pointers() {
+        let message = encode_gsp_rpc_with_sequences(
+            NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            0,
+            0,
+            b"static-info",
+        )
+        .expect("rpc");
+        let mut command_queue = vec![0u8; NVIDIA_GSP_SHARED_QUEUE_BYTES];
+        let mut status_queue = vec![0u8; NVIDIA_GSP_SHARED_QUEUE_BYTES];
+        write_le_u32(
+            &mut command_queue,
+            NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET,
+            62,
+        );
+        write_le_u32(
+            &mut status_queue,
+            NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET,
+            61,
+        );
+        {
+            let mut queues =
+                GspQueuePair::new(&mut command_queue, &mut status_queue).expect("queue pair");
+            assert_eq!(queues.write_command_message(&message).expect("enqueue"), 0);
+        }
+        assert_eq!(
+            read_le_u32(&command_queue, NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET),
+            0
+        );
+        let status_offset = queue_slot_offset(0).expect("status slot");
+        status_queue[status_offset..status_offset + NVIDIA_GSP_PAGE_SIZE].copy_from_slice(&message);
+        write_le_u32(
+            &mut status_queue,
+            NVIDIA_GSP_QUEUE_TX_WRITE_POINTER_OFFSET,
+            1,
+        );
+        {
+            let mut queues =
+                GspQueuePair::new(&mut command_queue, &mut status_queue).expect("queue pair");
+            let received = queues
+                .try_receive_status_message()
+                .expect("receive")
+                .expect("status message");
+            assert_eq!(received, message);
+        }
+        assert_eq!(
+            read_le_u32(&command_queue, NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET),
+            1
+        );
+        assert_eq!(
+            read_le_u32(&status_queue, NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET),
+            61
+        );
     }
 
     #[test]
