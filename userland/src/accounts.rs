@@ -13,6 +13,7 @@ pub struct Account {
     pub uid: u64,
     pub gid: u64,
     pub password_digest: [u8; 32],
+    pub administrator: bool,
 }
 
 impl Account {
@@ -22,6 +23,7 @@ impl Account {
         uid: 0,
         gid: 0,
         password_digest: [0; 32],
+        administrator: false,
     };
 
     pub fn username(&self) -> &[u8] {
@@ -56,6 +58,12 @@ impl AccountStore {
             .copied()
             .find(|account| account.uid == uid && account.gid == gid)
     }
+
+    pub fn is_administrator(&self, uid: u64, gid: u64) -> bool {
+        self.accounts[..self.count]
+            .iter()
+            .any(|account| account.uid == uid && account.gid == gid && account.administrator)
+    }
 }
 
 pub fn update_password(
@@ -87,6 +95,17 @@ pub fn add_account(
     gid: u64,
     password_digest: [u8; 32],
 ) -> bool {
+    add_account_with_role(store, username, uid, gid, password_digest, false)
+}
+
+pub fn add_account_with_role(
+    store: &mut AccountStore,
+    username: &[u8],
+    uid: u64,
+    gid: u64,
+    password_digest: [u8; 32],
+    administrator: bool,
+) -> bool {
     if store.count >= MAX_ACCOUNTS
         || username.is_empty()
         || username.len() > ACCOUNT_USERNAME_LENGTH
@@ -105,6 +124,7 @@ pub fn add_account(
     account.uid = uid;
     account.gid = gid;
     account.password_digest = password_digest;
+    account.administrator = administrator;
     store.accounts[store.count] = account;
     store.count += 1;
     true
@@ -163,7 +183,18 @@ pub fn serialize(store: &AccountStore, output: &mut [u8; ACCOUNT_DATABASE_LENGTH
                 return false;
             }
         }
-        if !append_byte(&mut record, &mut length, b'\n') {
+        if !append_byte(&mut record, &mut length, b'|')
+            || !append_bytes(
+                &mut record,
+                &mut length,
+                if account.administrator {
+                    b"admin"
+                } else {
+                    b"user"
+                },
+            )
+            || !append_byte(&mut record, &mut length, b'\n')
+        {
             return false;
         }
         let start = index * ACCOUNT_RECORD_LENGTH;
@@ -193,7 +224,6 @@ fn parse_record(record: &[u8]) -> Option<Account> {
         || first > ACCOUNT_USERNAME_LENGTH
         || !valid_username(&record[..first])
         || third + 1 >= record.len()
-        || record[third + 1..].contains(&b'|')
     {
         return None;
     }
@@ -202,7 +232,25 @@ fn parse_record(record: &[u8]) -> Option<Account> {
     if !(1000..=u32::MAX as u64).contains(&uid) || !(1000..=u32::MAX as u64).contains(&gid) {
         return None;
     }
-    let digest_bytes = &record[third + 1..];
+    let digest_start = third + 1;
+    let (digest_end, administrator) = if record[digest_start..].len() == 64 {
+        // Records written before roles existed treated UID 1000 as the administrator. Preserve
+        // that policy while allowing the store to migrate on its next write.
+        (record.len(), uid == 1000)
+    } else {
+        let role_separator = record[digest_start..]
+            .iter()
+            .position(|byte| *byte == b'|')
+            .and_then(|offset| offset.checked_add(digest_start))?;
+        let role = &record[role_separator + 1..];
+        let administrator = match role {
+            b"admin" => true,
+            b"user" => false,
+            _ => return None,
+        };
+        (role_separator, administrator)
+    };
+    let digest_bytes = &record[digest_start..digest_end];
     if digest_bytes.len() != 64 {
         return None;
     }
@@ -212,6 +260,7 @@ fn parse_record(record: &[u8]) -> Option<Account> {
         uid,
         gid,
         password_digest: [0; 32],
+        administrator,
     };
     account.username[..first].copy_from_slice(&record[..first]);
     for (index, pair) in digest_bytes.chunks_exact(2).enumerate() {
@@ -317,6 +366,7 @@ mod tests {
         assert_eq!(store.count, 1);
         assert_eq!(store.accounts[0].username(), b"user");
         assert_eq!(store.accounts[0].uid, 1000);
+        assert!(store.accounts[0].administrator);
         let mut bytes = [0u8; ACCOUNT_DATABASE_LENGTH];
         assert!(serialize(&store, &mut bytes));
         assert_eq!(
@@ -344,6 +394,42 @@ mod tests {
         invalid[..first.len()].copy_from_slice(first);
         invalid[first.len()..first.len() + duplicate.len()].copy_from_slice(duplicate);
         assert!(parse(&invalid).is_none());
+    }
+
+    #[test]
+    fn serializes_and_authenticates_explicit_account_roles() {
+        let mut store = AccountStore::empty();
+        assert!(add_account_with_role(
+            &mut store,
+            b"admin",
+            1000,
+            1000,
+            password_digest(b"admin-pass"),
+            true,
+        ));
+        assert!(add_account_with_role(
+            &mut store,
+            b"alice",
+            1001,
+            1001,
+            password_digest(b"alice-pass"),
+            false,
+        ));
+        let mut bytes = [0u8; ACCOUNT_DATABASE_LENGTH];
+        assert!(serialize(&store, &mut bytes));
+        let parsed = parse(&bytes).unwrap();
+        assert!(parsed.is_administrator(1000, 1000));
+        assert!(!parsed.is_administrator(1001, 1001));
+        assert!(verify_password(
+            &parsed,
+            1000,
+            &password_digest(b"admin-pass")
+        ));
+        assert!(verify_password(
+            &parsed,
+            1001,
+            &password_digest(b"alice-pass")
+        ));
     }
 
     #[test]

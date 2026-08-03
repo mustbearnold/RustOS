@@ -13,9 +13,10 @@ const ADMIN_PATH: &[u8] = b"/sbin/admin\0";
 const REQUEST_HEADER_LENGTH: usize = 8;
 const ADMIN_PASSWORD_LENGTH: usize = 32;
 const REQUEST_LENGTH: usize =
-    REQUEST_HEADER_LENGTH + ADMIN_PASSWORD_LENGTH + ACCOUNT_USERNAME_LENGTH + 32;
+    REQUEST_HEADER_LENGTH + ADMIN_PASSWORD_LENGTH + ACCOUNT_USERNAME_LENGTH + 32 + 1;
 const USERNAME_BUFFER_LENGTH: usize = ACCOUNT_USERNAME_LENGTH + 1;
 const PASSWORD_BUFFER_LENGTH: usize = 64;
+const ROLE_BUFFER_LENGTH: usize = 8;
 const REQUEST_ADD_ACCOUNT: [u8; REQUEST_HEADER_LENGTH] = *b"ADDUSER\0";
 
 #[unsafe(no_mangle)]
@@ -50,6 +51,13 @@ pub extern "C" fn _start() -> ! {
         &mut skip_lf,
     );
     write_stdout(b"\n");
+    let mut role = [0u8; ROLE_BUFFER_LENGTH];
+    let role_length = read_line(
+        b"useradd: role (user/admin): ",
+        &mut role,
+        true,
+        &mut skip_lf,
+    );
     if admin_password_length == 0 {
         write_stdout(b"useradd: admin password is empty\n");
         exit(2);
@@ -64,6 +72,14 @@ pub extern "C" fn _start() -> ! {
         write_stdout(b"useradd: passwords do not match\n");
         exit(4);
     }
+    let administrator = if role[..role_length] == *b"admin" {
+        1
+    } else if role[..role_length] == *b"user" {
+        0
+    } else {
+        write_stdout(b"useradd: role must be user or admin\n");
+        exit(5);
+    };
 
     let mut request = [0u8; REQUEST_LENGTH];
     request[..REQUEST_HEADER_LENGTH].copy_from_slice(&REQUEST_ADD_ACCOUNT);
@@ -73,32 +89,33 @@ pub extern "C" fn _start() -> ! {
     let username_start = REQUEST_HEADER_LENGTH + ADMIN_PASSWORD_LENGTH;
     request[username_start..username_start + username_length]
         .copy_from_slice(&username[..username_length]);
-    request[username_start + ACCOUNT_USERNAME_LENGTH..]
+    request[username_start + ACCOUNT_USERNAME_LENGTH..][..32]
         .copy_from_slice(&password_digest(&password[..password_length]));
+    *request.last_mut().unwrap() = administrator;
 
     let handles = pipe();
     if is_syscall_error(handles.read) || is_syscall_error(handles.write) {
         write_stdout(b"useradd: helper pipe failed\n");
-        exit(5);
+        exit(6);
     }
     let pid = spawn_privileged_redirected(ADMIN_PATH, handles.read, SPAWN_INHERIT_PARENT_FD);
     if is_syscall_error(pid) {
         let _ = close(handles.read);
         let _ = close(handles.write);
         write_stdout(b"useradd: helper unavailable\n");
-        exit(6);
+        exit(7);
     }
     let count = write(handles.write, &request);
     let _ = close(handles.write);
     let _ = close(handles.read);
     if is_syscall_error(count) || count != REQUEST_LENGTH as u64 {
         write_stdout(b"useradd: request failed\n");
-        exit(7);
+        exit(8);
     }
     let result = waitpid(pid);
     if is_syscall_error(result.pid) || result.status != 0 {
         write_stdout(b"useradd: account creation failed\n");
-        exit(8);
+        exit(9);
     }
     write_stdout(b"useradd: account created status=ready\n");
     exit(0);

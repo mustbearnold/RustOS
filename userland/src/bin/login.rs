@@ -4,7 +4,7 @@
 use rustos_userland::{
     SYSCALL_ENOENT,
     accounts::{
-        ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, add_account, parse,
+        ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, add_account_with_role, parse,
         password_digest, serialize, valid_username,
     },
     close, exit, is_syscall_error, mkdir, open, open_create_write, read, spawn_as, waitpid, write,
@@ -214,12 +214,13 @@ fn setup_first_account() -> Option<AccountStore> {
         }
 
         let mut accounts = AccountStore::empty();
-        if !add_account(
+        if !add_account_with_role(
             &mut accounts,
             &username[..username_length],
             FIRST_ACCOUNT_UID,
             FIRST_ACCOUNT_GID,
             password_digest(&password[..password_length]),
+            true,
         ) {
             write_stdout(b"login: first account rejected\n");
             return None;

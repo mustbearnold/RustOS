@@ -163,6 +163,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             let logout_proof = arguments
                 .iter()
                 .any(|argument| argument == "--logout-proof");
+            let role_proof = arguments.iter().any(|argument| argument == "--role-proof");
             let virtio_gpu_proof = arguments
                 .iter()
                 .any(|argument| argument == "--virtio-gpu-proof");
@@ -235,6 +236,9 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             }
             if logout_proof && mode != ImageMode::Desktop {
                 return Err("--logout-proof requires --desktop".to_owned());
+            }
+            if role_proof && mode != ImageMode::Desktop {
+                return Err("--role-proof requires --desktop".to_owned());
             }
             if virtio_gpu_proof && mode != ImageMode::Desktop {
                 return Err("--virtio-gpu-proof requires --desktop".to_owned());
@@ -334,6 +338,27 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 return Err(
                     "--logout-proof cannot be combined with another runtime proof".to_owned(),
                 );
+            }
+            if role_proof
+                && (keyboard_proof
+                    || shell_proof
+                    || pipe_proof
+                    || desktop_proof
+                    || terminal_proof
+                    || account_proof
+                    || logout_proof
+                    || virtio_gpu_proof
+                    || poweroff_proof
+                    || reboot_proof
+                    || suspend_proof
+                    || smp_proof
+                    || any_audio_proof
+                    || virtio_network_proof
+                    || nvme_interrupt_proof
+                    || ahci_interrupt_proof
+                    || vm_proof)
+            {
+                return Err("--role-proof cannot be combined with another runtime proof".to_owned());
             }
             if virtio_gpu_proof
                 && (keyboard_proof
@@ -453,6 +478,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 terminal_proof,
                 account_proof,
                 logout_proof,
+                role_proof,
                 virtio_gpu_proof,
                 poweroff_proof,
                 reboot_proof,
@@ -1491,6 +1517,7 @@ fn run(
     terminal_proof: bool,
     account_proof: bool,
     logout_proof: bool,
+    role_proof: bool,
     virtio_gpu_proof: bool,
     poweroff_proof: bool,
     reboot_proof: bool,
@@ -1531,6 +1558,7 @@ fn run(
         || desktop_proof
         || account_proof
         || logout_proof
+        || role_proof
         || (mode == ImageMode::Shell && keyboard_proof))
         .then(|| {
             let timestamp = SystemTime::now()
@@ -1707,7 +1735,8 @@ fn run(
         || virtio_gpu_proof
         || terminal_proof
         || account_proof
-        || logout_proof)
+        || logout_proof
+        || role_proof)
         .then(|| {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1895,6 +1924,15 @@ fn run(
                             .clone(),
                         firmware == "uefi",
                     )
+                } else if role_proof {
+                    spawn_role_proof(
+                        path.clone(),
+                        screenshot.clone(),
+                        serial_path
+                            .as_ref()
+                            .expect("role proof serial path exists")
+                            .clone(),
+                    )
                 } else if terminal_proof {
                     spawn_terminal_proof(
                         path.clone(),
@@ -1953,6 +1991,7 @@ fn run(
         || terminal_proof
         || account_proof
         || logout_proof
+        || role_proof
         || desktop_proof
     {
         if let Some(proof_thread) = proof_thread {
@@ -2088,6 +2127,17 @@ fn run(
             .as_deref()
             .ok_or_else(|| "logout proof screenshot path was not created".to_owned())?;
         if let Err(error) = verify_logout_proof(serial, screenshot) {
+            result = Err(error);
+        }
+    }
+    if result.is_ok() && role_proof {
+        let serial = serial_path
+            .as_deref()
+            .ok_or_else(|| "role proof serial path was not created".to_owned())?;
+        let screenshot = screenshot_path
+            .as_deref()
+            .ok_or_else(|| "role proof screenshot path was not created".to_owned())?;
+        if let Err(error) = verify_role_proof(serial, screenshot) {
             result = Err(error);
         }
     }
@@ -3860,6 +3910,44 @@ fn verify_logout_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_role_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(serial)
+        .map_err(|error| format!("reading role proof serial {}: {error}", serial.display()))?;
+    let required = [
+        "terminal: useradd role prompt=ready",
+        "terminal: administrator account created status=ready",
+        "login: username selected name=bob status=ready",
+        "login: authenticated username=bob status=ready",
+        "desktop: credentials uid=1001 gid=1001 status=ready",
+        "terminal: sudo state set status=ready",
+        "desktop: session clients reaped status=ready",
+        "login: session exited status=ready",
+    ];
+    if !required.iter().all(|marker| content.contains(marker)) {
+        return Err(format!(
+            "role proof serial did not contain the administrator-role creation, login, authorization, and logout markers: {}",
+            serial.display()
+        ));
+    }
+    let screenshot_bytes = fs::read(screenshot).map_err(|error| {
+        format!(
+            "reading role proof screenshot {}: {error}",
+            screenshot.display()
+        )
+    })?;
+    if !screenshot_bytes.starts_with(b"P6\n") || screenshot_bytes.len() <= 64 {
+        return Err(format!(
+            "role proof screenshot is not a valid non-empty PPM image: {}",
+            screenshot.display()
+        ));
+    }
+    println!(
+        "role proof: administrator_created=true administrator_login=true privileged_allowed=true logout=true screenshot_bytes={} status=ready",
+        screenshot_bytes.len()
+    );
+    Ok(())
+}
+
 fn verify_desktop_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
     let content = fs::read_to_string(serial)
         .map_err(|error| format!("reading desktop proof serial {}: {error}", serial.display()))?;
@@ -4379,6 +4467,12 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                 && send_account_input(&mut monitor, "alice-pass")
                 && wait_for_serial_markers(
                     &serial,
+                    &["terminal: useradd role prompt=ready"],
+                    Duration::from_secs(30),
+                )
+                && send_account_input(&mut monitor, "user")
+                && wait_for_serial_markers(
+                    &serial,
                     &["terminal: useradd account created status=ready"],
                     Duration::from_secs(30),
                 );
@@ -4455,6 +4549,9 @@ fn spawn_account_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> J
                         "login: username selected name=alice status=ready",
                         "login: authenticated username=alice status=ready",
                         "login: session authenticated number=2 status=ready",
+                        "desktop: credentials uid=1001 gid=1001 status=ready",
+                        "desktop: compositor framebuffer=ready scene=ready status=ready",
+                        "terminal: client surface=ready shell=spawned focus=ready status=ready",
                     ],
                     Duration::from_secs(30),
                 )
@@ -4586,6 +4683,7 @@ fn capture_account_proof_screenshot(monitor: &mut UnixStream, screenshot: &Path)
 
 #[cfg(unix)]
 fn prove_non_admin_sudo_denied(monitor: &mut UnixStream, serial: &Path) -> bool {
+    thread::sleep(Duration::from_secs(1));
     send_account_command(monitor, "sudo state set")
         && wait_for_serial_markers(
             serial,
@@ -4662,6 +4760,133 @@ fn spawn_logout_proof(
         );
         println!("logout proof: login_boundary={logged_out}");
         thread::sleep(Duration::from_secs(1));
+        let _ = monitor.write_all(b"quit\n");
+    })
+}
+
+#[cfg(unix)]
+fn spawn_role_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> JoinHandle<()> {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(8));
+        let Some(mut monitor) = connect_monitor(&path) else {
+            println!("role proof: monitor=false");
+            return;
+        };
+        if !send_login_credentials(&mut monitor, &serial) {
+            return;
+        }
+        let first_ready = wait_for_serial_markers(
+            &serial,
+            &[
+                "desktop: compositor framebuffer=ready scene=ready status=ready",
+                "terminal: client surface=ready shell=spawned focus=ready status=ready",
+            ],
+            Duration::from_secs(90),
+        );
+        println!("role proof: first_session={first_ready}");
+        if !first_ready {
+            let _ = monitor.write_all(b"quit\n");
+            return;
+        }
+
+        let administrator_created = send_account_command(&mut monitor, "sudo useradd")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: useradd admin password prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "rustos")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: useradd username prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "bob")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: useradd password prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "bob-pass")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: useradd confirm prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "bob-pass")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: useradd role prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "admin")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: administrator account created status=ready"],
+                Duration::from_secs(30),
+            );
+        println!("role proof: administrator_created={administrator_created}");
+        if !administrator_created
+            || !send_account_input(&mut monitor, "exit")
+            || !wait_for_serial_occurrences(
+                &serial,
+                "login: session exited status=ready",
+                1,
+                Duration::from_secs(30),
+            )
+        {
+            let _ = monitor.write_all(b"quit\n");
+            return;
+        }
+
+        let bob_login = send_login_command(&mut monitor, "bob")
+            && send_login_command(&mut monitor, "bob-pass")
+            && wait_for_serial_markers(
+                &serial,
+                &[
+                    "login: username selected name=bob status=ready",
+                    "login: authenticated username=bob status=ready",
+                    "login: session authenticated number=2 status=ready",
+                    "desktop: credentials uid=1001 gid=1001 status=ready",
+                    "terminal: client surface=ready shell=spawned focus=ready status=ready",
+                ],
+                Duration::from_secs(90),
+            );
+        println!("role proof: administrator_login={bob_login}");
+        if !bob_login {
+            let _ = monitor.write_all(b"quit\n");
+            return;
+        }
+        let _ = monitor.write_all(format!("screendump {}\n", screenshot.display()).as_bytes());
+        thread::sleep(Duration::from_secs(1));
+        let privileged_allowed = send_account_command(&mut monitor, "sudo state set")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: sudo password prompt=ready"],
+                Duration::from_secs(30),
+            )
+            && send_account_input(&mut monitor, "bob-pass")
+            && wait_for_serial_markers(
+                &serial,
+                &["terminal: sudo state set status=ready"],
+                Duration::from_secs(30),
+            );
+        println!("role proof: privileged_allowed={privileged_allowed}");
+        if privileged_allowed {
+            let _ = send_account_input(&mut monitor, "exit");
+            let _ = wait_for_serial_occurrences(
+                &serial,
+                "desktop: session clients reaped status=ready",
+                2,
+                Duration::from_secs(30),
+            );
+            let _ = wait_for_serial_occurrences(
+                &serial,
+                "login: session exited status=ready",
+                2,
+                Duration::from_secs(30),
+            );
+        }
         let _ = monitor.write_all(b"quit\n");
     })
 }
@@ -4816,6 +5041,11 @@ fn spawn_logout_proof(
     _serial: PathBuf,
     _uefi: bool,
 ) -> JoinHandle<()> {
+    thread::spawn(|| {})
+}
+
+#[cfg(not(unix))]
+fn spawn_role_proof(_path: PathBuf, _screenshot: PathBuf, _serial: PathBuf) -> JoinHandle<()> {
     thread::spawn(|| {})
 }
 
@@ -5471,6 +5701,9 @@ fn print_usage() {
     println!("  --account-proof    verify first-boot account setup and logout/reload persistence");
     println!(
         "  --logout-proof     click the desktop logout control and verify login-boundary return"
+    );
+    println!(
+        "  --role-proof       create a secondary administrator and verify role-aware sudo authorization"
     );
     println!("  --virtio-gpu-proof require a virtio-gpu scanout and desktop frame proof");
     println!("  --partitioned      use a GPT EFI + FAT32 RustOS root image (UEFI only)");

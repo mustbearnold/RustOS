@@ -5,7 +5,7 @@ use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, SPAWN_INHERIT_PARENT_FD,
     accounts::{
         ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, ACCOUNT_USERNAME_LENGTH, AccountStore,
-        MAX_ACCOUNTS, add_account, parse, serialize, update_password, valid_username,
+        MAX_ACCOUNTS, add_account_with_role, parse, serialize, update_password, valid_username,
         verify_password,
     },
     close, exit, get_caller_credentials, is_syscall_error, mkdir, open, open_create_write,
@@ -15,7 +15,7 @@ use rustos_userland::{
 const STDIN_FD: u64 = 0;
 const FIXED_REQUEST_LENGTH: usize = 8;
 const PASSWORD_REQUEST_TAIL_LENGTH: usize = 8 + 32 + 32;
-const ADD_ACCOUNT_REQUEST_TAIL_LENGTH: usize = 32 + ACCOUNT_USERNAME_LENGTH + 32;
+const ADD_ACCOUNT_REQUEST_TAIL_LENGTH: usize = 32 + ACCOUNT_USERNAME_LENGTH + 32 + 1;
 const AUTH_REQUEST_TAIL_LENGTH: usize = 8 + 32;
 const AUTH_DIGEST_LENGTH: usize = 32;
 const ACCOUNT_WRITE_CHUNK_LENGTH: usize = 256;
@@ -175,8 +175,13 @@ fn add_account_request(caller: Credentials) -> i64 {
         write_stdout(b"admin: account username invalid\n");
         return 21;
     }
+    let role = *tail.last().unwrap_or(&2);
+    if role > 1 {
+        write_stdout(b"admin: account role invalid\n");
+        return 26;
+    }
     let mut password_digest = [0u8; 32];
-    password_digest.copy_from_slice(&tail[username_end..]);
+    password_digest.copy_from_slice(&tail[username_end..username_end + 32]);
     let Some(mut store) = read_store() else {
         write_stdout(b"admin: account store unavailable\n");
         return 22;
@@ -185,7 +190,7 @@ fn add_account_request(caller: Credentials) -> i64 {
         write_stdout(b"admin: account capacity exhausted\n");
         return 23;
     };
-    if !add_account(&mut store, username, uid, uid, password_digest) {
+    if !add_account_with_role(&mut store, username, uid, uid, password_digest, role == 1) {
         write_stdout(b"admin: account creation rejected\n");
         return 24;
     }
@@ -197,10 +202,11 @@ fn add_account_request(caller: Credentials) -> i64 {
         write_stdout(b"admin: account store reread failed\n");
         return 26;
     };
-    if verified
-        .find_username(username)
-        .is_none_or(|account| account.uid != uid || account.password_digest != password_digest)
-    {
+    if verified.find_username(username).is_none_or(|account| {
+        account.uid != uid
+            || account.password_digest != password_digest
+            || account.administrator != (role == 1)
+    }) {
         write_stdout(b"admin: account store verification failed\n");
         return 27;
     }
@@ -208,7 +214,11 @@ fn add_account_request(caller: Credentials) -> i64 {
     write_stdout(username);
     write_stdout(b" uid=");
     write_decimal(uid);
-    write_stdout(b" status=ready\n");
+    write_stdout(if role == 1 {
+        b" role=admin status=ready\n"
+    } else {
+        b" role=user status=ready\n"
+    });
     0
 }
 
@@ -296,18 +306,22 @@ fn authorize_admin(caller: Credentials, digest: &[u8; AUTH_DIGEST_LENGTH]) -> bo
     if caller.uid == 0 {
         return true;
     }
-    if caller.uid != 1000 {
-        write_stdout(b"admin: authorization denied status=denied\n");
-        return false;
-    }
     let Some(store) = read_store() else {
         write_stdout(b"admin: account store unavailable status=denied\n");
         return false;
     };
-    if verify_password(&store, 1000, digest) {
+    if store.accounts[..store.count].iter().any(|account| {
+        account.uid == caller.uid
+            && account.gid == caller.gid
+            && account.administrator
+            && account.password_digest == *digest
+    }) {
         true
-    } else {
+    } else if store.is_administrator(caller.uid, caller.gid) {
         write_stdout(b"admin: authorization failed status=denied\n");
+        false
+    } else {
+        write_stdout(b"admin: authorization denied status=denied\n");
         false
     }
 }

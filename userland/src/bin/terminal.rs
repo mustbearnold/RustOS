@@ -140,6 +140,9 @@ pub extern "C" fn _start() -> ! {
     let mut useradd_username_reported = false;
     let mut useradd_password_reported = false;
     let mut useradd_confirm_reported = false;
+    let mut useradd_role_reported = false;
+    let mut administrator_created_reported = false;
+    let mut sudo_state_set_reported = false;
     let mut useradd_created_reported = false;
     let mut lock_prompt_reported = false;
     let mut lock_failure_reported = false;
@@ -326,6 +329,21 @@ pub extern "C" fn _start() -> ! {
             if !useradd_confirm_reported && transcript.contains(b"useradd: retype password: ") {
                 write_stdout(b"terminal: useradd confirm prompt=ready\n");
                 useradd_confirm_reported = true;
+            }
+            if !useradd_role_reported && transcript.contains(b"useradd: role (user/admin): ") {
+                write_stdout(b"terminal: useradd role prompt=ready\n");
+                useradd_role_reported = true;
+            }
+            if !administrator_created_reported
+                && transcript.contains(b"admin: account created username=")
+                && transcript.contains(b"role=admin status=ready")
+            {
+                write_stdout(b"terminal: administrator account created status=ready\n");
+                administrator_created_reported = true;
+            }
+            if !sudo_state_set_reported && transcript.contains(b"sudo: state set status=ready") {
+                write_stdout(b"terminal: sudo state set status=ready\n");
+                sudo_state_set_reported = true;
             }
             if !useradd_created_reported
                 && (transcript.contains(b"useradd: account created status=ready")
