@@ -3,7 +3,8 @@
 
 use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, NET_MAX_BUFFER_LENGTH, NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE,
-    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SEEK_END, SPAWN_INHERIT_FD,
+    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SEEK_END, SEEK_SET,
+    SPAWN_INHERIT_FD,
     accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse, password_digest},
     close, exit, get_credentials, is_permission_error, is_syscall_error, list_files,
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
@@ -144,7 +145,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir rmdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv grow poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir rmdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv open-proof grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -299,6 +300,9 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if let Some(arguments) = argument_after(line, b"mv ") {
         move_file(state, arguments);
+        write_prompt(recovery_mode, state);
+    } else if line == b"open-proof" {
+        prove_open_file_lifecycle(state);
         write_prompt(recovery_mode, state);
     } else if line == b"grow" {
         grow_large_file(state);
@@ -1257,6 +1261,100 @@ fn move_file(state: &ShellState, arguments: &[u8]) {
         write_stdout(b" to=");
         write_stdout(destination.as_bytes());
         write_stdout(b" status=ready\n");
+    }
+}
+
+fn prove_open_file_lifecycle(state: &ShellState) {
+    let Some(path) = resolve_command_path(state, b"open-handle") else {
+        write_stdout(b"open-proof: path too long\n");
+        return;
+    };
+    let Some(renamed) = resolve_command_path(state, b"renamed-open-handle") else {
+        write_stdout(b"open-proof: path too long\n");
+        return;
+    };
+    let mut path_buffer = [0u8; MAX_PATH_LENGTH];
+    let mut renamed_buffer = [0u8; MAX_PATH_LENGTH];
+    let (Some(path_bytes), Some(renamed_bytes)) = (
+        path.write_nul(&mut path_buffer),
+        renamed.write_nul(&mut renamed_buffer),
+    ) else {
+        write_stdout(b"open-proof: path too long\n");
+        return;
+    };
+
+    let _ = unlink(path_bytes);
+    let _ = unlink(renamed_bytes);
+    let handle = open_resolved_path(&path, OPEN_CREATE | OPEN_WRITE);
+    if is_syscall_error(handle) {
+        write_stdout(b"open-proof: open failed\n");
+        return;
+    }
+
+    let mut ok = write(handle, b"before") == 6;
+    let observer = if ok {
+        open_resolved_path(&path, OPEN_WRITE)
+    } else {
+        u64::MAX
+    };
+    if is_syscall_error(observer) {
+        ok = false;
+    }
+    if ok {
+        ok = seek(observer, 0, SEEK_END) == 6;
+    }
+    if ok {
+        ok = rename(path_bytes, renamed_bytes) == 0;
+    }
+    let mut contents = [0u8; 6];
+    if ok {
+        ok = seek(handle, 0, SEEK_SET) == 0;
+    }
+    if ok {
+        let count = read(handle, &mut contents);
+        ok = count == 6 && contents == *b"before";
+    }
+    if ok {
+        ok = unlink(renamed_bytes) == 0;
+    }
+    if ok {
+        ok = seek(handle, 0, SEEK_SET) == 0;
+    }
+    if ok {
+        ok = write(handle, b"after") == 5;
+    }
+    if ok {
+        ok = seek(handle, 0, SEEK_SET) == 0;
+    }
+    if ok {
+        contents = [0; 6];
+        let count = read(handle, &mut contents[..5]);
+        ok = count == 5 && contents[..5] == *b"after";
+    }
+    if is_syscall_error(close(handle)) {
+        ok = false;
+    }
+    if !is_syscall_error(observer) {
+        if ok {
+            ok = seek(observer, 0, SEEK_SET) == 0;
+        }
+        if ok {
+            contents = [0; 6];
+            let count = read(observer, &mut contents[..5]);
+            ok = count == 5 && contents[..5] == *b"after";
+        }
+        if is_syscall_error(close(observer)) {
+            ok = false;
+        }
+    }
+    if path_kind(&path).is_some() || path_kind(&renamed).is_some() {
+        ok = false;
+    }
+
+    if ok {
+        write_stdout(b"shell: open-file lifecycle status=ready\n");
+    } else {
+        write_stdout(b"open-proof: lifecycle failed\n");
     }
 }
 

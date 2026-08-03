@@ -2329,6 +2329,7 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "rmdir nonempty",
                 "shell: rmdir path=/home/user/work/nonempty status=ready",
             ),
+            ("open-proof", "shell: open-file lifecycle status=ready"),
             ("ls", "shell: ls path=/home/user/work status=ready"),
             (
                 "cat /etc/rustos/config.txt",
@@ -3743,6 +3744,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: remove path=/home/user/work/renamed-note status=ready",
         "shell: rmdir path=/home/user/work/empty status=ready",
         "shell: rmdir path=/home/user/work/nonempty status=ready",
+        "shell: open-file lifecycle status=ready",
         "shell: ls path=/home/user/work status=ready",
         "shell: ps status=ready",
         "shell: relative read path=/etc/rustos/config.txt status=ready",
@@ -3777,6 +3779,12 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || content
             .lines()
             .any(|line| line.trim_end_matches('\r') == "nonempty 0 dir")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "open-handle 0 data")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "renamed-open-handle 0 data")
         || !content.contains("large.bin 131072 data")
         || !content.contains("boot=1")
         || !content.contains("admin: state set status=ready")

@@ -15,6 +15,38 @@ use spin::{Mutex, Once};
 #[cfg(target_os = "none")]
 static RUNTIME_FILESYSTEM: Once<Mutex<FatFileSystem<StorageDisk>>> = Once::new();
 
+#[cfg(target_os = "none")]
+pub type RuntimeFileId = u64;
+
+#[cfg(target_os = "none")]
+#[derive(Clone, Copy)]
+struct RuntimeFileObject {
+    id: RuntimeFileId,
+    entry: FatFileEntry,
+    directory: Option<FatDirectoryRef>,
+    slot: Option<FatDirectorySlot>,
+    open_count: usize,
+}
+
+#[cfg(target_os = "none")]
+struct RuntimeFileObjectTable {
+    next_id: RuntimeFileId,
+    entries: Vec<RuntimeFileObject>,
+}
+
+#[cfg(target_os = "none")]
+impl RuntimeFileObjectTable {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+static RUNTIME_FILE_OBJECTS: Once<Mutex<RuntimeFileObjectTable>> = Once::new();
+
 const ATA_LBA28_CAPABILITY: u16 = 1 << 9;
 const ATA_LBA48_CAPABILITY: u16 = 1 << 10;
 const MBR_PARTITION_TABLE_OFFSET: usize = 446;
@@ -1773,6 +1805,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
         self.create_directory_in_directory(parent, long_name, short_name)
     }
 
+    #[cfg_attr(target_os = "none", allow(dead_code))]
     pub fn unlink_file_path(&mut self, path: &[u8]) -> Result<(), FatFileSystemError<D::Error>> {
         let located = self
             .locate_path_entry(path)?
@@ -1781,11 +1814,26 @@ impl<D: BlockDevice> FatFileSystem<D> {
             return Err(FatFileSystemError::NotRegularFile);
         }
 
+        self.remove_file_directory_entry(located, true)
+    }
+
+    fn remove_file_directory_entry(
+        &mut self,
+        located: LocatedFatEntry,
+        release_clusters: bool,
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        if !located.entry.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+
         self.write_cursor = None;
         let clusters = self.collect_cluster_chain(located.entry.first_cluster)?;
         self.delete_directory_slots(&located.long_name_slots)?;
         self.write_directory_slot_deleted(located.slot)?;
-        self.release_cluster_chain(&clusters)
+        if release_clusters {
+            self.release_cluster_chain(&clusters)?;
+        }
+        Ok(())
     }
 
     pub fn remove_directory_path(
@@ -2418,6 +2466,127 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok((count, end_size))
     }
 
+    /// Write to a regular file whose directory entry has already been unlinked. The cluster
+    /// chain remains owned by the open-file object, so this path updates only the in-memory file
+    /// identity and never writes through a directory slot that may have been reused.
+    fn write_file_range_growing_detached(
+        &mut self,
+        file: FatFileEntry,
+        offset: u64,
+        buffer: &[u8],
+    ) -> Result<(usize, FatFileEntry), FatFileSystemError<D::Error>> {
+        if !file.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+        if file.attributes & FAT_ATTRIBUTE_READ_ONLY != 0 {
+            return Err(FatFileSystemError::ReadOnlyFile);
+        }
+
+        self.write_cursor = None;
+        let file_size = u64::from(file.size);
+        if buffer.is_empty() {
+            return Ok((0, file));
+        }
+        let end = offset.checked_add(buffer.len() as u64).ok_or(
+            FatFileSystemError::FileWriteOutOfBounds {
+                offset,
+                length: buffer.len() as u64,
+                size: file_size,
+            },
+        )?;
+        let end_size = usize::try_from(end).unwrap_or(usize::MAX);
+        if end_size > MAX_MUTABLE_FILE_SIZE {
+            return Err(FatFileSystemError::FileTooLarge {
+                size: end_size,
+                max_size: MAX_MUTABLE_FILE_SIZE,
+            });
+        }
+        if end <= file_size {
+            let count = self.write_file_range(file, offset, buffer)?;
+            return Ok((count, file));
+        }
+
+        let old_chain = self.collect_cluster_chain(file.first_cluster)?;
+        if file_size != 0 && old_chain.is_empty() {
+            return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
+        }
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let required_clusters = end
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let old_cluster_count =
+            u64::try_from(old_chain.len()).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let additional_clusters = required_clusters.saturating_sub(old_cluster_count);
+        let appended_size = usize::try_from(
+            additional_clusters
+                .checked_mul(cluster_bytes)
+                .ok_or(FatFileSystemError::InvalidGeometry)?,
+        )
+        .map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let appended_clusters = self.allocate_cluster_chain(appended_size)?;
+        for cluster in appended_clusters.iter().copied() {
+            if let Err(error) = self.zero_cluster(cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+
+        let old_last_cluster = old_chain.last().copied();
+        if let Some(new_first_cluster) = appended_clusters.first().copied()
+            && let Some(old_last_cluster) = old_last_cluster
+            && let Err(error) = self.set_fat_entry(old_last_cluster, new_first_cluster)
+        {
+            let _ = self.release_cluster_chain(&appended_clusters);
+            return Err(error);
+        }
+
+        let first_cluster = old_chain
+            .first()
+            .copied()
+            .or_else(|| appended_clusters.first().copied())
+            .unwrap_or(0);
+        let grown_file = FatFileEntry {
+            first_cluster,
+            size: u32::try_from(end).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+            ..file
+        };
+
+        if offset > file_size {
+            let mut gap_offset = file_size;
+            let mut gap_remaining = offset - file_size;
+            let zeroes = [0u8; SECTOR_SIZE];
+            while gap_remaining != 0 {
+                let count = core::cmp::min(gap_remaining, zeroes.len() as u64) as usize;
+                if let Err(error) = self.write_file_range(grown_file, gap_offset, &zeroes[..count])
+                {
+                    self.rollback_detached_file_growth(old_last_cluster, &appended_clusters);
+                    return Err(error);
+                }
+                gap_offset += count as u64;
+                gap_remaining -= count as u64;
+            }
+        }
+
+        let count = match self.write_file_range(grown_file, offset, buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                self.rollback_detached_file_growth(old_last_cluster, &appended_clusters);
+                return Err(error);
+            }
+        };
+        Ok((count, grown_file))
+    }
+
+    fn rollback_detached_file_growth(&mut self, old_last_cluster: Option<u32>, appended: &[u32]) {
+        if let Some(old_last_cluster) = old_last_cluster {
+            let _ = self.set_fat_entry(old_last_cluster, self.end_of_chain_value());
+        }
+        let _ = self.release_cluster_chain(appended);
+    }
+
     fn zero_file_range(
         &mut self,
         file: FatFileEntry,
@@ -2620,6 +2789,144 @@ impl<D: BlockDevice> FatFileSystem<D> {
             last_cluster,
         });
         Ok(new_size)
+    }
+
+    /// Resize a file whose directory entry has already been unlinked. The caller owns the
+    /// returned file identity and will release its final chain when the last descriptor closes.
+    fn resize_file_detached(
+        &mut self,
+        file: FatFileEntry,
+        new_size: usize,
+    ) -> Result<FatFileEntry, FatFileSystemError<D::Error>> {
+        if !file.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+        if file.attributes & FAT_ATTRIBUTE_READ_ONLY != 0 {
+            return Err(FatFileSystemError::ReadOnlyFile);
+        }
+        if new_size > MAX_MUTABLE_FILE_SIZE {
+            return Err(FatFileSystemError::FileTooLarge {
+                size: new_size,
+                max_size: MAX_MUTABLE_FILE_SIZE,
+            });
+        }
+
+        let old_size =
+            usize::try_from(file.size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        if new_size == old_size {
+            return Ok(file);
+        }
+        self.write_cursor = None;
+
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let old_chain = self.collect_cluster_chain(file.first_cluster)?;
+        if old_size != 0 && old_chain.is_empty() {
+            return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
+        }
+
+        if new_size < old_size {
+            let required_clusters = if new_size == 0 {
+                0
+            } else {
+                usize::try_from(
+                    u64::try_from(new_size)
+                        .map_err(|_| FatFileSystemError::InvalidGeometry)?
+                        .div_ceil(cluster_bytes),
+                )
+                .map_err(|_| FatFileSystemError::InvalidGeometry)?
+            };
+            if required_clusters > old_chain.len() {
+                return Err(FatFileSystemError::UnexpectedEndOfChain {
+                    cluster: old_chain.last().copied().unwrap_or(0),
+                });
+            }
+
+            if new_size != 0 {
+                let retained_capacity = u64::try_from(required_clusters)
+                    .map_err(|_| FatFileSystemError::InvalidGeometry)?
+                    .checked_mul(cluster_bytes)
+                    .ok_or(FatFileSystemError::InvalidGeometry)?;
+                let zero_end = core::cmp::min(u64::from(file.size), retained_capacity);
+                if u64::try_from(new_size).unwrap() < zero_end {
+                    self.zero_file_range(file, u64::try_from(new_size).unwrap(), zero_end)?;
+                }
+            }
+
+            let retained_first = old_chain.first().copied().unwrap_or(0);
+            let retained_last = required_clusters
+                .checked_sub(1)
+                .and_then(|index| old_chain.get(index).copied());
+            let released = &old_chain[required_clusters..];
+            if let Some(last_cluster) = retained_last
+                && !released.is_empty()
+            {
+                self.set_fat_entry(last_cluster, self.end_of_chain_value())?;
+            }
+            self.release_cluster_chain(released)?;
+            return Ok(FatFileEntry {
+                first_cluster: retained_first,
+                size: u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+                ..file
+            });
+        }
+
+        let old_size_u64 =
+            u64::try_from(old_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let new_size_u64 =
+            u64::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let required_clusters = new_size_u64
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let old_cluster_count =
+            u64::try_from(old_chain.len()).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let additional_clusters = required_clusters.saturating_sub(old_cluster_count);
+        let appended_size = usize::try_from(
+            additional_clusters
+                .checked_mul(cluster_bytes)
+                .ok_or(FatFileSystemError::InvalidGeometry)?,
+        )
+        .map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let appended_clusters = self.allocate_cluster_chain(appended_size)?;
+        for cluster in appended_clusters.iter().copied() {
+            if let Err(error) = self.zero_cluster(cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+
+        let old_last_cluster = old_chain.last().copied();
+        if let Some(new_first_cluster) = appended_clusters.first().copied()
+            && let Some(old_last_cluster) = old_last_cluster
+            && let Err(error) = self.set_fat_entry(old_last_cluster, new_first_cluster)
+        {
+            let _ = self.release_cluster_chain(&appended_clusters);
+            return Err(error);
+        }
+
+        let first_cluster = old_chain
+            .first()
+            .copied()
+            .or_else(|| appended_clusters.first().copied())
+            .unwrap_or(0);
+        let resized_file = FatFileEntry {
+            first_cluster,
+            size: u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+            ..file
+        };
+        let old_capacity = old_cluster_count
+            .checked_mul(cluster_bytes)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let zero_end = core::cmp::min(new_size_u64, old_capacity);
+        if old_size_u64 < zero_end {
+            if let Err(error) = self.zero_file_range(resized_file, old_size_u64, zero_end) {
+                self.rollback_detached_file_growth(old_last_cluster, &appended_clusters);
+                return Err(error);
+            }
+        }
+        Ok(resized_file)
     }
 
     /// Replace the contents of an existing regular root file, allocating a fresh bounded cluster
@@ -2908,6 +3215,16 @@ impl<D: BlockDevice> FatFileSystem<D> {
         self.read_volume_sector(slot.relative_sector, &mut sector)?;
         sector[slot.offset..slot.offset + FAT_DIRECTORY_ENTRY_SIZE].copy_from_slice(entry);
         self.write_volume_sector(slot.relative_sector, &sector)
+    }
+
+    fn read_directory_slot_file(
+        &mut self,
+        slot: FatDirectorySlot,
+    ) -> Result<Option<FatFileEntry>, FatFileSystemError<D::Error>> {
+        let mut sector = [0u8; SECTOR_SIZE];
+        self.read_volume_sector(slot.relative_sector, &mut sector)?;
+        parse_fat_directory_entry(&sector[slot.offset..slot.offset + FAT_DIRECTORY_ENTRY_SIZE])
+            .map_err(FatFileSystemError::DirectoryEntry)
     }
 
     fn write_directory_slot_deleted(
@@ -4020,6 +4337,155 @@ pub fn probe_kernel_file(
 }
 
 #[cfg(target_os = "none")]
+fn runtime_file_objects() -> Option<&'static Mutex<RuntimeFileObjectTable>> {
+    RUNTIME_FILE_OBJECTS.call_once(|| Mutex::new(RuntimeFileObjectTable::new()));
+    RUNTIME_FILE_OBJECTS.get()
+}
+
+#[cfg(target_os = "none")]
+fn same_directory_slot(
+    left_directory: Option<FatDirectoryRef>,
+    left_slot: Option<FatDirectorySlot>,
+    right_directory: FatDirectoryRef,
+    right_slot: FatDirectorySlot,
+) -> bool {
+    left_directory == Some(right_directory)
+        && left_slot.is_some_and(|slot| {
+            slot.relative_sector == right_slot.relative_sector && slot.offset == right_slot.offset
+        })
+}
+
+#[cfg(target_os = "none")]
+pub fn open_runtime_file(
+    path: &[u8],
+    create: bool,
+) -> Result<Option<(RuntimeFileId, usize, bool)>, ()> {
+    let objects = runtime_file_objects().ok_or(())?;
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut objects = objects.lock();
+    let mut filesystem = filesystem.lock();
+    let (located, created) = match filesystem.locate_path_entry(path) {
+        Ok(Some(located)) => (located, false),
+        Ok(None) if create => {
+            if let Err(error) = filesystem.create_file_path(path, &[]) {
+                crate::kprintln!(
+                    "storage: runtime open create failed path={:?} error={:?} status=degraded",
+                    path,
+                    error
+                );
+                return Err(());
+            }
+            let located = match filesystem.locate_path_entry(path) {
+                Ok(Some(located)) => located,
+                Ok(None) => return Err(()),
+                Err(error) => {
+                    crate::kprintln!(
+                        "storage: runtime open locate-after-create failed path={:?} error={:?} status=degraded",
+                        path,
+                        error
+                    );
+                    return Err(());
+                }
+            };
+            (located, true)
+        }
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime open lookup failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            return Err(());
+        }
+    };
+    if !located.entry.is_regular_file() {
+        return Err(());
+    }
+    let size = usize::try_from(located.entry.size).map_err(|_| ())?;
+    if let Some(object) = objects.entries.iter_mut().find(|object| {
+        same_directory_slot(
+            object.directory,
+            object.slot,
+            located.directory,
+            located.slot,
+        )
+    }) {
+        object.entry = located.entry;
+        object.open_count = object.open_count.checked_add(1).ok_or(())?;
+        return Ok(Some((object.id, size, created)));
+    }
+
+    let id = objects.next_id;
+    objects.next_id = objects.next_id.checked_add(1).ok_or(())?;
+    objects.entries.push(RuntimeFileObject {
+        id,
+        entry: located.entry,
+        directory: Some(located.directory),
+        slot: Some(located.slot),
+        open_count: 1,
+    });
+    Ok(Some((id, size, created)))
+}
+
+#[cfg(target_os = "none")]
+pub fn retain_runtime_file(id: RuntimeFileId) -> bool {
+    let Some(objects) = runtime_file_objects() else {
+        return false;
+    };
+    let mut objects = objects.lock();
+    let Some(object) = objects.entries.iter_mut().find(|object| object.id == id) else {
+        return false;
+    };
+    let Some(open_count) = object.open_count.checked_add(1) else {
+        return false;
+    };
+    object.open_count = open_count;
+    true
+}
+
+#[cfg(target_os = "none")]
+pub fn release_runtime_file(id: RuntimeFileId) {
+    let Some(objects) = runtime_file_objects() else {
+        return;
+    };
+    let detached = {
+        let mut objects = objects.lock();
+        let Some(index) = objects.entries.iter().position(|object| object.id == id) else {
+            return;
+        };
+        if objects.entries[index].open_count > 1 {
+            objects.entries[index].open_count -= 1;
+            return;
+        }
+        let object = objects.entries.swap_remove(index);
+        object.slot.is_none().then_some(object.entry)
+    };
+    let Some(file) = detached else {
+        return;
+    };
+    let Some(filesystem) = RUNTIME_FILESYSTEM.get() else {
+        return;
+    };
+    let mut filesystem = filesystem.lock();
+    let Ok(clusters) = filesystem.collect_cluster_chain(file.first_cluster) else {
+        crate::kprintln!(
+            "storage: detached close chain lookup failed id={} first_cluster={} status=degraded",
+            id,
+            file.first_cluster
+        );
+        return;
+    };
+    if let Err(error) = filesystem.release_cluster_chain(&clusters) {
+        crate::kprintln!(
+            "storage: detached close chain release failed id={} error={:?} status=degraded",
+            id,
+            error
+        );
+    }
+}
+
+#[cfg(target_os = "none")]
 pub fn read_runtime_file(path: &[u8], offset: u64, buffer: &mut [u8]) -> Result<usize, ()> {
     use crate::vfs::FileSystem;
 
@@ -4030,6 +4496,49 @@ pub fn read_runtime_file(path: &[u8], offset: u64, buffer: &mut [u8]) -> Result<
 }
 
 #[cfg(target_os = "none")]
+pub fn read_runtime_open_file(
+    id: RuntimeFileId,
+    offset: u64,
+    buffer: &mut [u8],
+) -> Result<usize, ()> {
+    let objects = runtime_file_objects().ok_or(())?;
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let objects = objects.lock();
+    let entry = objects
+        .entries
+        .iter()
+        .find(|object| object.id == id)
+        .map(|object| object.entry)
+        .ok_or(())?;
+    let mut filesystem = filesystem.lock();
+    filesystem
+        .read_file_range(entry, offset, buffer)
+        .map_err(|error| {
+            crate::kprintln!(
+                "storage: runtime open read failed id={} offset={} bytes={} error={:?} status=degraded",
+                id,
+                offset,
+                buffer.len(),
+                error
+            );
+        })
+}
+
+#[cfg(target_os = "none")]
+pub fn runtime_open_file_size(id: RuntimeFileId) -> Result<usize, ()> {
+    let objects = runtime_file_objects().ok_or(())?;
+    let objects = objects.lock();
+    let entry = objects
+        .entries
+        .iter()
+        .find(|object| object.id == id)
+        .map(|object| object.entry)
+        .ok_or(())?;
+    usize::try_from(entry.size).map_err(|_| ())
+}
+
+#[cfg(target_os = "none")]
+#[allow(dead_code)]
 pub fn runtime_file_size(path: &[u8]) -> Result<Option<usize>, ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
@@ -4080,6 +4589,7 @@ pub fn runtime_file_snapshot() -> Result<Vec<(Vec<u8>, usize)>, ()> {
 }
 
 #[cfg(target_os = "none")]
+#[allow(dead_code)]
 pub fn create_runtime_file(path: &[u8], contents: &[u8]) -> Result<usize, ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
@@ -4151,6 +4661,63 @@ pub fn write_runtime_file(path: &[u8], offset: u64, buffer: &[u8]) -> Result<(us
 }
 
 #[cfg(target_os = "none")]
+pub fn write_runtime_open_file(
+    id: RuntimeFileId,
+    offset: u64,
+    buffer: &[u8],
+) -> Result<(usize, usize), ()> {
+    let objects = runtime_file_objects().ok_or(())?;
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut objects = objects.lock();
+    let mut filesystem = filesystem.lock();
+    let Some(index) = objects.entries.iter().position(|object| object.id == id) else {
+        return Err(());
+    };
+    let entry = objects.entries[index].entry;
+    let slot = objects.entries[index].slot;
+    let result = if let Some(slot) = slot {
+        let (count, _) = filesystem
+            .write_file_range_growing(slot, entry, offset, buffer)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime open write failed id={} offset={} bytes={} error={:?} status=degraded",
+                    id,
+                    offset,
+                    buffer.len(),
+                    error
+                );
+            })?;
+        let updated = filesystem
+            .read_directory_slot_file(slot)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime open write metadata reread failed id={} error={:?} status=degraded",
+                    id,
+                    error
+                );
+            })?
+            .ok_or(())?;
+        (count, updated)
+    } else {
+        filesystem
+            .write_file_range_growing_detached(entry, offset, buffer)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime detached write failed id={} offset={} bytes={} error={:?} status=degraded",
+                    id,
+                    offset,
+                    buffer.len(),
+                    error
+                );
+            })?
+    };
+    let size = usize::try_from(result.1.size).map_err(|_| ())?;
+    objects.entries[index].entry = result.1;
+    Ok((result.0, size))
+}
+
+#[cfg(target_os = "none")]
+#[allow(dead_code)]
 pub fn truncate_runtime_file(path: &[u8], new_size: usize) -> Result<usize, ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
@@ -4184,20 +4751,97 @@ pub fn truncate_runtime_file(path: &[u8], new_size: usize) -> Result<usize, ()> 
 }
 
 #[cfg(target_os = "none")]
-pub fn unlink_runtime_file(path: &[u8]) -> Result<(), ()> {
+pub fn truncate_runtime_open_file(id: RuntimeFileId, new_size: usize) -> Result<usize, ()> {
+    let objects = runtime_file_objects().ok_or(())?;
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut objects = objects.lock();
     let mut filesystem = filesystem.lock();
-    match filesystem.unlink_file_path(path) {
-        Ok(()) => Ok(()),
+    let Some(index) = objects.entries.iter().position(|object| object.id == id) else {
+        return Err(());
+    };
+    let entry = objects.entries[index].entry;
+    let slot = objects.entries[index].slot;
+    let updated = if let Some(slot) = slot {
+        filesystem
+            .resize_file_at(slot, entry, new_size)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime open truncate failed id={} size={} error={:?} status=degraded",
+                    id,
+                    new_size,
+                    error
+                );
+            })?;
+        filesystem
+            .read_directory_slot_file(slot)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime open truncate metadata reread failed id={} error={:?} status=degraded",
+                    id,
+                    error
+                );
+            })?
+            .ok_or(())?
+    } else {
+        filesystem
+            .resize_file_detached(entry, new_size)
+            .map_err(|error| {
+                crate::kprintln!(
+                    "storage: runtime detached truncate failed id={} size={} error={:?} status=degraded",
+                    id,
+                    new_size,
+                    error
+                );
+            })?
+    };
+    let size = usize::try_from(updated.size).map_err(|_| ())?;
+    objects.entries[index].entry = updated;
+    Ok(size)
+}
+
+#[cfg(target_os = "none")]
+pub fn unlink_runtime_file(path: &[u8]) -> Result<(), ()> {
+    let objects = runtime_file_objects().ok_or(())?;
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut objects = objects.lock();
+    let mut filesystem = filesystem.lock();
+    let located = match filesystem.locate_path_entry(path) {
+        Ok(Some(located)) => located,
+        Ok(None) => return Err(()),
         Err(error) => {
             crate::kprintln!(
-                "storage: runtime unlink failed path={:?} error={:?} status=degraded",
+                "storage: runtime unlink lookup failed path={:?} error={:?} status=degraded",
                 path,
                 error
             );
-            Err(())
+            return Err(());
         }
+    };
+    if !located.entry.is_regular_file() {
+        return Err(());
     }
+    let object_index = objects.entries.iter().position(|object| {
+        same_directory_slot(
+            object.directory,
+            object.slot,
+            located.directory,
+            located.slot,
+        )
+    });
+    let keep_clusters = object_index.is_some();
+    if let Err(error) = filesystem.remove_file_directory_entry(located, !keep_clusters) {
+        crate::kprintln!(
+            "storage: runtime unlink failed path={:?} error={:?} status=degraded",
+            path,
+            error
+        );
+        return Err(());
+    }
+    if let Some(index) = object_index {
+        objects.entries[index].directory = None;
+        objects.entries[index].slot = None;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "none")]
@@ -4219,20 +4863,59 @@ pub fn remove_runtime_directory(path: &[u8]) -> Result<(), ()> {
 
 #[cfg(target_os = "none")]
 pub fn rename_runtime_file(source: &[u8], destination: &[u8]) -> Result<(), ()> {
+    let objects = runtime_file_objects().ok_or(())?;
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut objects = objects.lock();
     let mut filesystem = filesystem.lock();
-    match filesystem.rename_file_path(source, destination) {
-        Ok(()) => Ok(()),
+    let source_entry = match filesystem.locate_path_entry(source) {
+        Ok(Some(located)) => located,
+        Ok(None) => return Err(()),
         Err(error) => {
             crate::kprintln!(
-                "storage: runtime rename failed source={:?} destination={:?} error={:?} status=degraded",
+                "storage: runtime rename lookup failed source={:?} destination={:?} error={:?} status=degraded",
                 source,
                 destination,
                 error
             );
-            Err(())
+            return Err(());
         }
+    };
+    let object_index = objects.entries.iter().position(|object| {
+        same_directory_slot(
+            object.directory,
+            object.slot,
+            source_entry.directory,
+            source_entry.slot,
+        )
+    });
+    if let Err(error) = filesystem.rename_file_path(source, destination) {
+        crate::kprintln!(
+            "storage: runtime rename failed source={:?} destination={:?} error={:?} status=degraded",
+            source,
+            destination,
+            error
+        );
+        return Err(());
     }
+    if let Some(index) = object_index {
+        let destination_entry = match filesystem.locate_path_entry(destination) {
+            Ok(Some(located)) => located,
+            Ok(None) => return Err(()),
+            Err(error) => {
+                crate::kprintln!(
+                    "storage: runtime rename destination reread failed source={:?} destination={:?} error={:?} status=degraded",
+                    source,
+                    destination,
+                    error
+                );
+                return Err(());
+            }
+        };
+        objects.entries[index].entry = destination_entry.entry;
+        objects.entries[index].directory = Some(destination_entry.directory);
+        objects.entries[index].slot = Some(destination_entry.slot);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "none")]
@@ -5172,6 +5855,81 @@ mod tests {
         );
         assert!(regrown_readback[..400].iter().all(|byte| *byte == 0x5a));
         assert!(regrown_readback[400..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn keeps_an_unlinked_file_identity_alive_without_corrupting_slot_reuse() {
+        let (disk, partition, boot) = test_fat16_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        let contents = vec![0x11; 600];
+        filesystem
+            .create_file_path(b"/DETACHED.TXT", &contents)
+            .unwrap();
+
+        filesystem
+            .rename_file_path(b"/DETACHED.TXT", b"/RENAMED.TXT")
+            .unwrap();
+        let located = filesystem
+            .locate_path_entry(b"/RENAMED.TXT")
+            .unwrap()
+            .unwrap();
+        let renamed_identity = located.entry;
+        let mut renamed_readback = vec![0u8; contents.len()];
+        assert_eq!(
+            filesystem.read_file_range(renamed_identity, 0, &mut renamed_readback),
+            Ok(contents.len())
+        );
+        assert_eq!(renamed_readback, contents);
+
+        filesystem
+            .remove_file_directory_entry(located, false)
+            .unwrap();
+        assert!(
+            filesystem
+                .locate_path_entry(b"/RENAMED.TXT")
+                .unwrap()
+                .is_none()
+        );
+
+        let replacement = filesystem
+            .create_root_file(*b"RENAMED TXT", b"slot")
+            .unwrap();
+        let (written, detached_after_write) = filesystem
+            .write_file_range_growing_detached(renamed_identity, 1_200, b"tail")
+            .unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(detached_after_write.size, 1_204);
+        let mut detached_readback = vec![0xffu8; 1_204];
+        assert_eq!(
+            filesystem.read_file_range(detached_after_write, 0, &mut detached_readback),
+            Ok(1_204)
+        );
+        assert!(
+            detached_readback[..contents.len()]
+                .iter()
+                .all(|byte| *byte == 0x11)
+        );
+        assert!(
+            detached_readback[contents.len()..1_200]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(&detached_readback[1_200..], b"tail");
+
+        let detached_shrunk = filesystem
+            .resize_file_detached(detached_after_write, 256)
+            .unwrap();
+        assert_eq!(detached_shrunk.size, 256);
+        let mut replacement_readback = [0u8; 4];
+        assert_eq!(
+            filesystem.read_file_range(replacement, 0, &mut replacement_readback),
+            Ok(4)
+        );
+        assert_eq!(&replacement_readback, b"slot");
+        let detached_chain = filesystem
+            .collect_cluster_chain(detached_shrunk.first_cluster)
+            .unwrap();
+        filesystem.release_cluster_chain(&detached_chain).unwrap();
     }
 
     #[test]

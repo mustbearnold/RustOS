@@ -1149,7 +1149,7 @@ enum ProcessHandle {
         writable: bool,
     },
     Disk {
-        path: &'static [u8],
+        id: crate::storage::RuntimeFileId,
         offset: usize,
         size: usize,
         writable: bool,
@@ -1172,52 +1172,57 @@ enum FileHandleSnapshot {
         writable: bool,
     },
     Disk {
-        path: &'static [u8],
+        id: crate::storage::RuntimeFileId,
         offset: usize,
-        size: usize,
         writable: bool,
     },
 }
 
 #[cfg(target_os = "none")]
 fn retain_process_handle(handle: ProcessHandle) -> bool {
-    let ProcessHandle::Pipe { id, readable } = handle else {
-        return true;
-    };
-    let Some(slot) = PIPE_TABLE.get(usize::from(id)) else {
-        return false;
-    };
-    let mut pipe = slot.lock();
-    let Some(pipe) = pipe.as_mut() else {
-        return false;
-    };
-    if readable {
-        pipe.readers = pipe.readers.saturating_add(1);
-    } else {
-        pipe.writers = pipe.writers.saturating_add(1);
+    match handle {
+        ProcessHandle::Pipe { id, readable } => {
+            let Some(slot) = PIPE_TABLE.get(usize::from(id)) else {
+                return false;
+            };
+            let mut pipe = slot.lock();
+            let Some(pipe) = pipe.as_mut() else {
+                return false;
+            };
+            if readable {
+                pipe.readers = pipe.readers.saturating_add(1);
+            } else {
+                pipe.writers = pipe.writers.saturating_add(1);
+            }
+            true
+        }
+        ProcessHandle::Disk { id, .. } => crate::storage::retain_runtime_file(id),
+        ProcessHandle::Console | ProcessHandle::File { .. } => true,
     }
-    true
 }
 
 #[cfg(target_os = "none")]
 fn release_process_handle(handle: ProcessHandle) {
-    let ProcessHandle::Pipe { id, readable } = handle else {
-        return;
-    };
-    let Some(slot) = PIPE_TABLE.get(usize::from(id)) else {
-        return;
-    };
-    let mut pipe = slot.lock();
-    let Some(pipe_state) = pipe.as_mut() else {
-        return;
-    };
-    if readable {
-        pipe_state.readers = pipe_state.readers.saturating_sub(1);
-    } else {
-        pipe_state.writers = pipe_state.writers.saturating_sub(1);
-    }
-    if pipe_state.readers == 0 && pipe_state.writers == 0 {
-        *pipe = None;
+    match handle {
+        ProcessHandle::Pipe { id, readable } => {
+            let Some(slot) = PIPE_TABLE.get(usize::from(id)) else {
+                return;
+            };
+            let mut pipe = slot.lock();
+            let Some(pipe_state) = pipe.as_mut() else {
+                return;
+            };
+            if readable {
+                pipe_state.readers = pipe_state.readers.saturating_sub(1);
+            } else {
+                pipe_state.writers = pipe_state.writers.saturating_sub(1);
+            }
+            if pipe_state.readers == 0 && pipe_state.writers == 0 {
+                *pipe = None;
+            }
+        }
+        ProcessHandle::Disk { id, .. } => crate::storage::release_runtime_file(id),
+        ProcessHandle::Console | ProcessHandle::File { .. } => {}
     }
 }
 
@@ -1279,12 +1284,21 @@ impl ProcessHandleTable {
         Self { entries }
     }
 
-    fn duplicate(&self) -> Self {
-        let duplicate = *self;
-        for handle in duplicate.entries.iter().flatten().copied() {
-            let _ = retain_process_handle(handle);
+    fn duplicate(&self) -> Option<Self> {
+        let mut duplicate = Self {
+            entries: [None; MAX_PROCESS_HANDLES],
+        };
+        for (index, handle) in self.entries.iter().copied().enumerate() {
+            let Some(handle) = handle else {
+                continue;
+            };
+            if !retain_process_handle(handle) {
+                duplicate.release_all();
+                return None;
+            }
+            duplicate.entries[index] = Some(handle);
         }
-        duplicate
+        Some(duplicate)
     }
 
     fn redirected(&self, stdin_fd: u64, stdout_fd: u64) -> Result<Self, SpawnError> {
@@ -2752,12 +2766,17 @@ impl Process {
         Some((read_index as u64, write_index as u64))
     }
 
-    fn install_disk_handle(&self, path: &'static [u8], size: usize, writable: bool) -> Option<u64> {
+    fn install_disk_handle(
+        &self,
+        id: crate::storage::RuntimeFileId,
+        size: usize,
+        writable: bool,
+    ) -> Option<u64> {
         let mut handles = self.handles.lock();
         for index in 3..MAX_PROCESS_HANDLES {
             if handles.entries[index].is_none() {
                 handles.entries[index] = Some(ProcessHandle::Disk {
-                    path,
+                    id,
                     offset: 0,
                     size,
                     writable,
@@ -2788,14 +2807,13 @@ impl Process {
                 writable,
             }),
             Some(ProcessHandle::Disk {
-                path,
+                id,
                 offset,
-                size,
                 writable,
+                ..
             }) => Some(FileHandleSnapshot::Disk {
-                path,
+                id,
                 offset,
-                size,
                 writable,
             }),
             Some(ProcessHandle::Pipe { id, readable }) => {
@@ -3701,7 +3719,9 @@ fn fork_for_syscall(frame: &mut SyscallFrame) -> u64 {
         // stable for the lifetime of the guest.
         let parent = unsafe { &*parent_pointer };
         let context = fork_context_from_syscall(frame);
-        let handles = parent.handles.lock().duplicate();
+        let Some(mut handles) = parent.handles.lock().duplicate() else {
+            return SYSCALL_EAGAIN;
+        };
         let address_space = match clone_user_address_space(&parent.address_space) {
             Ok(address_space) => address_space,
             Err(error) => {
@@ -3709,6 +3729,7 @@ fn fork_for_syscall(frame: &mut SyscallFrame) -> u64 {
                     "process: fork address-space clone failed ({:?}) status=degraded",
                     error
                 );
+                handles.release_all();
                 return SYSCALL_EAGAIN;
             }
         };
@@ -3870,20 +3891,16 @@ fn write_for_syscall(frame: &mut SyscallFrame) {
         frame.rax = SYSCALL_EBADF;
         return;
     }
-    let (path, offset, writable, disk_backed) = match handle {
+    let (offset, writable) = match handle {
         FileHandleSnapshot::Catalog {
-            path,
             offset,
             persistent,
             writable,
             ..
-        } => (path, offset, persistent && writable, false),
+        } => (offset, persistent && writable),
         FileHandleSnapshot::Disk {
-            path,
-            offset,
-            writable,
-            ..
-        } => (path, offset, writable, true),
+            offset, writable, ..
+        } => (offset, writable),
         FileHandleSnapshot::Pipe { .. } => unreachable!("pipe write handled above"),
     };
     if !writable {
@@ -3898,13 +3915,22 @@ fn write_for_syscall(frame: &mut SyscallFrame) {
         frame.rax = SYSCALL_EFAULT;
         return;
     }
-    let Ok((count, new_size)) =
-        crate::storage::write_runtime_file(path, offset as u64, &bytes[..length])
-    else {
+    let result = match handle {
+        FileHandleSnapshot::Catalog { path, .. } => {
+            crate::storage::write_runtime_file(path, offset as u64, &bytes[..length])
+        }
+        FileHandleSnapshot::Disk { id, .. } => {
+            crate::storage::write_runtime_open_file(id, offset as u64, &bytes[..length])
+        }
+        FileHandleSnapshot::Pipe { .. } => unreachable!("pipe write handled above"),
+    };
+    let Ok((count, new_size)) = result else {
         frame.rax = SYSCALL_EAGAIN;
         return;
     };
-    if disk_backed && !process.update_disk_handle_size(frame.rdi, new_size) {
+    if matches!(handle, FileHandleSnapshot::Disk { .. })
+        && !process.update_disk_handle_size(frame.rdi, new_size)
+    {
         frame.rax = SYSCALL_EBADF;
         return;
     }
@@ -3932,7 +3958,13 @@ fn seek_for_syscall(frame: &mut SyscallFrame) {
     };
     let (current, size) = match handle {
         FileHandleSnapshot::Catalog { offset, image, .. } => (offset, image.len()),
-        FileHandleSnapshot::Disk { offset, size, .. } => (offset, size),
+        FileHandleSnapshot::Disk { id, offset, .. } => {
+            let Ok(size) = crate::storage::runtime_open_file_size(id) else {
+                frame.rax = SYSCALL_EAGAIN;
+                return;
+            };
+            (offset, size)
+        }
         FileHandleSnapshot::Pipe { .. } => {
             frame.rax = SYSCALL_EBADF;
             return;
@@ -3989,7 +4021,7 @@ fn truncate_for_syscall(frame: &mut SyscallFrame) {
         frame.rax = SYSCALL_EBADF;
         return;
     };
-    let FileHandleSnapshot::Disk { path, writable, .. } = handle else {
+    let FileHandleSnapshot::Disk { id, writable, .. } = handle else {
         frame.rax = match handle {
             FileHandleSnapshot::Pipe { .. } => SYSCALL_EBADF,
             FileHandleSnapshot::Catalog { .. } => SYSCALL_EROFS,
@@ -4001,7 +4033,7 @@ fn truncate_for_syscall(frame: &mut SyscallFrame) {
         frame.rax = SYSCALL_EROFS;
         return;
     }
-    if crate::storage::truncate_runtime_file(path, new_size).is_err() {
+    if crate::storage::truncate_runtime_open_file(id, new_size).is_err() {
         frame.rax = SYSCALL_EAGAIN;
         return;
     }
@@ -4200,20 +4232,19 @@ fn open_for_syscall(user_path: u64, flags: u64) -> u64 {
             {
                 return SYSCALL_EPERM;
             }
-            let (size, created) = match crate::storage::runtime_file_size(&path[..path_length]) {
-                Ok(Some(size)) => (size, false),
-                Ok(None) if create_requested => {
-                    match crate::storage::create_runtime_file(&path[..path_length], &[]) {
-                        Ok(size) => (size, true),
-                        Err(()) => return SYSCALL_EAGAIN,
-                    }
+            let (id, size, created) =
+                match crate::storage::open_runtime_file(&path[..path_length], create_requested) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return SYSCALL_ENOENT,
+                    Err(()) => return SYSCALL_EAGAIN,
+                };
+            let handle = process.install_disk_handle(id, size, writable);
+            if handle.is_none() {
+                crate::storage::release_runtime_file(id);
+                if created {
+                    let _ = crate::storage::unlink_runtime_file(&path[..path_length]);
                 }
-                Ok(None) => return SYSCALL_ENOENT,
-                Err(()) => return SYSCALL_EAGAIN,
-            };
-            let path: &'static [u8] = Box::leak(path[..path_length].to_vec().into_boxed_slice());
-            let handle = process.install_disk_handle(path, size, writable);
-            if created {
+            } else if created {
                 process.note_file_created();
             }
             handle
@@ -5432,19 +5463,23 @@ fn read_for_syscall(frame: &mut SyscallFrame, nonblocking: bool) {
             }
             (count, executable)
         }
-        FileHandleSnapshot::Disk {
-            path, offset, size, ..
-        } => {
-            let count = size.saturating_sub(offset).min(length);
-            let Ok(actual) =
-                crate::storage::read_runtime_file(path, offset as u64, &mut bytes[..count])
-            else {
+        FileHandleSnapshot::Disk { id, offset, .. } => {
+            let Ok(size) = crate::storage::runtime_open_file_size(id) else {
                 frame.rax = SYSCALL_EAGAIN;
                 return;
             };
-            if actual != count {
-                frame.rax = SYSCALL_EAGAIN;
-                return;
+            let count = size.saturating_sub(offset).min(length);
+            if count != 0 {
+                let Ok(actual) =
+                    crate::storage::read_runtime_open_file(id, offset as u64, &mut bytes[..count])
+                else {
+                    frame.rax = SYSCALL_EAGAIN;
+                    return;
+                };
+                if actual != count {
+                    frame.rax = SYSCALL_EAGAIN;
+                    return;
+                }
             }
             (count, false)
         }
