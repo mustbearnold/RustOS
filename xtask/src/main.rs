@@ -1,6 +1,8 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
-use rustos_gpu_protocol::{GspCachedArguments, GspFirmware, GspFmc, GspRpcMessage, encode_gsp_rpc};
+use rustos_gpu_protocol::{
+    GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspRpcMessage, encode_gsp_rpc,
+};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -100,6 +102,24 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 .map(PathBuf::from)
                 .ok_or_else(|| "nvidia-fmc-check requires a firmware path".to_owned())?;
             nvidia_fmc_check(&path)
+        }
+        Some("nvidia-gsp-bundle-check") => {
+            let version = arguments
+                .get(1)
+                .ok_or_else(|| "nvidia-gsp-bundle-check requires a firmware version".to_owned())?;
+            let gsp = arguments
+                .get(2)
+                .map(PathBuf::from)
+                .ok_or_else(|| "nvidia-gsp-bundle-check requires a GSP path".to_owned())?;
+            let fmc = arguments
+                .get(3)
+                .map(PathBuf::from)
+                .ok_or_else(|| "nvidia-gsp-bundle-check requires an FMC path".to_owned())?;
+            let bootloader = arguments
+                .get(4)
+                .map(PathBuf::from)
+                .ok_or_else(|| "nvidia-gsp-bundle-check requires a bootloader path".to_owned())?;
+            nvidia_gsp_bundle_check(version.as_bytes(), &gsp, &fmc, &bootloader)
         }
         Some("run") => {
             let firmware = arguments.get(1).map(String::as_str).ok_or_else(usage)?;
@@ -1169,8 +1189,7 @@ fn copy_partition(
 }
 
 fn nvidia_gsp_check(path: &Path) -> Result<(), String> {
-    let firmware = fs::read(path)
-        .map_err(|error| format!("reading NVIDIA GSP firmware {}: {error}", path.display()))?;
+    let firmware = read_firmware_blob(path)?;
     let descriptor = GspFirmware::parse(&firmware)
         .map_err(|error| format!("parsing NVIDIA GSP firmware {}: {error:?}", path.display()))?;
     let layout = descriptor
@@ -1260,11 +1279,45 @@ fn nvidia_fmc_check(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn nvidia_gsp_bundle_check(
+    expected_version: &[u8],
+    gsp_path: &Path,
+    fmc_path: &Path,
+    bootloader_path: &Path,
+) -> Result<(), String> {
+    let gsp = read_firmware_blob(gsp_path)?;
+    let fmc = read_firmware_blob(fmc_path)?;
+    let bootloader = read_firmware_blob(bootloader_path)?;
+    let bundle = GspFirmwareBundle::parse(&gsp, &fmc, &bootloader, expected_version)
+        .map_err(|error| format!("parsing NVIDIA GSP bundle: {error:?}"))?;
+    let layout = bundle
+        .gsp
+        .boot_layout()
+        .map_err(|error| format!("planning NVIDIA GSP bundle layout: {error:?}"))?;
+    println!(
+        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} status=ready",
+        String::from_utf8_lossy(expected_version),
+        gsp.len(),
+        bundle.gsp.image.size,
+        layout.radix3.image_pages,
+        fmc.len(),
+        bundle.fmc.image.size,
+        bootloader.len(),
+        bundle.bootloader.payload.size,
+        bundle.bootloader.descriptor.version,
+        bundle.bootloader.descriptor.app_version,
+        layout.radix3.total_bytes,
+    );
+    Ok(())
+}
+
 fn read_firmware_blob(path: &Path) -> Result<Vec<u8>, String> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| format!("resolving firmware {}: {error}", path.display()))?;
     if path.extension().is_some_and(|extension| extension == "zst") {
         let output = Command::new("zstd")
             .args(["--quiet", "--decompress", "--stdout"])
-            .arg(path)
+            .arg(&resolved)
             .output()
             .map_err(|error| format!("running zstd for {}: {error}", path.display()))?;
         if !output.status.success() {
@@ -1276,7 +1329,7 @@ fn read_firmware_blob(path: &Path) -> Result<Vec<u8>, String> {
         }
         return Ok(output.stdout);
     }
-    fs::read(path).map_err(|error| format!("reading firmware {}: {error}", path.display()))
+    fs::read(&resolved).map_err(|error| format!("reading firmware {}: {error}", path.display()))
 }
 
 fn check() -> Result<(), String> {
@@ -5962,7 +6015,7 @@ fn usage() -> String {
 }
 
 fn usage_text() -> &'static str {
-    "usage: cargo run -p rustos-xtask -- <build|check|nvidia-gsp-check|nvidia-fmc-check|run|install> ..."
+    "usage: cargo run -p rustos-xtask -- <build|check|nvidia-gsp-check|nvidia-fmc-check|nvidia-gsp-bundle-check|run|install> ..."
 }
 
 fn print_usage() {
@@ -5971,6 +6024,9 @@ fn print_usage() {
     println!("  check              check the host workspace and bare-metal kernel");
     println!("  nvidia-gsp-check PATH  validate an external NVIDIA GSP ELF and RPC marshalling");
     println!("  nvidia-fmc-check PATH  validate a GB20x GSP-FMC ELF and section CRCs");
+    println!(
+        "  nvidia-gsp-bundle-check VERSION GSP FMC BOOTLOADER  validate matching GB20x firmware"
+    );
     println!("  run bios|uefi      boot the image in QEMU with serial output");
     println!("  --shell            boot the shell-only init configuration");
     println!("  --recovery         boot the standalone recovery configuration");

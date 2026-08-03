@@ -2,8 +2,13 @@
 
 extern crate alloc;
 
+mod boot;
 mod fmc;
 
+pub use boot::{
+    GspBootloader, GspBootloaderError, GspFirmwareBundle, GspFirmwareBundleError, GspFmcBootParams,
+    GspRmDescriptorField, GspRmUcodeDescriptor, GspWprMeta,
+};
 pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection};
 
 use alloc::vec::Vec;
