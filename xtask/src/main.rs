@@ -2316,6 +2316,19 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "rm renamed-note",
                 "shell: remove path=/home/user/work/renamed-note status=ready",
             ),
+            ("mkdir empty", "mkdir: ok"),
+            (
+                "rmdir empty",
+                "shell: rmdir path=/home/user/work/empty status=ready",
+            ),
+            ("mkdir nonempty", "mkdir: ok"),
+            ("touch nonempty/child", "touch: ok"),
+            ("rmdir nonempty", "rmdir: failed"),
+            ("rm nonempty/child", "rm: ok"),
+            (
+                "rmdir nonempty",
+                "shell: rmdir path=/home/user/work/nonempty status=ready",
+            ),
             ("ls", "shell: ls path=/home/user/work status=ready"),
             (
                 "cat /etc/rustos/config.txt",
@@ -3728,6 +3741,8 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: rename from=/home/user/work/note to=/home/user/work/renamed-note status=ready",
         "shell: relative read path=/home/user/work/renamed-note status=ready",
         "shell: remove path=/home/user/work/renamed-note status=ready",
+        "shell: rmdir path=/home/user/work/empty status=ready",
+        "shell: rmdir path=/home/user/work/nonempty status=ready",
         "shell: ls path=/home/user/work status=ready",
         "shell: ps status=ready",
         "shell: relative read path=/etc/rustos/config.txt status=ready",
@@ -3756,6 +3771,12 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || content
             .lines()
             .any(|line| line.trim_end_matches('\r') == "renamed-note 9 data")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "empty 0 dir")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "nonempty 0 dir")
         || !content.contains("large.bin 131072 data")
         || !content.contains("boot=1")
         || !content.contains("admin: state set status=ready")

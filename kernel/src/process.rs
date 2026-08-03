@@ -85,6 +85,7 @@ pub const SYS_SEEK: u64 = 56;
 pub const SYS_TRUNCATE: u64 = 57;
 pub const SYS_UNLINK: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
+pub const SYS_RMDIR: u64 = 60;
 const PATH_INFO_LENGTH: usize = 16;
 const CREDENTIALS_LENGTH: usize = 16;
 const PATH_KIND_FILE: u64 = 1;
@@ -228,6 +229,7 @@ pub enum SyscallAction {
     Truncate,
     Unlink,
     Rename,
+    Rmdir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +269,8 @@ pub struct ProcessExit {
 /// writable runtime file using the new size in `rsi`, zero-filling extensions and releasing
 /// truncated FAT clusters; `SYS_UNLINK` removes a regular runtime file at the NUL-terminated path
 /// in `rdi`; `SYS_RENAME` moves a regular runtime file from the NUL-terminated path in `rdi` to
-/// the path in `rsi`; `SYS_THREAD_CREATE` starts the
+/// the path in `rsi`; `SYS_RMDIR` removes an empty runtime directory at the NUL-terminated path
+/// in `rdi`; `SYS_THREAD_CREATE` starts the
 /// executable entry point in the current address space with its argument in `rsi` and returns a
 /// thread identifier; `SYS_THREAD_JOIN` blocks until a same-process thread exits; and
 /// `SYS_THREAD_EXIT` exits the calling thread without terminating its process; `SYS_EXEC` replaces
@@ -337,6 +340,7 @@ pub fn dispatch_syscall(pid: ProcessId, frame: &mut SyscallFrame) -> SyscallActi
         SYS_TRUNCATE => SyscallAction::Truncate,
         SYS_UNLINK => SyscallAction::Unlink,
         SYS_RENAME => SyscallAction::Rename,
+        SYS_RMDIR => SyscallAction::Rmdir,
         SYS_THREAD_CREATE => SyscallAction::ThreadCreate,
         SYS_THREAD_JOIN => SyscallAction::ThreadJoin,
         SYS_THREAD_EXIT => SyscallAction::ThreadExit,
@@ -2358,6 +2362,7 @@ impl Thread {
             | SyscallAction::Truncate
             | SyscallAction::Unlink
             | SyscallAction::Rename
+            | SyscallAction::Rmdir
             | SyscallAction::ThreadCreate
             | SyscallAction::ThreadJoin
             | SyscallAction::Exec
@@ -3017,6 +3022,7 @@ impl Process {
             SyscallAction::Truncate => {}
             SyscallAction::Unlink => {}
             SyscallAction::Rename => {}
+            SyscallAction::Rmdir => {}
             SyscallAction::ThreadCreate => {}
             SyscallAction::ThreadJoin => {}
             SyscallAction::ThreadExit => {}
@@ -4038,6 +4044,43 @@ fn unlink_for_syscall(frame: &mut SyscallFrame) {
         return;
     }
     frame.rax = match crate::storage::unlink_runtime_file(&path[..path_length]) {
+        Ok(()) => 0,
+        Err(()) => SYSCALL_EAGAIN,
+    };
+}
+
+#[cfg(target_os = "none")]
+fn rmdir_for_syscall(frame: &mut SyscallFrame) {
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    let mut path = [0u8; MAX_EXECUTABLE_PATH_LENGTH];
+    let path_length = {
+        // SAFETY: the current process pointer was registered before entering user mode and its
+        // address space remains stable for the duration of this syscall.
+        let process = unsafe { &*pointer };
+        match process.address_space.copy_user_string(frame.rdi, &mut path) {
+            Ok(length) => length,
+            Err(error) => {
+                crate::kprintln!(
+                    "process: rmdir path copy failed ({:?}) status=degraded",
+                    error
+                );
+                frame.rax = SYSCALL_EFAULT;
+                return;
+            }
+        }
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    if !runtime_access_allowed(&path[..path_length], process.uid, AccessKind::Write) {
+        frame.rax = SYSCALL_EPERM;
+        return;
+    }
+    frame.rax = match crate::storage::remove_runtime_directory(&path[..path_length]) {
         Ok(()) => 0,
         Err(()) => SYSCALL_EAGAIN,
     };
@@ -6197,6 +6240,10 @@ fn dispatch_user_syscall(frame: &mut SyscallFrame) -> SyscallAction {
             rename_for_syscall(frame);
             SyscallAction::Return
         }
+        SyscallAction::Rmdir => {
+            rmdir_for_syscall(frame);
+            SyscallAction::Return
+        }
         SyscallAction::ThreadCreate => {
             create_thread_for_syscall(frame);
             SyscallAction::Return
@@ -6462,6 +6509,9 @@ pub extern "C" fn rustos_user_syscall_dispatch(frame: *mut SyscallFrame) -> u64 
         }
         SyscallAction::Rename => {
             unreachable!("rename syscall must be resolved before returning")
+        }
+        SyscallAction::Rmdir => {
+            unreachable!("rmdir syscall must be resolved before returning")
         }
         SyscallAction::ThreadCreate => {
             unreachable!("thread create syscall must be resolved before returning")
@@ -7301,6 +7351,7 @@ mod tests {
             SYS_TRUNCATE,
             SYS_UNLINK,
             SYS_RENAME,
+            SYS_RMDIR,
         ] {
             let mut frame = SyscallFrame {
                 rax: syscall,
@@ -7317,6 +7368,7 @@ mod tests {
                     SYS_TRUNCATE => SyscallAction::Truncate,
                     SYS_UNLINK => SyscallAction::Unlink,
                     SYS_RENAME => SyscallAction::Rename,
+                    SYS_RMDIR => SyscallAction::Rmdir,
                     _ => unreachable!(),
                 }
             );

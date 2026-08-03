@@ -9,8 +9,9 @@ use rustos_userland::{
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
     open_with_flags, open_write,
     path::{MAX_PATH_LENGTH, PathBuf, resolve},
-    path_info, pipe, poweroff, read, reboot, rename, seek, spawn, spawn_privileged_redirected,
-    spawn_redirected, suspend, truncate, unlink, waitpid, write, write_stdout, yield_now,
+    path_info, pipe, poweroff, read, reboot, rename, rmdir, seek, spawn,
+    spawn_privileged_redirected, spawn_redirected, suspend, truncate, unlink, waitpid, write,
+    write_stdout, yield_now,
 };
 
 const STDIN_FD: u64 = 0;
@@ -143,7 +144,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv grow poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir rmdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -292,6 +293,9 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if let Some(path) = argument_after(line, b"rm ") {
         remove_file(state, path);
+        write_prompt(recovery_mode, state);
+    } else if let Some(path) = argument_after(line, b"rmdir ") {
+        remove_directory(state, path);
         write_prompt(recovery_mode, state);
     } else if let Some(arguments) = argument_after(line, b"mv ") {
         move_file(state, arguments);
@@ -1183,6 +1187,30 @@ fn remove_file(state: &ShellState, input: &[u8]) {
     } else {
         write_stdout(b"rm: ok\n");
         write_stdout(b"shell: remove path=");
+        write_stdout(path.as_bytes());
+        write_stdout(b" status=ready\n");
+    }
+}
+
+fn remove_directory(state: &ShellState, input: &[u8]) {
+    let Some(path) = resolve_command_path(state, input) else {
+        write_stdout(b"rmdir: path too long\n");
+        return;
+    };
+    let mut path_buffer = [0u8; MAX_PATH_LENGTH];
+    let Some(path_bytes) = path.write_nul(&mut path_buffer) else {
+        write_stdout(b"rmdir: path too long\n");
+        return;
+    };
+    let result = rmdir(path_bytes);
+    if is_permission_error(result) {
+        write_stdout(b"rmdir: permission denied\n");
+        write_permission_marker(&path);
+    } else if is_syscall_error(result) {
+        write_stdout(b"rmdir: failed\n");
+    } else {
+        write_stdout(b"rmdir: ok\n");
+        write_stdout(b"shell: rmdir path=");
         write_stdout(path.as_bytes());
         write_stdout(b" status=ready\n");
     }

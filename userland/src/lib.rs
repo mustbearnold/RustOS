@@ -64,6 +64,7 @@ pub const SYS_SEEK: u64 = 56;
 pub const SYS_TRUNCATE: u64 = 57;
 pub const SYS_UNLINK: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
+pub const SYS_RMDIR: u64 = 60;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_CREATE: u64 = 2;
 pub const SEEK_SET: u64 = 0;
@@ -691,6 +692,11 @@ pub fn truncate(handle: u64, size: u64) -> u64 {
 #[inline]
 pub fn unlink(path: &[u8]) -> u64 {
     syscall(SYS_UNLINK, path.as_ptr() as u64, 0, 0).rax
+}
+
+#[inline]
+pub fn rmdir(path: &[u8]) -> u64 {
+    syscall(SYS_RMDIR, path.as_ptr() as u64, 0, 0).rax
 }
 
 #[inline]

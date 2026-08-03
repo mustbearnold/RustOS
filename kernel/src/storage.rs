@@ -847,6 +847,7 @@ pub enum FatFileSystemError<E> {
     ReadOnlyFile,
     FileAlreadyExists,
     FileNotFound,
+    DirectoryNotEmpty,
     DirectoryFull,
     FileTooLarge {
         size: usize,
@@ -1597,6 +1598,33 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok(None)
     }
 
+    fn directory_is_empty(
+        &mut self,
+        directory: FatDirectoryRef,
+    ) -> Result<bool, FatFileSystemError<D::Error>> {
+        let locations = self.directory_sector_locations(directory)?;
+        let mut sector = [0u8; SECTOR_SIZE];
+        for (relative_sector, _) in locations {
+            self.read_volume_sector(relative_sector, &mut sector)?;
+            for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
+                let entry = &sector[offset..offset + FAT_DIRECTORY_ENTRY_SIZE];
+                if entry[0] == 0 {
+                    return Ok(true);
+                }
+                if entry[0] == FAT_DELETED_ENTRY {
+                    continue;
+                }
+                let Some(file) = parse_fat_directory_entry(entry)? else {
+                    continue;
+                };
+                if !is_dot_directory_entry(&file.short_name) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn create_file_in_directory(
         &mut self,
         directory: FatDirectoryRef,
@@ -1751,6 +1779,32 @@ impl<D: BlockDevice> FatFileSystem<D> {
             .ok_or(FatFileSystemError::FileNotFound)?;
         if !located.entry.is_regular_file() {
             return Err(FatFileSystemError::NotRegularFile);
+        }
+
+        self.write_cursor = None;
+        let clusters = self.collect_cluster_chain(located.entry.first_cluster)?;
+        self.delete_directory_slots(&located.long_name_slots)?;
+        self.write_directory_slot_deleted(located.slot)?;
+        self.release_cluster_chain(&clusters)
+    }
+
+    pub fn remove_directory_path(
+        &mut self,
+        path: &[u8],
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        let located = self
+            .locate_path_entry(path)?
+            .ok_or(FatFileSystemError::FileNotFound)?;
+        if !located.entry.is_directory() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+        if located.entry.first_cluster == 0 {
+            return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
+        }
+
+        let directory = FatDirectoryRef::Cluster(located.entry.first_cluster);
+        if !self.directory_is_empty(directory)? {
+            return Err(FatFileSystemError::DirectoryNotEmpty);
         }
 
         self.write_cursor = None;
@@ -3979,7 +4033,18 @@ pub fn read_runtime_file(path: &[u8], offset: u64, buffer: &mut [u8]) -> Result<
 pub fn runtime_file_size(path: &[u8]) -> Result<Option<usize>, ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
-    let Some(located) = filesystem.locate_path_entry(path).map_err(|_| ())? else {
+    let located = match filesystem.locate_path_entry(path) {
+        Ok(located) => located,
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime size lookup failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            return Err(());
+        }
+    };
+    let Some(located) = located else {
         return Ok(None);
     };
     if !located.entry.is_regular_file() {
@@ -4018,9 +4083,18 @@ pub fn runtime_file_snapshot() -> Result<Vec<(Vec<u8>, usize)>, ()> {
 pub fn create_runtime_file(path: &[u8], contents: &[u8]) -> Result<usize, ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
-    let file = filesystem
-        .create_file_path(path, contents)
-        .map_err(|_| ())?;
+    let file = match filesystem.create_file_path(path, contents) {
+        Ok(file) => file,
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime create failed path={:?} bytes={} error={:?} status=degraded",
+                path,
+                contents.len(),
+                error
+            );
+            return Err(());
+        }
+    };
     Ok(usize::try_from(file.size).map_err(|_| ())?)
 }
 
@@ -4028,8 +4102,17 @@ pub fn create_runtime_file(path: &[u8], contents: &[u8]) -> Result<usize, ()> {
 pub fn create_runtime_directory(path: &[u8]) -> Result<(), ()> {
     let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
     let mut filesystem = filesystem.lock();
-    filesystem.create_directory_path(path).map_err(|_| ())?;
-    Ok(())
+    match filesystem.create_directory_path(path) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime mkdir failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            Err(())
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -4109,6 +4192,23 @@ pub fn unlink_runtime_file(path: &[u8]) -> Result<(), ()> {
         Err(error) => {
             crate::kprintln!(
                 "storage: runtime unlink failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            Err(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn remove_runtime_directory(path: &[u8]) -> Result<(), ()> {
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut filesystem = filesystem.lock();
+    match filesystem.remove_directory_path(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime rmdir failed path={:?} error={:?} status=degraded",
                 path,
                 error
             );
@@ -5185,6 +5285,18 @@ mod tests {
         filesystem
             .create_directory_path(destination_directory)
             .unwrap();
+        let source_directory_cluster = filesystem
+            .locate_path_entry(source_directory)
+            .unwrap()
+            .unwrap()
+            .entry
+            .first_cluster;
+        let destination_directory_cluster = filesystem
+            .locate_path_entry(destination_directory)
+            .unwrap()
+            .unwrap()
+            .entry
+            .first_cluster;
         let contents = vec![0x5a; 700];
         let entry = filesystem.create_file_path(source, &contents).unwrap();
         let first_cluster = entry.first_cluster;
@@ -5202,6 +5314,30 @@ mod tests {
         assert_eq!(
             filesystem
                 .fat_entry_value(first_cluster, &mut fat_scratch)
+                .unwrap(),
+            0
+        );
+
+        filesystem
+            .remove_directory_path(destination_directory)
+            .unwrap();
+        filesystem.remove_directory_path(source_directory).unwrap();
+        assert!(
+            filesystem
+                .lookup_path(destination_directory)
+                .unwrap()
+                .is_none()
+        );
+        assert!(filesystem.lookup_path(source_directory).unwrap().is_none());
+        assert_eq!(
+            filesystem
+                .fat_entry_value(destination_directory_cluster, &mut fat_scratch)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            filesystem
+                .fat_entry_value(source_directory_cluster, &mut fat_scratch)
                 .unwrap(),
             0
         );
@@ -5245,6 +5381,60 @@ mod tests {
                 .lookup_path(b"/home/user/work/renamed-note")
                 .unwrap()
                 .is_none()
+        );
+
+        filesystem
+            .create_directory_path(b"/home/user/nonempty")
+            .unwrap();
+        filesystem
+            .create_file_path(b"/home/user/nonempty/child", b"x")
+            .unwrap();
+        let nonempty_cluster = filesystem
+            .locate_path_entry(b"/home/user/nonempty")
+            .unwrap()
+            .unwrap()
+            .entry
+            .first_cluster;
+        assert_eq!(
+            filesystem.remove_directory_path(b"/home/user/nonempty"),
+            Err(FatFileSystemError::DirectoryNotEmpty)
+        );
+        assert!(
+            filesystem
+                .lookup_path(b"/home/user/nonempty/child")
+                .unwrap()
+                .is_some()
+        );
+        filesystem
+            .unlink_file_path(b"/home/user/nonempty/child")
+            .unwrap();
+        filesystem
+            .remove_directory_path(b"/home/user/nonempty")
+            .unwrap();
+        let mut fat_scratch = [0u8; SECTOR_SIZE];
+        assert_eq!(
+            filesystem
+                .fat_entry_value(nonempty_cluster, &mut fat_scratch)
+                .unwrap(),
+            0
+        );
+
+        let work_cluster = filesystem
+            .locate_path_entry(b"/home/user/work")
+            .unwrap()
+            .unwrap()
+            .entry
+            .first_cluster;
+        filesystem
+            .remove_directory_path(b"/home/user/work")
+            .unwrap();
+        filesystem.remove_directory_path(b"/home/user").unwrap();
+        filesystem.remove_directory_path(b"/home").unwrap();
+        assert_eq!(
+            filesystem
+                .fat_entry_value(work_cluster, &mut fat_scratch)
+                .unwrap(),
+            0
         );
     }
 

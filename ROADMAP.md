@@ -4,6 +4,8 @@ The project is intentionally staged. Each stage needs a boot or host-runtime pro
 
 ## 0. Boot contract — in progress
 
+- The FAT lifecycle proof now covers safe empty-directory removal through `SYS_RMDIR` and the shell `rmdir` command, including refusal of non-empty directories and release of removed directory clusters on FAT16 and FAT32.
+
 - boot on x86_64 BIOS and UEFI through a Rust bootloader
 - report boot protocol, memory map, and framebuffer state
 - provide a serial console and a visible framebuffer
@@ -44,6 +46,8 @@ The project is intentionally staged. Each stage needs a boot or host-runtime pro
 - modern virtio PCI vendor-capability parsing plus an interrupt-driven virtio-net driver with version-1 feature negotiation, MAC/status discovery, bounded RX/TX split virtqueues, physical DMA buffers, MSI-X queue completion notification, polling fallback, external DHCP proof, DHCP renewal packets, ARP gateway resolution, and network-manager attachment to the userland network syscalls; richer link policy remains future driver work
 
 ## 2. Kernel services — in progress
+
+- `SYS_RMDIR` removes an empty runtime directory, rejects non-empty directories, clears VFAT long-name slots, and releases the directory's FAT chain.
 
 - root-owned `/sbin/login` with bounded multi-record account parsing, SHA-256 password verification, first-boot username/password onboarding, writable-store bootstrap and reread, invalid-credential rejection, and a parent-waited `spawn_as` desktop session; `/bin/passwd` sends a fixed-format old/new digest request, `sudo useradd` sends a fixed-format account-creation request including an explicit administrator role, and `/bin/lock` sends a fixed-format authentication request to root-owned `/sbin/admin`, which persists and rereads the updated store; the desktop terminal and shell inherit the authenticated UID/GID, graphical secret input is masked, per-UID home paths are enforced, the compositor releases framebuffer ownership at logout, and BIOS plus partitioned-UEFI proofs cover first-boot setup, account creation, role-aware authorization, lock/unlock, password mutation, second-boot persistent reload, authentication, desktop re-acquisition, command routing, exit, and child reaping
 
