@@ -2289,6 +2289,18 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "shell: large file path=/home/user/work/large.bin bytes=131072 status=ready",
             ),
             (
+                "truncate large.bin 65536",
+                "shell: truncate path=/home/user/work/large.bin bytes=65536 status=ready",
+            ),
+            (
+                "append large.bin tail",
+                "shell: append path=/home/user/work/large.bin offset=65536 bytes=4 status=ready",
+            ),
+            (
+                "truncate large.bin 131072",
+                "shell: truncate path=/home/user/work/large.bin bytes=131072 status=ready",
+            ),
+            (
                 "write note daily-use",
                 "shell: relative write path=/home/user/work/note status=ready",
             ),
@@ -2297,7 +2309,6 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "shell: relative read path=/home/user/work/note status=ready",
             ),
             ("ls", "shell: ls path=/home/user/work status=ready"),
-            ("ps", "shell: ps status=ready"),
             (
                 "cat /etc/rustos/config.txt",
                 "shell: relative read path=/etc/rustos/config.txt status=ready",
@@ -2308,6 +2319,7 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
             ),
             ("state", "shell: state read status=ready"),
             ("sudo pkg install", "sudo: pkg install status=ready"),
+            ("ps", "shell: ps status=ready"),
             (
                 "run /bin/replaced",
                 "shell: run path=/bin/replaced status=ready",
@@ -3701,6 +3713,9 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: ls path=/home/user/documents status=ready",
         "shell: cwd changed path=/home/user/work status=ready",
         "shell: large file path=/home/user/work/large.bin bytes=131072 status=ready",
+        "shell: truncate path=/home/user/work/large.bin bytes=65536 status=ready",
+        "shell: append path=/home/user/work/large.bin offset=65536 bytes=4 status=ready",
+        "shell: truncate path=/home/user/work/large.bin bytes=131072 status=ready",
         "shell: relative write path=/home/user/work/note status=ready",
         "shell: relative read path=/home/user/work/note status=ready",
         "shell: ls path=/home/user/work status=ready",
@@ -3732,7 +3747,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || !content.contains("admin: package operation status=ready")
         || !content.contains("pkg: dependency closure readback verified")
         || !content.contains("uid=0 gid=0 origin=/sbin/admin")
-        || !content.contains("uid=0 gid=0 origin=/bin/pkg")
+        || !content.contains("exited /bin/pkg /bin/pkg Some(0)")
     {
         return Err(format!(
             "shell proof serial did not contain the complete identity, permission, privilege, and relative-file marker set: {}",

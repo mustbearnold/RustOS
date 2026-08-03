@@ -81,6 +81,8 @@ pub const SYS_GETCREDENTIALS: u64 = 52;
 pub const SYS_SPAWN_AS: u64 = 53;
 pub const SYS_SPAWN_PRIVILEGED: u64 = 54;
 pub const SYS_GET_CALLER_CREDENTIALS: u64 = 55;
+pub const SYS_SEEK: u64 = 56;
+pub const SYS_TRUNCATE: u64 = 57;
 const PATH_INFO_LENGTH: usize = 16;
 const CREDENTIALS_LENGTH: usize = 16;
 const PATH_KIND_FILE: u64 = 1;
@@ -220,6 +222,8 @@ pub enum SyscallAction {
     GetCallerCredentials,
     SpawnAs,
     SpawnPrivileged,
+    Seek,
+    Truncate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +258,10 @@ pub struct ProcessExit {
 /// `OPEN_WRITE` in `rsi` selecting writable mode and `OPEN_CREATE` selecting bounded root-file
 /// creation when the path is absent;
 /// `SYS_READ` reads from its handle into the user buffer `(rsi, rdx)`; `SYS_CLOSE` releases that
-/// handle; `SYS_THREAD_CREATE` starts the
+/// handle; `SYS_SEEK` takes a handle in `rdi`, a signed byte delta in `rsi`, and `SEEK_SET`/`SEEK_CUR`/
+/// `SEEK_END` in `rdx`, returning the new non-negative byte offset; `SYS_TRUNCATE` resizes a
+/// writable runtime file using the new size in `rsi`, zero-filling extensions and releasing
+/// truncated FAT clusters; `SYS_THREAD_CREATE` starts the
 /// executable entry point in the current address space with its argument in `rsi` and returns a
 /// thread identifier; `SYS_THREAD_JOIN` blocks until a same-process thread exits; and
 /// `SYS_THREAD_EXIT` exits the calling thread without terminating its process; `SYS_EXEC` replaces
@@ -320,6 +327,8 @@ pub fn dispatch_syscall(pid: ProcessId, frame: &mut SyscallFrame) -> SyscallActi
         SYS_OPEN => SyscallAction::Open,
         SYS_READ => SyscallAction::Read,
         SYS_CLOSE => SyscallAction::Close,
+        SYS_SEEK => SyscallAction::Seek,
+        SYS_TRUNCATE => SyscallAction::Truncate,
         SYS_THREAD_CREATE => SyscallAction::ThreadCreate,
         SYS_THREAD_JOIN => SyscallAction::ThreadJoin,
         SYS_THREAD_EXIT => SyscallAction::ThreadExit,
@@ -2337,6 +2346,8 @@ impl Thread {
             | SyscallAction::Read
             | SyscallAction::ReadNonblocking
             | SyscallAction::Close
+            | SyscallAction::Seek
+            | SyscallAction::Truncate
             | SyscallAction::ThreadCreate
             | SyscallAction::ThreadJoin
             | SyscallAction::Exec
@@ -2798,6 +2809,28 @@ impl Process {
         true
     }
 
+    fn set_file_handle_offset(&self, handle: u64, offset: usize) -> bool {
+        let Ok(index) = usize::try_from(handle) else {
+            return false;
+        };
+        let mut handles = self.handles.lock();
+        let Some(Some(handle)) = handles.entries.get_mut(index) else {
+            return false;
+        };
+        match handle {
+            ProcessHandle::File {
+                offset: current, ..
+            }
+            | ProcessHandle::Disk {
+                offset: current, ..
+            } => {
+                *current = offset;
+                true
+            }
+            ProcessHandle::Console | ProcessHandle::Pipe { .. } => false,
+        }
+    }
+
     fn update_disk_handle_size(&self, handle: u64, size: usize) -> bool {
         let Ok(index) = usize::try_from(handle) else {
             return false;
@@ -2808,6 +2841,26 @@ impl Process {
             return false;
         };
         *current = size;
+        true
+    }
+
+    fn truncate_disk_handle(&self, handle: u64, size: usize) -> bool {
+        let Ok(index) = usize::try_from(handle) else {
+            return false;
+        };
+        let mut handles = self.handles.lock();
+        let Some(Some(ProcessHandle::Disk {
+            offset,
+            size: current,
+            ..
+        })) = handles.entries.get_mut(index)
+        else {
+            return false;
+        };
+        *current = size;
+        if *offset > size {
+            *offset = size;
+        }
         true
     }
 
@@ -2950,6 +3003,8 @@ impl Process {
             SyscallAction::Read => {}
             SyscallAction::ReadNonblocking => {}
             SyscallAction::Close => {}
+            SyscallAction::Seek => {}
+            SyscallAction::Truncate => {}
             SyscallAction::ThreadCreate => {}
             SyscallAction::ThreadJoin => {}
             SyscallAction::ThreadExit => {}
@@ -3841,6 +3896,102 @@ fn write_for_syscall(frame: &mut SyscallFrame) {
     }
     process.note_file_write(count);
     frame.rax = count as u64;
+}
+
+#[cfg(target_os = "none")]
+fn seek_for_syscall(frame: &mut SyscallFrame) {
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    let Some(handle) = process.file_handle_snapshot(frame.rdi) else {
+        frame.rax = SYSCALL_EBADF;
+        return;
+    };
+    let (current, size) = match handle {
+        FileHandleSnapshot::Catalog { offset, image, .. } => (offset, image.len()),
+        FileHandleSnapshot::Disk { offset, size, .. } => (offset, size),
+        FileHandleSnapshot::Pipe { .. } => {
+            frame.rax = SYSCALL_EBADF;
+            return;
+        }
+    };
+    let base = match frame.rdx {
+        0 => 0,
+        1 => current,
+        2 => size,
+        _ => {
+            frame.rax = SYSCALL_EINVAL;
+            return;
+        }
+    };
+    let Ok(base) = i64::try_from(base) else {
+        frame.rax = SYSCALL_EINVAL;
+        return;
+    };
+    let target = match base.checked_add(frame.rsi as i64) {
+        Some(target) if (0..=crate::storage::MAX_MUTABLE_FILE_SIZE as i64).contains(&target) => {
+            target as usize
+        }
+        _ => {
+            frame.rax = SYSCALL_EINVAL;
+            return;
+        }
+    };
+    if !process.set_file_handle_offset(frame.rdi, target) {
+        frame.rax = SYSCALL_EBADF;
+        return;
+    }
+    frame.rax = target as u64;
+}
+
+#[cfg(target_os = "none")]
+fn truncate_for_syscall(frame: &mut SyscallFrame) {
+    let Ok(new_size) = usize::try_from(frame.rsi) else {
+        frame.rax = SYSCALL_EINVAL;
+        return;
+    };
+    if new_size > crate::storage::MAX_MUTABLE_FILE_SIZE {
+        frame.rax = SYSCALL_EINVAL;
+        return;
+    }
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    let Some(handle) = process.file_handle_snapshot(frame.rdi) else {
+        frame.rax = SYSCALL_EBADF;
+        return;
+    };
+    let FileHandleSnapshot::Disk { path, writable, .. } = handle else {
+        frame.rax = match handle {
+            FileHandleSnapshot::Pipe { .. } => SYSCALL_EBADF,
+            FileHandleSnapshot::Catalog { .. } => SYSCALL_EROFS,
+            FileHandleSnapshot::Disk { .. } => unreachable!("disk handle matched above"),
+        };
+        return;
+    };
+    if !writable {
+        frame.rax = SYSCALL_EROFS;
+        return;
+    }
+    if crate::storage::truncate_runtime_file(path, new_size).is_err() {
+        frame.rax = SYSCALL_EAGAIN;
+        return;
+    }
+    if !process.truncate_disk_handle(frame.rdi, new_size) {
+        frame.rax = SYSCALL_EBADF;
+        return;
+    }
+    frame.rax = 0;
 }
 
 #[cfg(target_os = "none")]
@@ -5916,6 +6067,14 @@ fn dispatch_user_syscall(frame: &mut SyscallFrame) -> SyscallAction {
             close_for_syscall(frame);
             SyscallAction::Return
         }
+        SyscallAction::Seek => {
+            seek_for_syscall(frame);
+            SyscallAction::Return
+        }
+        SyscallAction::Truncate => {
+            truncate_for_syscall(frame);
+            SyscallAction::Return
+        }
         SyscallAction::ThreadCreate => {
             create_thread_for_syscall(frame);
             SyscallAction::Return
@@ -6172,6 +6331,10 @@ pub extern "C" fn rustos_user_syscall_dispatch(frame: *mut SyscallFrame) -> u64 
             unreachable!("nonblocking read syscall must be resolved before returning")
         }
         SyscallAction::Close => unreachable!("close syscall must be resolved before returning"),
+        SyscallAction::Seek => unreachable!("seek syscall must be resolved before returning"),
+        SyscallAction::Truncate => {
+            unreachable!("truncate syscall must be resolved before returning")
+        }
         SyscallAction::ThreadCreate => {
             unreachable!("thread create syscall must be resolved before returning")
         }
@@ -7002,7 +7165,7 @@ mod tests {
 
     #[test]
     fn syscall_abi_marks_file_handle_operations_for_kernel_resolution() {
-        for syscall in [SYS_OPEN, SYS_READ, SYS_CLOSE] {
+        for syscall in [SYS_OPEN, SYS_READ, SYS_CLOSE, SYS_SEEK, SYS_TRUNCATE] {
             let mut frame = SyscallFrame {
                 rax: syscall,
                 ..SyscallFrame::default()
@@ -7014,6 +7177,8 @@ mod tests {
                     SYS_OPEN => SyscallAction::Open,
                     SYS_READ => SyscallAction::Read,
                     SYS_CLOSE => SyscallAction::Close,
+                    SYS_SEEK => SyscallAction::Seek,
+                    SYS_TRUNCATE => SyscallAction::Truncate,
                     _ => unreachable!(),
                 }
             );

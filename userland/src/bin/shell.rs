@@ -3,14 +3,14 @@
 
 use rustos_userland::{
     CREDENTIALS_LENGTH, Credentials, NET_MAX_BUFFER_LENGTH, NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE,
-    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SPAWN_INHERIT_FD,
+    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SEEK_END, SPAWN_INHERIT_FD,
     accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse, password_digest},
     close, exit, get_credentials, is_permission_error, is_syscall_error, list_files,
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
     open_with_flags, open_write,
     path::{MAX_PATH_LENGTH, PathBuf, resolve},
-    path_info, pipe, poweroff, read, reboot, spawn, spawn_privileged_redirected, spawn_redirected,
-    suspend, waitpid, write, write_stdout, yield_now,
+    path_info, pipe, poweroff, read, reboot, seek, spawn, spawn_privileged_redirected,
+    spawn_redirected, suspend, truncate, waitpid, write, write_stdout, yield_now,
 };
 
 const STDIN_FD: u64 = 0;
@@ -143,7 +143,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write grow poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -283,6 +283,12 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if let Some(arguments) = argument_after(line, b"write ") {
         write_file(state, arguments);
+        write_prompt(recovery_mode, state);
+    } else if let Some(arguments) = argument_after(line, b"append ") {
+        append_file(state, arguments);
+        write_prompt(recovery_mode, state);
+    } else if let Some(arguments) = argument_after(line, b"truncate ") {
+        truncate_file(state, arguments);
         write_prompt(recovery_mode, state);
     } else if line == b"grow" {
         grow_large_file(state);
@@ -751,6 +757,20 @@ fn write_decimal(mut value: u64) {
     write_stdout(&bytes[cursor..]);
 }
 
+fn parse_decimal(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in bytes.iter().copied() {
+        if !(b'0'..=b'9').contains(&byte) {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
 fn show_network() {
     let mut buffer = [0u8; rustos_userland::NET_INFO_MAX_LENGTH];
     let count = net_info(&mut buffer);
@@ -1056,6 +1076,84 @@ fn write_file(state: &ShellState, arguments: &[u8]) {
         write_stdout(b"write: ok\n");
         write_stdout(b"shell: relative write path=");
         write_stdout(path.as_bytes());
+        write_stdout(b" status=ready\n");
+    }
+}
+
+fn append_file(state: &ShellState, arguments: &[u8]) {
+    let Some(separator) = arguments.iter().position(|byte| *byte == b' ') else {
+        write_stdout(b"append: usage append /path value\n");
+        return;
+    };
+    let path = &arguments[..separator];
+    let value = &arguments[separator + 1..];
+    if path.is_empty() {
+        write_stdout(b"append: usage append /path value\n");
+        return;
+    }
+    let Some(path) = resolve_command_path(state, path) else {
+        write_stdout(b"append: path too long\n");
+        return;
+    };
+    let handle = open_resolved_path(&path, OPEN_CREATE | OPEN_WRITE);
+    if is_syscall_error(handle) {
+        write_stdout(b"append: open failed\n");
+        return;
+    }
+    let offset = seek(handle, 0, SEEK_END);
+    let count = if is_syscall_error(offset) {
+        u64::MAX
+    } else {
+        write(handle, value)
+    };
+    let closed = close(handle);
+    if is_syscall_error(offset)
+        || is_syscall_error(count)
+        || count != value.len() as u64
+        || is_syscall_error(closed)
+    {
+        write_stdout(b"append: failed\n");
+    } else {
+        write_stdout(b"append: ok\n");
+        write_stdout(b"shell: append path=");
+        write_stdout(path.as_bytes());
+        write_stdout(b" offset=");
+        write_decimal(offset);
+        write_stdout(b" bytes=");
+        write_decimal(value.len() as u64);
+        write_stdout(b" status=ready\n");
+    }
+}
+
+fn truncate_file(state: &ShellState, arguments: &[u8]) {
+    let Some(separator) = arguments.iter().position(|byte| *byte == b' ') else {
+        write_stdout(b"truncate: usage truncate /path size\n");
+        return;
+    };
+    let path = &arguments[..separator];
+    let Some(size) = parse_decimal(&arguments[separator + 1..]) else {
+        write_stdout(b"truncate: usage truncate /path size\n");
+        return;
+    };
+    let Some(path) = resolve_command_path(state, path) else {
+        write_stdout(b"truncate: path too long\n");
+        return;
+    };
+    let handle = open_resolved_path(&path, OPEN_WRITE);
+    if is_syscall_error(handle) {
+        write_stdout(b"truncate: open failed\n");
+        return;
+    }
+    let result = truncate(handle, size);
+    let closed = close(handle);
+    if is_syscall_error(result) || result != 0 || is_syscall_error(closed) {
+        write_stdout(b"truncate: failed\n");
+    } else {
+        write_stdout(b"truncate: ok\n");
+        write_stdout(b"shell: truncate path=");
+        write_stdout(path.as_bytes());
+        write_stdout(b" bytes=");
+        write_decimal(size);
         write_stdout(b" status=ready\n");
     }
 }

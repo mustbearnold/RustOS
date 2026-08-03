@@ -2240,6 +2240,210 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok((count, end_size))
     }
 
+    fn zero_file_range(
+        &mut self,
+        file: FatFileEntry,
+        start: u64,
+        end: u64,
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        if start > end || end > u64::from(file.size) {
+            return Err(FatFileSystemError::FileWriteOutOfBounds {
+                offset: start,
+                length: end.saturating_sub(start),
+                size: u64::from(file.size),
+            });
+        }
+        let zeroes = [0u8; SECTOR_SIZE];
+        let mut offset = start;
+        while offset < end {
+            let count = core::cmp::min(end - offset, zeroes.len() as u64) as usize;
+            self.write_file_range(file, offset, &zeroes[..count])?;
+            offset += count as u64;
+        }
+        Ok(())
+    }
+
+    /// Resize a regular file in place, preserving its existing prefix and zero-filling every byte
+    /// exposed by an extension. Shrinking also clears the retained cluster tail so a later grow
+    /// cannot reveal data that was previously beyond EOF.
+    fn resize_file_at(
+        &mut self,
+        slot: FatDirectorySlot,
+        file: FatFileEntry,
+        new_size: usize,
+    ) -> Result<usize, FatFileSystemError<D::Error>> {
+        if !file.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+        if file.attributes & FAT_ATTRIBUTE_READ_ONLY != 0 {
+            return Err(FatFileSystemError::ReadOnlyFile);
+        }
+        if new_size > MAX_MUTABLE_FILE_SIZE {
+            return Err(FatFileSystemError::FileTooLarge {
+                size: new_size,
+                max_size: MAX_MUTABLE_FILE_SIZE,
+            });
+        }
+
+        let old_size =
+            usize::try_from(file.size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        if new_size == old_size {
+            return Ok(new_size);
+        }
+        self.write_cursor = None;
+
+        let cluster_bytes = u64::from(self.boot.sectors_per_cluster)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let old_chain = self.collect_cluster_chain(file.first_cluster)?;
+        if old_size != 0 && old_chain.is_empty() {
+            return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
+        }
+
+        if new_size < old_size {
+            let required_clusters = if new_size == 0 {
+                0
+            } else {
+                usize::try_from(
+                    u64::try_from(new_size)
+                        .map_err(|_| FatFileSystemError::InvalidGeometry)?
+                        .div_ceil(cluster_bytes),
+                )
+                .map_err(|_| FatFileSystemError::InvalidGeometry)?
+            };
+            if required_clusters > old_chain.len() {
+                return Err(FatFileSystemError::UnexpectedEndOfChain {
+                    cluster: old_chain.last().copied().unwrap_or(0),
+                });
+            }
+
+            if new_size != 0 {
+                let retained_capacity = u64::try_from(required_clusters)
+                    .map_err(|_| FatFileSystemError::InvalidGeometry)?
+                    .checked_mul(cluster_bytes)
+                    .ok_or(FatFileSystemError::InvalidGeometry)?;
+                let zero_end = core::cmp::min(u64::try_from(old_size).unwrap(), retained_capacity);
+                if u64::try_from(new_size).unwrap() < zero_end {
+                    self.zero_file_range(file, u64::try_from(new_size).unwrap(), zero_end)?;
+                }
+            }
+
+            let retained_first = old_chain.first().copied().unwrap_or(0);
+            let retained_last = required_clusters
+                .checked_sub(1)
+                .and_then(|index| old_chain.get(index).copied());
+            let released = &old_chain[required_clusters..];
+            if let Some(last_cluster) = retained_last {
+                if let Some(first_released) = released.first().copied() {
+                    self.set_fat_entry(last_cluster, self.end_of_chain_value())?;
+                    if let Err(error) = self.update_directory_entry_metadata(
+                        slot,
+                        retained_first,
+                        u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+                    ) {
+                        let _ = self.set_fat_entry(last_cluster, first_released);
+                        return Err(error);
+                    }
+                } else {
+                    self.update_directory_entry_metadata(
+                        slot,
+                        retained_first,
+                        u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+                    )?;
+                }
+            } else {
+                self.update_directory_entry_metadata(
+                    slot,
+                    0,
+                    u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?,
+                )?;
+            }
+            self.release_cluster_chain(released)?;
+            self.write_cursor = retained_last.map(|last_cluster| FatWriteCursor {
+                slot,
+                first_cluster: retained_first,
+                file_size: u32::try_from(new_size).unwrap(),
+                last_cluster,
+            });
+            return Ok(new_size);
+        }
+
+        let old_size_u64 =
+            u64::try_from(old_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let new_size_u64 =
+            u64::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let required_clusters = new_size_u64
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FatFileSystemError::InvalidGeometry)?
+            / cluster_bytes;
+        let old_cluster_count =
+            u64::try_from(old_chain.len()).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let additional_clusters = required_clusters.saturating_sub(old_cluster_count);
+        let appended_size = usize::try_from(
+            additional_clusters
+                .checked_mul(cluster_bytes)
+                .ok_or(FatFileSystemError::InvalidGeometry)?,
+        )
+        .map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let appended_clusters = self.allocate_cluster_chain(appended_size)?;
+        for cluster in appended_clusters.iter().copied() {
+            if let Err(error) = self.zero_cluster(cluster) {
+                let _ = self.release_cluster_chain(&appended_clusters);
+                return Err(error);
+            }
+        }
+
+        let old_last_cluster = old_chain.last().copied();
+        if let Some(new_first_cluster) = appended_clusters.first().copied()
+            && let Some(old_last_cluster) = old_last_cluster
+            && let Err(error) = self.set_fat_entry(old_last_cluster, new_first_cluster)
+        {
+            let _ = self.release_cluster_chain(&appended_clusters);
+            return Err(error);
+        }
+
+        let first_cluster = old_chain
+            .first()
+            .copied()
+            .or_else(|| appended_clusters.first().copied())
+            .unwrap_or(0);
+        let new_size_u32 =
+            u32::try_from(new_size).map_err(|_| FatFileSystemError::InvalidGeometry)?;
+        let resized_file = FatFileEntry {
+            first_cluster,
+            size: new_size_u32,
+            ..file
+        };
+        if let Err(error) = self.update_directory_entry_metadata(slot, first_cluster, new_size_u32)
+        {
+            self.rollback_file_growth(slot, file, old_last_cluster, &appended_clusters, false);
+            return Err(error);
+        }
+
+        let old_capacity = old_cluster_count
+            .checked_mul(cluster_bytes)
+            .ok_or(FatFileSystemError::InvalidGeometry)?;
+        let zero_end = core::cmp::min(new_size_u64, old_capacity);
+        if old_size_u64 < zero_end {
+            if let Err(error) = self.zero_file_range(resized_file, old_size_u64, zero_end) {
+                self.rollback_file_growth(slot, file, old_last_cluster, &appended_clusters, true);
+                return Err(error);
+            }
+        }
+
+        let last_cluster = appended_clusters
+            .last()
+            .copied()
+            .or_else(|| old_chain.last().copied());
+        self.write_cursor = last_cluster.map(|last_cluster| FatWriteCursor {
+            slot,
+            first_cluster,
+            file_size: new_size_u32,
+            last_cluster,
+        });
+        Ok(new_size)
+    }
+
     /// Replace the contents of an existing regular root file, allocating a fresh bounded cluster
     /// chain before publishing the new directory metadata.
     #[cfg_attr(target_os = "none", allow(dead_code))]
@@ -3720,6 +3924,39 @@ pub fn write_runtime_file(path: &[u8], offset: u64, buffer: &[u8]) -> Result<(us
 }
 
 #[cfg(target_os = "none")]
+pub fn truncate_runtime_file(path: &[u8], new_size: usize) -> Result<usize, ()> {
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut filesystem = filesystem.lock();
+    let located = match filesystem.locate_path_entry(path) {
+        Ok(Some(located)) => located,
+        Ok(None) => return Err(()),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime truncate lookup failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            return Err(());
+        }
+    };
+    if !located.entry.is_regular_file() {
+        return Err(());
+    }
+    match filesystem.resize_file_at(located.slot, located.entry, new_size) {
+        Ok(size) => Ok(size),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime truncate failed path={:?} size={} error={:?} status=degraded",
+                path,
+                new_size,
+                error
+            );
+            Err(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
 struct AtaPorts {
     data: Port<u16>,
     error_features: Port<u8>,
@@ -4584,6 +4821,78 @@ mod tests {
             Ok(sequential_readback.len())
         );
         assert!(sequential_readback.iter().all(|byte| *byte == 0x33));
+    }
+
+    #[test]
+    fn resizes_a_fat16_file_and_zero_fills_reused_storage() {
+        let (disk, partition, boot) = test_fat16_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        let contents = vec![0x5a; 1_500];
+        let file = filesystem
+            .create_root_file(*b"RESIZE  BIN", &contents)
+            .unwrap();
+
+        let slot = filesystem
+            .find_root_entry_slot(&file.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.resize_file_at(slot, file, 600), Ok(600));
+        let shrunk = filesystem.find_root_entry(b"RESIZE  BIN").unwrap().unwrap();
+        assert_eq!(shrunk.size, 600);
+        assert_eq!(
+            filesystem
+                .collect_cluster_chain(shrunk.first_cluster)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let slot = filesystem
+            .find_root_entry_slot(&shrunk.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.resize_file_at(slot, shrunk, 1_200), Ok(1_200));
+        let extended = filesystem.find_root_entry(b"RESIZE  BIN").unwrap().unwrap();
+        let mut readback = vec![0u8; 1_200];
+        assert_eq!(
+            filesystem.read_file_range(extended, 0, &mut readback),
+            Ok(1_200)
+        );
+        assert!(readback[..600].iter().all(|byte| *byte == 0x5a));
+        assert!(readback[600..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            filesystem.write_file_range(extended, 1_100, &[0xa5; 4]),
+            Ok(4)
+        );
+        let slot = filesystem
+            .find_root_entry_slot(&extended.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.resize_file_at(slot, extended, 400), Ok(400));
+        let shrunk_again = filesystem.find_root_entry(b"RESIZE  BIN").unwrap().unwrap();
+        assert_eq!(shrunk_again.size, 400);
+        assert_eq!(
+            filesystem
+                .collect_cluster_chain(shrunk_again.first_cluster)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let slot = filesystem
+            .find_root_entry_slot(&shrunk_again.short_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.resize_file_at(slot, shrunk_again, 700), Ok(700));
+        let regrown = filesystem.find_root_entry(b"RESIZE  BIN").unwrap().unwrap();
+        let mut regrown_readback = vec![0xffu8; 700];
+        assert_eq!(
+            filesystem.read_file_range(regrown, 0, &mut regrown_readback),
+            Ok(700)
+        );
+        assert!(regrown_readback[..400].iter().all(|byte| *byte == 0x5a));
+        assert!(regrown_readback[400..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
