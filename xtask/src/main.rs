@@ -1,6 +1,6 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
-use rustos_gpu_protocol::{GspFirmware, GspRpcMessage, encode_gsp_rpc};
+use rustos_gpu_protocol::{GspCachedArguments, GspFirmware, GspRpcMessage, encode_gsp_rpc};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -1169,12 +1169,50 @@ fn nvidia_gsp_check(path: &Path) -> Result<(), String> {
     let layout = descriptor
         .boot_layout()
         .map_err(|error| format!("planning NVIDIA GSP boot layout: {error:?}"))?;
+    let image_page_addresses: Vec<u64> = (0..layout.radix3.image_pages)
+        .map(|index| {
+            0x1000_0000_0000u64
+                .checked_add((index as u64) * rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE as u64)
+                .ok_or_else(|| "GSP image page address overflow".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let level2_page_addresses: Vec<u64> = (0..layout.radix3.level2_pages)
+        .map(|index| {
+            0x2000_0000_0000u64
+                .checked_add((index as u64) * rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE as u64)
+                .ok_or_else(|| "GSP radix-3 level-2 address overflow".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let radix3 = layout
+        .radix3
+        .materialize(
+            0x2000_1000_0000,
+            0x2000_1000_1000,
+            &level2_page_addresses,
+            &image_page_addresses,
+        )
+        .map_err(|error| format!("materializing GSP radix-3 tables: {error:?}"))?;
+    let shared_page_addresses: Vec<u64> = (0..layout.shared_memory.page_table_entry_count)
+        .map(|index| {
+            0x3000_0000_0000u64
+                .checked_add((index as u64) * rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE as u64)
+                .ok_or_else(|| "GSP shared-memory page address overflow".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let shared_memory = layout
+        .shared_memory
+        .materialize(&shared_page_addresses)
+        .map_err(|error| format!("materializing GSP shared memory: {error:?}"))?;
+    let cached_arguments =
+        GspCachedArguments::r570(shared_memory.page_table_address, layout.shared_memory)
+            .map_err(|error| format!("encoding GSP cached arguments: {error:?}"))?
+            .encode();
     let command = encode_gsp_rpc(0, 1, &[])
         .map_err(|error| format!("encoding GSP RPC smoke command: {error:?}"))?;
     let message = GspRpcMessage::parse(&command)
         .map_err(|error| format!("parsing GSP RPC smoke command: {error:?}"))?;
     println!(
-        "nvidia-gsp: path={} bytes={} image_offset=0x{:x} image_bytes={} image_pages={} version={} gb20x_signature={} signature_bytes={} radix3_bytes={} radix3_level2_pages={} shared_bytes={} shared_ptes={} queue_entries={} rpc_pages={} checksum={} status=ready",
+        "nvidia-gsp: path={} bytes={} image_offset=0x{:x} image_bytes={} image_pages={} version={} gb20x_signature={} signature_bytes={} radix3_bytes={} radix3_level2_pages={} radix3_tables={} shared_bytes={} shared_ptes={} queue_entries={} queue_header_bytes={} cached_args_bytes={} rpc_pages={} checksum={} status=ready",
         path.display(),
         firmware.len(),
         descriptor.image.offset,
@@ -1185,9 +1223,13 @@ fn nvidia_gsp_check(path: &Path) -> Result<(), String> {
         layout.signature.size,
         layout.radix3.total_bytes,
         layout.radix3.level2_pages,
+        radix3.level0.len() + radix3.level1.len() + radix3.level2.len()
+            == layout.radix3.total_bytes,
         layout.shared_memory.total_bytes,
         layout.shared_memory.page_table_entry_count,
         layout.shared_memory.queue_entry_count,
+        rustos_gpu_protocol::NVIDIA_GSP_QUEUE_HEADER_SIZE,
+        cached_arguments.len(),
         message.element_count(),
         message.checksum_valid()
     );

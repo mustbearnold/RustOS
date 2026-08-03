@@ -19,6 +19,7 @@ pub const NVIDIA_GSP_QUEUE_ENTRY_OFFSET: usize = NVIDIA_GSP_PAGE_SIZE;
 pub const NVIDIA_GSP_QUEUE_ENTRY_SIZE: usize = NVIDIA_GSP_PAGE_SIZE;
 pub const NVIDIA_GSP_QUEUE_ENTRY_COUNT: usize =
     (NVIDIA_GSP_SHARED_QUEUE_BYTES - NVIDIA_GSP_QUEUE_ENTRY_OFFSET) / NVIDIA_GSP_QUEUE_ENTRY_SIZE;
+pub const NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE: usize = core::mem::size_of::<u64>();
 pub const NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE: usize = NVIDIA_GSP_PAGE_SIZE / 8;
 pub const NVIDIA_GSP_RADIX3_MAX_IMAGE_PAGES: usize =
     NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE * NVIDIA_GSP_RADIX3_POINTERS_PER_PAGE;
@@ -27,6 +28,8 @@ pub const NVIDIA_GSP_R570_BAREMETAL_OS_CARVEOUT: usize = 22 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_BASE_RM_HEAP: usize = 14 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_MIN_RM_HEAP: usize = 88 * 1024 * 1024;
 pub const NVIDIA_GSP_R570_GB20X_NON_WPR_HEAP: usize = 0x220000;
+pub const NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE: usize = 72;
+pub const NVIDIA_GSP_R570_QUEUE_RX_HEADER_OFFSET: u32 = 32;
 pub const NVIDIA_GSP_RPC_SIGNATURE: u32 = 0x4352_5056;
 pub const NVIDIA_GSP_RPC_HEADER_VERSION: u32 = 0x0300_0000;
 pub const NVIDIA_GSP_CONTINUATION_FUNCTION: u32 = 0x0000_0014;
@@ -67,6 +70,15 @@ pub enum GspBootPlanError {
     EmptyGb20xSignature,
     ImageTooLarge { pages: usize, limit: usize },
     SizeOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspMemoryError {
+    AddressUnaligned { address: u64 },
+    AddressOverflow,
+    BufferTooSmall { required: usize, actual: usize },
+    PageCountMismatch { expected: usize, actual: usize },
+    ValueTooLarge { value: usize, limit: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,114 @@ impl GspSharedMemoryLayout {
             queue_entry_count: NVIDIA_GSP_QUEUE_ENTRY_COUNT,
         }
     }
+
+    pub fn materialize(
+        self,
+        page_addresses: &[u64],
+    ) -> Result<GspSharedMemoryImage, GspMemoryError> {
+        if page_addresses.is_empty() {
+            return Err(GspMemoryError::PageCountMismatch {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if page_addresses.len() != self.page_table_entry_count {
+            return Err(GspMemoryError::PageCountMismatch {
+                expected: self.page_table_entry_count,
+                actual: page_addresses.len(),
+            });
+        }
+        let page_table_required = self
+            .page_table_entry_count
+            .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+            .ok_or(GspMemoryError::AddressOverflow)?;
+        if page_table_required > self.page_table_bytes {
+            return Err(GspMemoryError::BufferTooSmall {
+                required: page_table_required,
+                actual: self.page_table_bytes,
+            });
+        }
+        for &address in page_addresses {
+            validate_page_address(address)?;
+        }
+
+        let mut page_table = Vec::new();
+        page_table.resize(self.page_table_bytes, 0);
+        for (index, &address) in page_addresses.iter().enumerate() {
+            let offset = index
+                .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+                .ok_or(GspMemoryError::AddressOverflow)?;
+            write_le_u64(&mut page_table, offset, address);
+        }
+
+        let mut command_queue = Vec::new();
+        command_queue.resize(NVIDIA_GSP_SHARED_QUEUE_BYTES, 0);
+        let command_header = GspQueueHeader::r570_command(self)?;
+        command_queue[..NVIDIA_GSP_QUEUE_HEADER_SIZE].copy_from_slice(&command_header.encode());
+
+        let mut status_queue = Vec::new();
+        status_queue.resize(NVIDIA_GSP_SHARED_QUEUE_BYTES, 0);
+
+        Ok(GspSharedMemoryImage {
+            page_table_address: page_addresses[0],
+            page_table,
+            command_queue,
+            status_queue,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspQueueHeader {
+    pub version: u32,
+    pub size: u32,
+    pub message_size: u32,
+    pub message_count: u32,
+    pub write_pointer: u32,
+    pub flags: u32,
+    pub rx_header_offset: u32,
+    pub entry_offset: u32,
+}
+
+impl GspQueueHeader {
+    pub fn r570_command(layout: GspSharedMemoryLayout) -> Result<Self, GspMemoryError> {
+        let message_count =
+            u32::try_from(layout.queue_entry_count).map_err(|_| GspMemoryError::ValueTooLarge {
+                value: layout.queue_entry_count,
+                limit: u32::MAX as usize,
+            })?;
+        Ok(Self {
+            version: 0,
+            size: NVIDIA_GSP_SHARED_QUEUE_BYTES as u32,
+            message_size: NVIDIA_GSP_QUEUE_ENTRY_SIZE as u32,
+            message_count,
+            write_pointer: 0,
+            flags: 1,
+            rx_header_offset: NVIDIA_GSP_R570_QUEUE_RX_HEADER_OFFSET,
+            entry_offset: NVIDIA_GSP_QUEUE_ENTRY_OFFSET as u32,
+        })
+    }
+
+    pub fn encode(self) -> [u8; NVIDIA_GSP_QUEUE_HEADER_SIZE] {
+        let mut bytes = [0u8; NVIDIA_GSP_QUEUE_HEADER_SIZE];
+        write_le_u32(&mut bytes, 0, self.version);
+        write_le_u32(&mut bytes, 4, self.size);
+        write_le_u32(&mut bytes, 8, self.message_size);
+        write_le_u32(&mut bytes, 12, self.message_count);
+        write_le_u32(&mut bytes, 16, self.write_pointer);
+        write_le_u32(&mut bytes, 20, self.flags);
+        write_le_u32(&mut bytes, 24, self.rx_header_offset);
+        write_le_u32(&mut bytes, 28, self.entry_offset);
+        bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GspSharedMemoryImage {
+    pub page_table_address: u64,
+    pub page_table: Vec<u8>,
+    pub command_queue: Vec<u8>,
+    pub status_queue: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +247,156 @@ pub struct GspRadix3Layout {
     pub level2_bytes: usize,
     pub level2_pages: usize,
     pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GspRadix3Tables {
+    pub level0_address: u64,
+    pub level1_address: u64,
+    pub level2_addresses: Vec<u64>,
+    pub level0: Vec<u8>,
+    pub level1: Vec<u8>,
+    pub level2: Vec<u8>,
+}
+
+impl GspRadix3Layout {
+    pub fn materialize(
+        self,
+        level0_address: u64,
+        level1_address: u64,
+        level2_addresses: &[u64],
+        image_page_addresses: &[u64],
+    ) -> Result<GspRadix3Tables, GspMemoryError> {
+        if level2_addresses.len() != self.level2_pages {
+            return Err(GspMemoryError::PageCountMismatch {
+                expected: self.level2_pages,
+                actual: level2_addresses.len(),
+            });
+        }
+        if image_page_addresses.len() != self.image_pages {
+            return Err(GspMemoryError::PageCountMismatch {
+                expected: self.image_pages,
+                actual: image_page_addresses.len(),
+            });
+        }
+        let level0_required = NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE;
+        let level1_required = self
+            .level2_pages
+            .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+            .ok_or(GspMemoryError::AddressOverflow)?;
+        let level2_required = self
+            .image_pages
+            .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+            .ok_or(GspMemoryError::AddressOverflow)?;
+        for (required, actual) in [
+            (level0_required, self.level0_bytes),
+            (level1_required, self.level1_bytes),
+            (level2_required, self.level2_bytes),
+        ] {
+            if required > actual {
+                return Err(GspMemoryError::BufferTooSmall { required, actual });
+            }
+        }
+        validate_page_address(level0_address)?;
+        validate_page_address(level1_address)?;
+        for &address in level2_addresses {
+            validate_page_address(address)?;
+        }
+        for &address in image_page_addresses {
+            validate_page_address(address)?;
+        }
+
+        let mut level0 = Vec::new();
+        level0.resize(self.level0_bytes, 0);
+        write_le_u64(&mut level0, 0, level1_address);
+
+        let mut level1 = Vec::new();
+        level1.resize(self.level1_bytes, 0);
+        for (index, &address) in level2_addresses.iter().enumerate() {
+            let offset = index
+                .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+                .ok_or(GspMemoryError::AddressOverflow)?;
+            write_le_u64(&mut level1, offset, address);
+        }
+
+        let mut level2 = Vec::new();
+        level2.resize(self.level2_bytes, 0);
+        for (index, &address) in image_page_addresses.iter().enumerate() {
+            let offset = index
+                .checked_mul(NVIDIA_GSP_SHARED_PAGE_TABLE_ENTRY_SIZE)
+                .ok_or(GspMemoryError::AddressOverflow)?;
+            write_le_u64(&mut level2, offset, address);
+        }
+
+        Ok(GspRadix3Tables {
+            level0_address,
+            level1_address,
+            level2_addresses: level2_addresses.to_vec(),
+            level0,
+            level1,
+            level2,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GspCachedArguments {
+    pub shared_mem_phys_addr: u64,
+    pub page_table_entry_count: u32,
+    pub command_queue_offset: u64,
+    pub status_queue_offset: u64,
+    pub old_power_level: u32,
+    pub power_flags: u32,
+    pub in_power_transition: bool,
+    pub gpu_instance: u32,
+    pub dmem_stack: bool,
+    pub profiler_pa: u64,
+    pub profiler_size: u64,
+}
+
+impl GspCachedArguments {
+    pub fn r570(
+        shared_mem_phys_addr: u64,
+        layout: GspSharedMemoryLayout,
+    ) -> Result<Self, GspMemoryError> {
+        validate_page_address(shared_mem_phys_addr)?;
+        let page_table_entry_count =
+            u32::try_from(layout.page_table_entry_count).map_err(|_| {
+                GspMemoryError::ValueTooLarge {
+                    value: layout.page_table_entry_count,
+                    limit: u32::MAX as usize,
+                }
+            })?;
+        Ok(Self {
+            shared_mem_phys_addr,
+            page_table_entry_count,
+            command_queue_offset: layout.command_queue_offset as u64,
+            status_queue_offset: layout.status_queue_offset as u64,
+            old_power_level: 0,
+            power_flags: 0,
+            in_power_transition: false,
+            gpu_instance: 0,
+            dmem_stack: true,
+            profiler_pa: 0,
+            profiler_size: 0,
+        })
+    }
+
+    pub fn encode(self) -> [u8; NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE] {
+        let mut bytes = [0u8; NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE];
+        write_le_u64(&mut bytes, 0, self.shared_mem_phys_addr);
+        write_le_u32(&mut bytes, 8, self.page_table_entry_count);
+        write_le_u64(&mut bytes, 16, self.command_queue_offset);
+        write_le_u64(&mut bytes, 24, self.status_queue_offset);
+        write_le_u32(&mut bytes, 32, self.old_power_level);
+        write_le_u32(&mut bytes, 36, self.power_flags);
+        bytes[40] = u8::from(self.in_power_transition);
+        write_le_u32(&mut bytes, 44, self.gpu_instance);
+        bytes[48] = u8::from(self.dmem_stack);
+        write_le_u64(&mut bytes, 56, self.profiler_pa);
+        write_le_u64(&mut bytes, 64, self.profiler_size);
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +819,17 @@ fn write_le_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_le_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn validate_page_address(address: u64) -> Result<(), GspMemoryError> {
+    if address & (NVIDIA_GSP_PAGE_SIZE as u64 - 1) != 0 {
+        return Err(GspMemoryError::AddressUnaligned { address });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -689,6 +970,114 @@ mod tests {
     }
 
     #[test]
+    fn materializes_noncontiguous_radix3_pointer_tables() {
+        let layout = GspRadix3Layout {
+            image_pages: 2,
+            level0_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level1_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level2_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level2_pages: 1,
+            total_bytes: 3 * NVIDIA_GSP_PAGE_SIZE,
+        };
+        let tables = layout
+            .materialize(0x1000, 0x5000, &[0x9000], &[0x11_000, 0x23_000])
+            .expect("radix-3 tables");
+        assert_eq!(read_test_u64(&tables.level0, 0), 0x5000);
+        assert_eq!(read_test_u64(&tables.level1, 0), 0x9000);
+        assert_eq!(read_test_u64(&tables.level2, 0), 0x11_000);
+        assert_eq!(read_test_u64(&tables.level2, 8), 0x23_000);
+        assert!(tables.level2[16..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn materializes_shared_memory_page_table_and_command_header() {
+        let layout = GspSharedMemoryLayout::standard();
+        let pages: Vec<u64> = (0..layout.page_table_entry_count)
+            .map(|index| 0x4000_0000 + (index as u64) * NVIDIA_GSP_PAGE_SIZE as u64)
+            .collect();
+        let shared = layout.materialize(&pages).expect("shared memory");
+        assert_eq!(shared.page_table_address, pages[0]);
+        assert_eq!(shared.page_table.len(), NVIDIA_GSP_PAGE_SIZE);
+        assert_eq!(shared.command_queue.len(), NVIDIA_GSP_SHARED_QUEUE_BYTES);
+        assert_eq!(shared.status_queue.len(), NVIDIA_GSP_SHARED_QUEUE_BYTES);
+        assert_eq!(read_test_u64(&shared.page_table, 0), pages[0]);
+        assert_eq!(
+            read_test_u64(&shared.page_table, 128 * core::mem::size_of::<u64>()),
+            pages[128]
+        );
+        let header = GspQueueHeader::r570_command(layout).expect("queue header");
+        assert_eq!(
+            &shared.command_queue[..NVIDIA_GSP_QUEUE_HEADER_SIZE],
+            &header.encode()
+        );
+        assert!(shared.status_queue.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn encodes_r570_cached_arguments_at_the_openrm_wire_offsets() {
+        let layout = GspSharedMemoryLayout::standard();
+        let arguments = GspCachedArguments::r570(0x8000, layout)
+            .expect("cached arguments")
+            .encode();
+        assert_eq!(arguments.len(), NVIDIA_GSP_R570_CACHED_ARGUMENTS_SIZE);
+        assert_eq!(read_test_u64(&arguments, 0), 0x8000);
+        assert_eq!(read_test_u32(&arguments, 8), 129);
+        assert_eq!(read_test_u64(&arguments, 16), 4096);
+        assert_eq!(
+            read_test_u64(&arguments, 24),
+            4096 + NVIDIA_GSP_SHARED_QUEUE_BYTES as u64
+        );
+        assert_eq!(read_test_u32(&arguments, 32), 0);
+        assert_eq!(arguments[40], 0);
+        assert_eq!(read_test_u32(&arguments, 44), 0);
+        assert_eq!(arguments[48], 1);
+        assert!(arguments[49..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn rejects_unaligned_or_incomplete_gsp_memory_inputs() {
+        let layout = GspSharedMemoryLayout::standard();
+        assert_eq!(
+            layout.materialize(&[0x1001]),
+            Err(GspMemoryError::PageCountMismatch {
+                expected: 129,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            GspCachedArguments::r570(0x1001, layout),
+            Err(GspMemoryError::AddressUnaligned { address: 0x1001 })
+        );
+
+        let mut small_shared_layout = layout;
+        small_shared_layout.page_table_bytes = 8;
+        let pages = vec![0x2000; layout.page_table_entry_count];
+        assert_eq!(
+            small_shared_layout.materialize(&pages),
+            Err(GspMemoryError::BufferTooSmall {
+                required: 129 * core::mem::size_of::<u64>(),
+                actual: 8
+            })
+        );
+
+        let small_radix3 = GspRadix3Layout {
+            image_pages: 1,
+            level0_bytes: 0,
+            level1_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level2_bytes: NVIDIA_GSP_PAGE_SIZE,
+            level2_pages: 1,
+            total_bytes: 2 * NVIDIA_GSP_PAGE_SIZE,
+        };
+        assert_eq!(
+            small_radix3.materialize(0x3000, 0x4000, &[0x5000], &[0x6000]),
+            Err(GspMemoryError::BufferTooSmall {
+                required: core::mem::size_of::<u64>(),
+                actual: 0
+            })
+        );
+    }
+
+    #[test]
     fn boot_layout_requires_the_generation_signature() {
         let mut bytes = synthetic_firmware();
         let signature_name = b".fwsignature_gb20x";
@@ -752,5 +1141,13 @@ mod tests {
                 limit: NVIDIA_GSP_MAX_MESSAGE_PAGES
             }) if actual_pages == pages
         ));
+    }
+
+    fn read_test_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    fn read_test_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("u64"))
     }
 }
