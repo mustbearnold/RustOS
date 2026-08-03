@@ -1569,6 +1569,7 @@ pub fn encode_gsp_static_info_request() -> [u8; NVIDIA_GSP_R570_STATIC_CONFIG_IN
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GspStaticInfoError {
     PayloadTooSmall { required: usize, actual: usize },
+    GpuNameEmpty,
     GpuNameNotTerminated,
 }
 
@@ -1587,8 +1588,11 @@ pub fn parse_gsp_static_info(payload: &[u8]) -> Result<GspStaticInfo, GspStaticI
     }
     let mut gpu_name = [0u8; 64];
     gpu_name.copy_from_slice(&payload[NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET..name_end]);
-    if !gpu_name.contains(&0) {
+    let Some(terminator) = gpu_name.iter().position(|byte| *byte == 0) else {
         return Err(GspStaticInfoError::GpuNameNotTerminated);
+    };
+    if terminator == 0 {
+        return Err(GspStaticInfoError::GpuNameEmpty);
     }
     Ok(GspStaticInfo { gpu_name })
 }
@@ -2328,6 +2332,13 @@ mod tests {
                 required: NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE,
                 actual: NVIDIA_GSP_R570_STATIC_CONFIG_INFO_SIZE - 1,
             })
+        );
+        payload
+            [NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET..NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET + 64]
+            .fill(0);
+        assert_eq!(
+            parse_gsp_static_info(&payload),
+            Err(GspStaticInfoError::GpuNameEmpty)
         );
         payload
             [NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET..NVIDIA_GSP_R570_STATIC_GPU_NAME_OFFSET + 64]

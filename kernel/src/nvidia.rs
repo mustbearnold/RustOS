@@ -932,6 +932,11 @@ pub fn boot_external_gsp(
         0,
         &system_info,
     )?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM command function={} transport_sequence=0 rpc_sequence=0 payload_bytes={} queue=shared status=sent",
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GSP_SET_SYSTEM_INFO,
+        system_info.len(),
+    );
     let registry = rustos_gpu_protocol::encode_gsp_registry();
     transport.send_gsp_rpc(
         staging,
@@ -940,22 +945,48 @@ pub fn boot_external_gsp(
         0,
         &registry,
     )?;
-    transport
+    crate::kprintln!(
+        "driver: nvidia GSP-RM command function={} transport_sequence=1 rpc_sequence=0 payload_bytes={} queue=shared status=sent",
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_SET_REGISTRY,
+        registry.len(),
+    );
+    let init_done = transport
         .wait_for_gsp_function(staging, rustos_gpu_protocol::NVIDIA_GSP_EVENT_GSP_INIT_DONE)?;
+    let init_done =
+        rustos_gpu_protocol::GspRpcMessage::parse(&init_done).map_err(NvidiaError::GspRpc)?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM event function={} transport_sequence={} rpc_sequence={} status=consumed",
+        init_done.function(),
+        init_done.transport_sequence(),
+        init_done.rpc_sequence(),
+    );
     let static_info_request = rustos_gpu_protocol::encode_gsp_static_info_request();
     transport.send_gsp_rpc(
         staging,
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
         2,
-        0,
+        2,
         &static_info_request,
     )?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM command function={} transport_sequence=2 rpc_sequence=2 payload_bytes={} queue=shared status=sent",
+        rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+        static_info_request.len(),
+    );
     let static_info_message = transport.wait_for_gsp_function(
         staging,
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
     )?;
     let static_info_message = rustos_gpu_protocol::GspRpcMessage::parse(&static_info_message)
         .map_err(NvidiaError::GspRpc)?;
+    crate::kprintln!(
+        "driver: nvidia GSP-RM reply function={} transport_sequence={} rpc_sequence={} result=0x{:08x} private_result=0x{:08x} status=received",
+        static_info_message.function(),
+        static_info_message.transport_sequence(),
+        static_info_message.rpc_sequence(),
+        static_info_message.rpc_result(),
+        static_info_message.rpc_result_private(),
+    );
     if static_info_message.rpc_result() != 0 {
         return Err(NvidiaError::GspRpcFailed {
             function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,

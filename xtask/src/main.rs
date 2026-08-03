@@ -1440,6 +1440,13 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         "driver: nvidia FSP COT response",
         "status=accepted",
         "driver: nvidia GSP-FMC ready",
+        "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent",
+        "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent",
+        "driver: nvidia GSP-RM event function=4097",
+        "status=consumed",
+        "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=2 payload_bytes=1656 queue=shared status=sent",
+        "driver: nvidia GSP-RM reply function=65",
+        "status=received",
         "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info",
         "gsp_rm_status=gsp-rm-ready device_writes=opt-in",
         "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04",
@@ -1452,6 +1459,26 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
             return Err(format!("physical NVIDIA GSP proof missing `{marker}`"));
         };
         cursor += relative + marker.len();
+    }
+    let Some(static_info_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia GSP-RM ready function_flow="))
+    else {
+        return Err("physical NVIDIA GSP proof missing static-info status line".to_owned());
+    };
+    let Some(name_bytes) = static_info_line
+        .split_once("gpu_name=[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(bytes, _)| bytes)
+    else {
+        return Err("physical NVIDIA GSP proof missing static GPU name".to_owned());
+    };
+    let has_nonzero_name_byte = name_bytes
+        .split(',')
+        .filter_map(|byte| byte.trim().parse::<u8>().ok())
+        .any(|byte| byte != 0);
+    if !has_nonzero_name_byte {
+        return Err("physical NVIDIA GSP proof has empty static GPU name".to_owned());
     }
     if content.contains("GSP-RM bootstrap failed")
         || content.contains("nvidia probe failed")
@@ -6408,7 +6435,12 @@ mod tests {
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
             "driver: nvidia FSP COT response status=accepted\n",
             "driver: nvidia GSP-FMC ready status=ready\n",
-            "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[0]\n",
+            "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent\n",
+            "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
+            "driver: nvidia GSP-RM event function=4097 transport_sequence=4 rpc_sequence=0 status=consumed\n",
+            "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=2 payload_bytes=1656 queue=shared status=sent\n",
+            "driver: nvidia GSP-RM reply function=65 transport_sequence=5 rpc_sequence=2 result=0x00000000 private_result=0x00000000 status=received\n",
+            "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[78, 86, 73, 68, 73, 65, 0]\n",
             "driver: nvidia GSP staging gsp_rm_status=gsp-rm-ready device_writes=opt-in status=ready\n",
             "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
         );
@@ -6416,6 +6448,10 @@ mod tests {
 
         let missing_static_info = success.replace("get-static-info", "missing-static-info");
         assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());
+
+        let empty_gpu_name =
+            success.replace("gpu_name=[78, 86, 73, 68, 73, 65, 0]", "gpu_name=[0]");
+        assert!(validate_nvidia_gsp_physical_log(&empty_gpu_name).is_err());
 
         let failed = format!("{success}driver: nvidia GSP-RM bootstrap failed status=degraded\n");
         assert!(validate_nvidia_gsp_physical_log(&failed).is_err());
