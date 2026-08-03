@@ -102,3 +102,7 @@ The project is intentionally staged. Each stage needs a boot or host-runtime pro
 - performance profile matching and compatibility validation against CachyOS workloads
 
 The project will not claim “entirely Rust” until every component owned by this repository is Rust and the remaining firmware or third-party binary boundary is explicitly documented.
+
+## Autonomous delivery loop
+
+Daily autonomous development is an explicit project requirement. The model is invoked by an external scheduler or runner, chooses one highest-value daily-use blocker, implements a bounded Rust slice, runs the relevant host and BIOS/UEFI gates, and commits directly to `main` only when the evidence passes. See `AUTONOMY.md` for the acceptance floors and the boundary between QEMU regression evidence and native Ryzen 7 5800X/RTX 5070 hardware validation.
