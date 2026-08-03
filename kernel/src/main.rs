@@ -754,7 +754,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             display.device_id
         );
     }
-    match nvidia::initialize(&pci_inventory, physical_memory_offset) {
+    let nvidia_probe = match nvidia::initialize(&pci_inventory, physical_memory_offset) {
         Ok(Some(probe)) => {
             hardware::set_nvidia(probe);
             kprintln!(
@@ -794,13 +794,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 nvidia::GSP_SHARED_MEMORY_PTES,
                 nvidia::GSP_QUEUE_ENTRY_COUNT
             );
+            Some(probe)
         }
-        Ok(None) => kprintln!("driver: nvidia RTX 5070 not present status=absent"),
-        Err(error) => kprintln!(
-            "driver: nvidia probe failed ({:?}) acceleration=unavailable status=degraded",
-            error
-        ),
-    }
+        Ok(None) => {
+            kprintln!("driver: nvidia RTX 5070 not present status=absent");
+            None
+        }
+        Err(error) => {
+            kprintln!(
+                "driver: nvidia probe failed ({:?}) acceleration=unavailable status=degraded",
+                error
+            );
+            None
+        }
+    };
     match igc::probe(&pci_inventory, physical_memory_offset) {
         Ok(Some(probe)) => {
             hardware::set_i225(probe);
@@ -1366,6 +1373,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             );
         }
     }
+    let nvidia_gsp_staging = if storage_ready && nvidia_probe.is_some() {
+        match nvidia::stage_external_gsp(
+            physical_memory_offset,
+            &boot_info.memory_regions,
+            gpu_dma_next_frame_address,
+        ) {
+            Ok(Some(staging)) => {
+                kprintln!(
+                    "driver: nvidia GSP staging system_base=0x{:x} system_bytes={} system_pages={} system_end=0x{:x} gsp_bytes={} fmc_bytes={} bootloader_bytes={} fsp_cot_bytes={} framebuffer_size={} frts=0x{:x}+0x{:x} device_writes=disabled status=ready",
+                    staging.system_base(),
+                    staging.system_bytes(),
+                    staging.system_pages(),
+                    staging.system_end(),
+                    staging.gsp_bytes,
+                    staging.fmc_bytes,
+                    staging.bootloader_bytes,
+                    staging.fsp_cot.len(),
+                    nvidia::NVIDIA_GB20X_FRAMEBUFFER_SIZE,
+                    staging.framebuffer.frts_address,
+                    staging.framebuffer.frts_size,
+                );
+                Some(staging)
+            }
+            Ok(None) => {
+                kprintln!(
+                    "driver: nvidia GSP firmware carrier absent paths=/GSP.BIN,/FMC.BIN,/BOOT.BIN status=absent"
+                );
+                None
+            }
+            Err(error) => {
+                kprintln!(
+                    "driver: nvidia GSP staging failed ({:?}) device_writes=disabled status=degraded",
+                    error
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let nvidia_dma_next_frame_address = nvidia_gsp_staging
+        .as_ref()
+        .map_or(gpu_dma_next_frame_address, |staging| {
+            Some(staging.next_frame_address())
+        });
+    process::update_frame_allocator(nvidia_dma_next_frame_address);
     let graphics_backend = hardware::snapshot().graphics_backend;
     kprintln!(
         "graphics: backend={} compositor={} acceleration={} status={}",
@@ -1512,7 +1565,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             match smp::init(
                 physical_memory,
                 &boot_info.memory_regions,
-                gpu_dma_next_frame_address,
+                nvidia_dma_next_frame_address,
                 acpi_info,
             ) {
                 Ok(stats) => {

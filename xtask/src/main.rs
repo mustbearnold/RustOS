@@ -76,6 +76,13 @@ enum ImageMode {
     Desktop,
 }
 
+#[derive(Debug)]
+struct NvidiaFirmwareCarrier {
+    gsp: Vec<u8>,
+    fmc: Vec<u8>,
+    bootloader: Vec<u8>,
+}
+
 fn main() {
     if let Err(error) = execute(env::args().skip(1).collect()) {
         eprintln!("rustos: {error}");
@@ -708,12 +715,22 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     let desktop_initramfs = build_initramfs(&desktop_entries)?;
     let recovery_initramfs = build_initramfs(&recovery_entries)?;
     let repository = build_repository();
+    let nvidia_firmware = optional_nvidia_firmware()?;
+    if let Some(firmware) = nvidia_firmware.as_ref() {
+        println!(
+            "nvidia firmware carrier: gsp_bytes={} fmc_bytes={} bootloader_bytes={} files=GSP.BIN,FMC.BIN,BOOT.BIN status=ready",
+            firmware.gsp.len(),
+            firmware.fmc.len(),
+            firmware.bootloader.len(),
+        );
+    }
 
     let bios = images.join(image_name("bios", release, ImageMode::Default));
     let mut bios_builder = DiskImageBuilder::new(kernel.clone());
     bios_builder.set_file_contents("initrd.cpi".to_owned(), initramfs.clone());
     bios_builder.set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     bios_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut bios_builder, nvidia_firmware.as_ref());
     bios_builder
         .create_bios_image(&bios)
         .map_err(|error| format!("creating BIOS image {}: {error:#}", bios.display()))?;
@@ -723,6 +740,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     uefi_builder.set_file_contents("initrd.cpi".to_owned(), initramfs.clone());
     uefi_builder.set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     uefi_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut uefi_builder, nvidia_firmware.as_ref());
     uefi_builder
         .create_uefi_image(&uefi)
         .map_err(|error| format!("creating UEFI image {}: {error:#}", uefi.display()))?;
@@ -733,6 +751,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
         &repository,
         &uefi_partitioned,
         partitioned_root_size,
+        nvidia_firmware.as_ref(),
     )?;
 
     let bios_shell = images.join(image_name("bios", release, ImageMode::Shell));
@@ -740,6 +759,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     bios_shell_builder.set_file_contents("initrd.cpi".to_owned(), shell_initramfs.clone());
     bios_shell_builder.set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     bios_shell_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut bios_shell_builder, nvidia_firmware.as_ref());
     bios_shell_builder
         .create_bios_image(&bios_shell)
         .map_err(|error| {
@@ -754,6 +774,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     uefi_shell_builder.set_file_contents("initrd.cpi".to_owned(), shell_initramfs.clone());
     uefi_shell_builder.set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     uefi_shell_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut uefi_shell_builder, nvidia_firmware.as_ref());
     uefi_shell_builder
         .create_uefi_image(&uefi_shell)
         .map_err(|error| {
@@ -770,6 +791,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
         &repository,
         &uefi_shell_partitioned,
         partitioned_root_size,
+        nvidia_firmware.as_ref(),
     )?;
 
     let bios_desktop = images.join(image_name("bios", release, ImageMode::Desktop));
@@ -778,6 +800,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     bios_desktop_builder
         .set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     bios_desktop_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut bios_desktop_builder, nvidia_firmware.as_ref());
     bios_desktop_builder
         .create_bios_image(&bios_desktop)
         .map_err(|error| {
@@ -793,6 +816,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     uefi_desktop_builder
         .set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     uefi_desktop_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut uefi_desktop_builder, nvidia_firmware.as_ref());
     uefi_desktop_builder
         .create_uefi_image(&uefi_desktop)
         .map_err(|error| {
@@ -809,6 +833,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
         &repository,
         &uefi_desktop_partitioned,
         partitioned_root_size,
+        nvidia_firmware.as_ref(),
     )?;
 
     let bios_recovery = images.join(image_name("bios", release, ImageMode::Recovery));
@@ -817,6 +842,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     bios_recovery_builder
         .set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     bios_recovery_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut bios_recovery_builder, nvidia_firmware.as_ref());
     bios_recovery_builder
         .create_bios_image(&bios_recovery)
         .map_err(|error| {
@@ -832,6 +858,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     uefi_recovery_builder
         .set_file_contents("rustos.st".to_owned(), PERSISTENT_STATE_CONTENT.to_vec());
     uefi_recovery_builder.set_file_contents("rustos.rep".to_owned(), repository.clone());
+    add_nvidia_firmware_files(&mut uefi_recovery_builder, nvidia_firmware.as_ref());
     uefi_recovery_builder
         .create_uefi_image(&uefi_recovery)
         .map_err(|error| {
@@ -848,6 +875,7 @@ fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
         &repository,
         &uefi_recovery_partitioned,
         partitioned_root_size,
+        nvidia_firmware.as_ref(),
     )?;
 
     println!("kernel: {}", kernel.display());
@@ -881,6 +909,7 @@ fn create_partitioned_uefi_image(
     repository: &[u8],
     output: &Path,
     root_size: u64,
+    nvidia_firmware: Option<&NvidiaFirmwareCarrier>,
 ) -> Result<(), String> {
     validate_partitioned_root_size(root_size)?;
     let timestamp = SystemTime::now()
@@ -906,16 +935,20 @@ fn create_partitioned_uefi_image(
 
         let kernel_image = fs::read(kernel)
             .map_err(|error| format!("reading kernel for {}: {error}", output.display()))?;
-        create_fat32_root_partition(
-            &root_path,
-            root_size,
-            &[
-                ("kernel-x86_64", kernel_image.as_slice()),
-                ("initrd.cpi", initramfs),
-                ("rustos.st", PERSISTENT_STATE_CONTENT),
-                ("rustos.rep", repository),
-            ],
-        )?;
+        let mut root_files: Vec<(&str, &[u8])> = vec![
+            ("kernel-x86_64", kernel_image.as_slice()),
+            ("initrd.cpi", initramfs),
+            ("rustos.st", PERSISTENT_STATE_CONTENT),
+            ("rustos.rep", repository),
+        ];
+        if let Some(firmware) = nvidia_firmware {
+            root_files.extend([
+                ("gsp.bin", firmware.gsp.as_slice()),
+                ("fmc.bin", firmware.fmc.as_slice()),
+                ("boot.bin", firmware.bootloader.as_slice()),
+            ]);
+        }
+        create_fat32_root_partition(&root_path, root_size, &root_files)?;
         create_gpt_disk_with_root(&esp_path, &root_path, output)
     })();
     let _ = fs::remove_file(&esp_path);
@@ -1388,6 +1421,52 @@ fn read_firmware_blob(path: &Path) -> Result<Vec<u8>, String> {
         return Ok(output.stdout);
     }
     fs::read(&resolved).map_err(|error| format!("reading firmware {}: {error}", path.display()))
+}
+
+fn optional_nvidia_firmware() -> Result<Option<NvidiaFirmwareCarrier>, String> {
+    let gsp_path = env::var_os("RUSTOS_NVIDIA_GSP").map(PathBuf::from);
+    let fmc_path = env::var_os("RUSTOS_NVIDIA_FMC").map(PathBuf::from);
+    let bootloader_path = env::var_os("RUSTOS_NVIDIA_BOOTLOADER").map(PathBuf::from);
+    if gsp_path.is_none() && fmc_path.is_none() && bootloader_path.is_none() {
+        return Ok(None);
+    }
+    let gsp_path = gsp_path.ok_or_else(|| {
+        "RUSTOS_NVIDIA_GSP, RUSTOS_NVIDIA_FMC, and RUSTOS_NVIDIA_BOOTLOADER must be set together"
+            .to_owned()
+    })?;
+    let fmc_path = fmc_path.ok_or_else(|| {
+        "RUSTOS_NVIDIA_GSP, RUSTOS_NVIDIA_FMC, and RUSTOS_NVIDIA_BOOTLOADER must be set together"
+            .to_owned()
+    })?;
+    let bootloader_path = bootloader_path.ok_or_else(|| {
+        "RUSTOS_NVIDIA_GSP, RUSTOS_NVIDIA_FMC, and RUSTOS_NVIDIA_BOOTLOADER must be set together"
+            .to_owned()
+    })?;
+    let gsp = read_firmware_blob(&gsp_path)?;
+    let fmc = read_firmware_blob(&fmc_path)?;
+    let bootloader = read_firmware_blob(&bootloader_path)?;
+    let gsp_descriptor = GspFirmware::parse(&gsp)
+        .map_err(|error| format!("validating NVIDIA GSP carrier: {error:?}"))?;
+    let expected_version = gsp_descriptor.version_bytes(&gsp);
+    GspFirmwareBundle::parse(&gsp, &fmc, &bootloader, expected_version)
+        .map_err(|error| format!("validating NVIDIA GSP carrier bundle: {error:?}"))?;
+    Ok(Some(NvidiaFirmwareCarrier {
+        gsp,
+        fmc,
+        bootloader,
+    }))
+}
+
+fn add_nvidia_firmware_files(
+    builder: &mut DiskImageBuilder,
+    firmware: Option<&NvidiaFirmwareCarrier>,
+) {
+    let Some(firmware) = firmware else {
+        return;
+    };
+    builder.set_file_contents("gsp.bin".to_owned(), firmware.gsp.clone());
+    builder.set_file_contents("fmc.bin".to_owned(), firmware.fmc.clone());
+    builder.set_file_contents("boot.bin".to_owned(), firmware.bootloader.clone());
 }
 
 fn check() -> Result<(), String> {
@@ -6457,6 +6536,7 @@ mod tests {
             b"repository",
             &image,
             PARTITIONED_ROOT_SIZE,
+            None,
         )
         .unwrap();
         let table = gpt::GptConfig::new()
@@ -6508,6 +6588,7 @@ mod tests {
             b"repository",
             &source,
             PARTITIONED_ROOT_SIZE,
+            None,
         )
         .unwrap();
         let target_file = fs::OpenOptions::new()

@@ -8,10 +8,10 @@ mod fsp;
 
 pub use boot::{
     GspBootloader, GspBootloaderError, GspFirmwareBundle, GspFirmwareBundleError, GspFmcBootParams,
-    GspRmDescriptorField, GspRmUcodeDescriptor, GspWprMeta, NVIDIA_GSP_FMC_BOOT_PARAMS_SIZE,
-    NVIDIA_GSP_WPR_META_SIZE,
+    GspRmDescriptorField, GspRmUcodeDescriptor, GspWprMeta, NVIDIA_GSP_BOOTLOADER_MAX_SIZE,
+    NVIDIA_GSP_FMC_BOOT_PARAMS_SIZE, NVIDIA_GSP_WPR_META_SIZE,
 };
-pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection};
+pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection, NVIDIA_GSP_FMC_MAX_SIZE};
 pub use fsp::{
     GspFspCot, GspFspCotError, GspFspResponse, GspFspResponseError,
     NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH, NVIDIA_GSP_FSP_COT_HASH_BYTES,

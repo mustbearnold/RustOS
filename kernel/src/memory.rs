@@ -40,6 +40,74 @@ impl PhysicalFrame {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalRange {
+    start_address: u64,
+    byte_length: usize,
+    page_count: usize,
+}
+
+impl PhysicalRange {
+    pub const fn start_address(self) -> u64 {
+        self.start_address
+    }
+
+    pub const fn byte_length(self) -> usize {
+        self.byte_length
+    }
+
+    pub const fn page_count(self) -> usize {
+        self.page_count
+    }
+
+    pub fn end_address(self) -> Option<u64> {
+        self.start_address.checked_add(
+            u64::try_from(self.page_count)
+                .ok()?
+                .checked_mul(PAGE_SIZE)?,
+        )
+    }
+}
+
+/// Find page-contiguous usable memory for a device-visible buffer.
+///
+/// The caller owns reservation ordering: pass the next unallocated physical address from the
+/// device allocator, then advance it to `end_address` before allocating another buffer. This
+/// keeps this pure search helper usable by early boot and host tests without global allocator
+/// state.
+pub fn find_contiguous_usable_range(
+    regions: &[MemoryRegion],
+    starting_at: Option<u64>,
+    byte_length: usize,
+) -> Option<PhysicalRange> {
+    if byte_length == 0 {
+        return None;
+    }
+    let page_count = byte_length
+        .checked_add(PAGE_SIZE as usize - 1)?
+        .checked_div(PAGE_SIZE as usize)?;
+    let aligned_bytes = page_count.checked_mul(PAGE_SIZE as usize)?;
+    let minimum_address = starting_at.unwrap_or(ALLOCATABLE_MEMORY_START);
+
+    for region in regions {
+        if region.kind != MemoryRegionKind::Usable || region.start >= region.end {
+            continue;
+        }
+        let candidate = region.start.max(minimum_address);
+        let candidate = candidate.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        let region_end = region.end & !(PAGE_SIZE - 1);
+        let end = candidate.checked_add(u64::try_from(aligned_bytes).ok()?)?;
+        if candidate < region_end && end <= region_end {
+            return Some(PhysicalRange {
+                start_address: candidate,
+                byte_length,
+                page_count,
+            });
+        }
+    }
+    None
+}
+
 pub struct FrameAllocator<'a> {
     regions: &'a [MemoryRegion],
     region_index: usize,
@@ -354,5 +422,68 @@ mod tests {
             Some(0xc000)
         );
         assert_eq!(first_usable_frame_in_range(&regions, 0x5000, 0x8000), None);
+    }
+
+    #[test]
+    fn finds_a_page_contiguous_device_buffer_after_the_allocator_cursor() {
+        let regions = [
+            MemoryRegion {
+                start: 0x100000,
+                end: 0x108000,
+                kind: MemoryRegionKind::Usable,
+            },
+            MemoryRegion {
+                start: 0x108000,
+                end: 0x110000,
+                kind: MemoryRegionKind::Bootloader,
+            },
+            MemoryRegion {
+                start: 0x200003,
+                end: 0x212345,
+                kind: MemoryRegionKind::Usable,
+            },
+        ];
+
+        let range = find_contiguous_usable_range(&regions, Some(0x205001), 0x5001)
+            .expect("contiguous buffer");
+        assert_eq!(range.start_address(), 0x206000);
+        assert_eq!(range.byte_length(), 0x5001);
+        assert_eq!(range.page_count(), 6);
+        assert_eq!(range.end_address(), Some(0x20c000));
+    }
+
+    #[test]
+    fn skips_usable_regions_that_cannot_fit_the_full_buffer() {
+        let regions = [
+            MemoryRegion {
+                start: 0x100000,
+                end: 0x104000,
+                kind: MemoryRegionKind::Usable,
+            },
+            MemoryRegion {
+                start: 0x200000,
+                end: 0x20c000,
+                kind: MemoryRegionKind::Usable,
+            },
+        ];
+
+        let range = find_contiguous_usable_range(&regions, None, 0x9000).expect("second region");
+        assert_eq!(range.start_address(), 0x200000);
+        assert_eq!(range.page_count(), 9);
+        assert_eq!(range.end_address(), Some(0x209000));
+    }
+
+    #[test]
+    fn rejects_empty_or_overflowing_contiguous_ranges() {
+        let regions = [MemoryRegion {
+            start: 0x100000,
+            end: 0x200000,
+            kind: MemoryRegionKind::Usable,
+        }];
+        assert_eq!(find_contiguous_usable_range(&regions, None, 0), None);
+        assert_eq!(
+            find_contiguous_usable_range(&regions, Some(u64::MAX - 1), 0x1000),
+            None
+        );
     }
 }

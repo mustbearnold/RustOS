@@ -1,3 +1,8 @@
+#[cfg(target_os = "none")]
+use bootloader_api::info::MemoryRegion;
+
+#[cfg(target_os = "none")]
+use crate::memory::PhysicalRange;
 use crate::pci::{
     MmioError, MmioRegion, PciAddress, PciBar, PciDevice, PciDeviceResources, PciInventory,
     PciResourceError,
@@ -11,6 +16,12 @@ pub const GSP_SHARED_MEMORY_PTES: usize =
     rustos_gpu_protocol::GspSharedMemoryLayout::standard().page_table_entry_count;
 pub const GSP_QUEUE_ENTRY_COUNT: usize =
     rustos_gpu_protocol::GspSharedMemoryLayout::standard().queue_entry_count;
+pub const NVIDIA_GB20X_FRAMEBUFFER_SIZE: u64 = 16 * (1u64 << 30);
+pub const NVIDIA_GB20X_BIOS_ADDRESS: u64 = NVIDIA_GB20X_FRAMEBUFFER_SIZE - 0x20_000;
+
+const NVIDIA_GSP_FIRMWARE_PATH: &[u8] = b"/GSP.BIN";
+const NVIDIA_FMC_FIRMWARE_PATH: &[u8] = b"/FMC.BIN";
+const NVIDIA_BOOTLOADER_FIRMWARE_PATH: &[u8] = b"/BOOT.BIN";
 
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
@@ -66,6 +77,298 @@ impl From<rustos_gpu_protocol::GspFspResponseError> for NvidiaError {
     fn from(error: rustos_gpu_protocol::GspFspResponseError) -> Self {
         Self::FspResponse(error)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvidiaFirmwarePart {
+    Gsp,
+    Fmc,
+    Bootloader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvidiaGspStageError {
+    StorageUnavailable,
+    MissingFirmwarePart {
+        part: NvidiaFirmwarePart,
+    },
+    InvalidFirmwareSize {
+        part: NvidiaFirmwarePart,
+        size: usize,
+        limit: usize,
+    },
+    FirmwareRead {
+        part: NvidiaFirmwarePart,
+        expected: usize,
+        actual: usize,
+    },
+    AllocationUnavailable {
+        bytes: usize,
+    },
+    AddressOverflow,
+    Gsp(rustos_gpu_protocol::GspFirmwareError),
+    Bundle(rustos_gpu_protocol::GspFirmwareBundleError),
+    SystemMemoryPlan(rustos_gpu_protocol::GspSystemMemoryPlanError),
+    Framebuffer(rustos_gpu_protocol::GspFramebufferLayoutError),
+    Materialization(rustos_gpu_protocol::GspMaterializationError),
+    FspCot(rustos_gpu_protocol::GspFspCotError),
+}
+
+#[cfg(target_os = "none")]
+#[derive(Debug)]
+pub struct NvidiaGspStaging {
+    system_memory: PhysicalBuffer,
+    pub plan: rustos_gpu_protocol::GspBootSystemMemoryPlan,
+    pub framebuffer: rustos_gpu_protocol::GspFramebufferLayout,
+    pub fsp_cot: [u8; rustos_gpu_protocol::NVIDIA_GSP_FSP_COT_PACKET_SIZE],
+    pub gsp_bytes: usize,
+    pub fmc_bytes: usize,
+    pub bootloader_bytes: usize,
+    next_frame_address: u64,
+}
+
+#[cfg(target_os = "none")]
+impl NvidiaGspStaging {
+    pub fn system_base(&self) -> u64 {
+        self.plan.system_base
+    }
+
+    pub fn system_bytes(&self) -> usize {
+        self.plan.total_bytes
+    }
+
+    pub fn system_pages(&self) -> usize {
+        self.system_memory.range.page_count()
+    }
+
+    pub fn system_end(&self) -> u64 {
+        self.plan.end_address
+    }
+
+    pub fn next_frame_address(&self) -> u64 {
+        self.next_frame_address
+    }
+}
+
+#[cfg(target_os = "none")]
+#[derive(Debug)]
+struct PhysicalBuffer {
+    range: PhysicalRange,
+    mapped_address: usize,
+}
+
+#[cfg(target_os = "none")]
+impl PhysicalBuffer {
+    fn allocate(
+        regions: &[MemoryRegion],
+        physical_memory_offset: u64,
+        starting_at: Option<u64>,
+        byte_length: usize,
+    ) -> Result<Self, NvidiaGspStageError> {
+        let range = crate::memory::find_contiguous_usable_range(regions, starting_at, byte_length)
+            .ok_or(NvidiaGspStageError::AllocationUnavailable { bytes: byte_length })?;
+        let mapped_address = physical_memory_offset
+            .checked_add(range.start_address())
+            .ok_or(NvidiaGspStageError::AddressOverflow)?;
+        let mapped_address =
+            usize::try_from(mapped_address).map_err(|_| NvidiaGspStageError::AddressOverflow)?;
+        Ok(Self {
+            range,
+            mapped_address,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: bootloader maps the complete physical memory range at `mapped_address`; the
+        // range came from usable page-aligned firmware memory and owns no overlapping allocation.
+        unsafe {
+            core::slice::from_raw_parts(self.mapped_address as *const u8, self.range.byte_length())
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: same mapping and ownership guarantee as `as_slice`; caller has unique access to
+        // this physical buffer while firmware bytes are loaded or materialized.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.mapped_address as *mut u8,
+                self.range.byte_length(),
+            )
+        }
+    }
+
+    fn end_address(&self) -> Result<u64, NvidiaGspStageError> {
+        self.range
+            .end_address()
+            .ok_or(NvidiaGspStageError::AddressOverflow)
+    }
+}
+
+#[cfg(target_os = "none")]
+fn firmware_size(
+    part: NvidiaFirmwarePart,
+    path: &[u8],
+    limit: usize,
+) -> Result<Option<usize>, NvidiaGspStageError> {
+    let size = crate::storage::runtime_file_size(path)
+        .map_err(|_| NvidiaGspStageError::StorageUnavailable)?;
+    let Some(size) = size else {
+        return Ok(None);
+    };
+    if size == 0 || size > limit {
+        return Err(NvidiaGspStageError::InvalidFirmwareSize { part, size, limit });
+    }
+    Ok(Some(size))
+}
+
+#[cfg(target_os = "none")]
+fn load_firmware_part(
+    part: NvidiaFirmwarePart,
+    path: &[u8],
+    buffer: &mut PhysicalBuffer,
+) -> Result<(), NvidiaGspStageError> {
+    let expected = buffer.range.byte_length();
+    let actual =
+        crate::storage::read_runtime_file(path, 0, buffer.as_mut_slice()).map_err(|_| {
+            NvidiaGspStageError::FirmwareRead {
+                part,
+                expected,
+                actual: 0,
+            }
+        })?;
+    if actual != expected {
+        return Err(NvidiaGspStageError::FirmwareRead {
+            part,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "none")]
+pub fn stage_external_gsp(
+    physical_memory_offset: u64,
+    regions: &[MemoryRegion],
+    starting_at: Option<u64>,
+) -> Result<Option<NvidiaGspStaging>, NvidiaGspStageError> {
+    let gsp_size = firmware_size(
+        NvidiaFirmwarePart::Gsp,
+        NVIDIA_GSP_FIRMWARE_PATH,
+        rustos_gpu_protocol::NVIDIA_GSP_MAX_FIRMWARE_SIZE,
+    )?;
+    let fmc_size = firmware_size(
+        NvidiaFirmwarePart::Fmc,
+        NVIDIA_FMC_FIRMWARE_PATH,
+        rustos_gpu_protocol::NVIDIA_GSP_FMC_MAX_SIZE,
+    )?;
+    let bootloader_size = firmware_size(
+        NvidiaFirmwarePart::Bootloader,
+        NVIDIA_BOOTLOADER_FIRMWARE_PATH,
+        rustos_gpu_protocol::NVIDIA_GSP_BOOTLOADER_MAX_SIZE,
+    )?;
+    if gsp_size.is_none() && fmc_size.is_none() && bootloader_size.is_none() {
+        return Ok(None);
+    }
+    let gsp_size = gsp_size.ok_or(NvidiaGspStageError::MissingFirmwarePart {
+        part: NvidiaFirmwarePart::Gsp,
+    })?;
+    let fmc_size = fmc_size.ok_or(NvidiaGspStageError::MissingFirmwarePart {
+        part: NvidiaFirmwarePart::Fmc,
+    })?;
+    let bootloader_size = bootloader_size.ok_or(NvidiaGspStageError::MissingFirmwarePart {
+        part: NvidiaFirmwarePart::Bootloader,
+    })?;
+
+    let mut next = starting_at;
+    let mut gsp_source = PhysicalBuffer::allocate(regions, physical_memory_offset, next, gsp_size)?;
+    next = Some(gsp_source.end_address()?);
+    let mut fmc_source = PhysicalBuffer::allocate(regions, physical_memory_offset, next, fmc_size)?;
+    next = Some(fmc_source.end_address()?);
+    let mut bootloader_source =
+        PhysicalBuffer::allocate(regions, physical_memory_offset, next, bootloader_size)?;
+    next = Some(bootloader_source.end_address()?);
+
+    load_firmware_part(
+        NvidiaFirmwarePart::Gsp,
+        NVIDIA_GSP_FIRMWARE_PATH,
+        &mut gsp_source,
+    )?;
+    load_firmware_part(
+        NvidiaFirmwarePart::Fmc,
+        NVIDIA_FMC_FIRMWARE_PATH,
+        &mut fmc_source,
+    )?;
+    load_firmware_part(
+        NvidiaFirmwarePart::Bootloader,
+        NVIDIA_BOOTLOADER_FIRMWARE_PATH,
+        &mut bootloader_source,
+    )?;
+
+    let gsp = rustos_gpu_protocol::GspFirmware::parse(gsp_source.as_slice())
+        .map_err(NvidiaGspStageError::Gsp)?;
+    let expected_version = gsp.version_bytes(gsp_source.as_slice());
+    let bundle = rustos_gpu_protocol::GspFirmwareBundle::parse(
+        gsp_source.as_slice(),
+        fmc_source.as_slice(),
+        bootloader_source.as_slice(),
+        expected_version,
+    )
+    .map_err(NvidiaGspStageError::Bundle)?;
+    let sizing_plan = rustos_gpu_protocol::GspBootSystemMemoryPlan::r570_gb20x(bundle, 0)
+        .map_err(NvidiaGspStageError::SystemMemoryPlan)?;
+    let mut system_memory = PhysicalBuffer::allocate(
+        regions,
+        physical_memory_offset,
+        next,
+        sizing_plan.total_bytes,
+    )?;
+    let plan = rustos_gpu_protocol::GspBootSystemMemoryPlan::r570_gb20x(
+        bundle,
+        system_memory.range.start_address(),
+    )
+    .map_err(NvidiaGspStageError::SystemMemoryPlan)?;
+    if plan.total_bytes != sizing_plan.total_bytes {
+        return Err(NvidiaGspStageError::AddressOverflow);
+    }
+    let framebuffer = rustos_gpu_protocol::GspFramebufferLayout::r570_gb20x(
+        NVIDIA_GB20X_FRAMEBUFFER_SIZE,
+        NVIDIA_GB20X_BIOS_ADDRESS,
+        plan.gsp_image_bytes,
+        plan.bootloader_bytes,
+    )
+    .map_err(NvidiaGspStageError::Framebuffer)?;
+    let fsp_cot = rustos_gpu_protocol::GspFspCot::gb20x(
+        plan.fmc_image.address,
+        plan.fmc_args.address,
+        framebuffer.frts_address,
+        u32::try_from(framebuffer.frts_size).map_err(|_| NvidiaGspStageError::AddressOverflow)?,
+        bundle.fmc.hash.bytes(fmc_source.as_slice()),
+        bundle.fmc.public_key.bytes(fmc_source.as_slice()),
+        bundle.fmc.signature.bytes(fmc_source.as_slice()),
+    )
+    .encode()
+    .map_err(NvidiaGspStageError::FspCot)?;
+    plan.materialize_bundle_into(
+        bundle,
+        gsp_source.as_slice(),
+        fmc_source.as_slice(),
+        bootloader_source.as_slice(),
+        framebuffer,
+        system_memory.as_mut_slice(),
+    )
+    .map_err(NvidiaGspStageError::Materialization)?;
+    let next_frame_address = system_memory.end_address()?;
+    Ok(Some(NvidiaGspStaging {
+        system_memory,
+        plan,
+        framebuffer,
+        fsp_cot,
+        gsp_bytes: gsp_size,
+        fmc_bytes: fmc_size,
+        bootloader_bytes: bootloader_size,
+        next_frame_address,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
