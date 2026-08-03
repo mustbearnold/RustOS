@@ -2263,6 +2263,22 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
         let steps = [
             ("id", "shell: credentials uid=1000 gid=1000 status=ready"),
             ("pwd", "shell: pwd path=/home/user status=ready"),
+            ("mkdir documents", "mkdir: ok"),
+            (
+                "cd documents",
+                "shell: cwd changed path=/home/user/documents status=ready",
+            ),
+            (
+                "write meeting-notes.txt long-name",
+                "shell: relative write path=/home/user/documents/meeting-notes.txt status=ready",
+            ),
+            (
+                "cat meeting-notes.txt",
+                "shell: relative read path=/home/user/documents/meeting-notes.txt status=ready",
+            ),
+            ("ls", "shell: ls path=/home/user/documents status=ready"),
+            ("cd ..", "shell: cwd changed path=/home/user status=ready"),
+            ("ls", "shell: ls path=/home/user status=ready"),
             ("mkdir work", "mkdir: ok"),
             (
                 "cd work",
@@ -3675,6 +3691,10 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell-login: account store ",
         "shell: credentials uid=1000 gid=1000 status=ready",
         "shell: pwd path=/home/user status=ready",
+        "shell: cwd changed path=/home/user/documents status=ready",
+        "shell: relative write path=/home/user/documents/meeting-notes.txt status=ready",
+        "shell: relative read path=/home/user/documents/meeting-notes.txt status=ready",
+        "shell: ls path=/home/user/documents status=ready",
         "shell: cwd changed path=/home/user/work status=ready",
         "shell: relative write path=/home/user/work/note status=ready",
         "shell: relative read path=/home/user/work/note status=ready",
@@ -3698,7 +3718,9 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || !content.contains("daily-use")
         || !content.contains("userland: /bin/replaced")
         || !content.contains("uid=1000 gid=1000 name=user")
-        || !content.contains("NOTE 9 data")
+        || !content.contains("note 9 data")
+        || !content.contains("documents 0 dir")
+        || !content.contains("meeting-notes.txt")
         || !content.contains("boot=1")
         || !content.contains("admin: state set status=ready")
         || !content.contains("admin: package operation status=ready")
@@ -3724,7 +3746,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "shell proof: identity=true permissions=true privileged_denied=true privileged_admin=true cwd=true relative_write=true relative_read=true ls=true screenshot_bytes={} status=ready",
+        "shell proof: identity=true permissions=true privileged_denied=true privileged_admin=true cwd=true long_names=true relative_write=true relative_read=true ls=true screenshot_bytes={} status=ready",
         screenshot_bytes.len()
     );
     Ok(())

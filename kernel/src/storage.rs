@@ -620,6 +620,13 @@ const FAT_DIRECTORY_CLUSTER_LIMIT: usize = 128;
 const FAT_PATH_COMPONENT_LIMIT: usize = 16;
 const FAT_RUNTIME_SNAPSHOT_FILE_LIMIT: usize = 128;
 const FAT_RUNTIME_SNAPSHOT_PATH_LENGTH: usize = 256;
+const FAT_LFN_ENTRY_SIZE: usize = FAT_DIRECTORY_ENTRY_SIZE;
+const FAT_LFN_ATTRIBUTE: u8 = FAT_ATTRIBUTE_LONG_NAME;
+const FAT_LFN_LAST_ENTRY: u8 = 0x40;
+const FAT_LFN_CHARS_PER_ENTRY: usize = 13;
+const MAX_LONG_NAME_LENGTH: usize = 255;
+const MAX_LONG_NAME_ENTRIES: usize =
+    (MAX_LONG_NAME_LENGTH + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY;
 pub const MAX_MUTABLE_FILE_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -883,6 +890,115 @@ struct FatDirectorySlot {
     file: Option<FatFileEntry>,
 }
 
+#[derive(Clone, Copy)]
+struct FatLongNameState {
+    bytes: [u8; MAX_LONG_NAME_LENGTH],
+    length: usize,
+    expected_order: u8,
+    checksum: u8,
+    valid: bool,
+}
+
+impl FatLongNameState {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_LONG_NAME_LENGTH],
+            length: 0,
+            expected_order: 0,
+            checksum: 0,
+            valid: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.length = 0;
+        self.expected_order = 0;
+        self.checksum = 0;
+        self.valid = false;
+    }
+
+    fn consume(&mut self, entry: &[u8]) {
+        if entry.len() < FAT_LFN_ENTRY_SIZE || entry[11] != FAT_LFN_ATTRIBUTE {
+            self.valid = false;
+            return;
+        }
+        let sequence = entry[0] & 0x1f;
+        let is_last = entry[0] & FAT_LFN_LAST_ENTRY != 0;
+        if sequence == 0 || usize::from(sequence) > MAX_LONG_NAME_ENTRIES {
+            self.valid = false;
+            return;
+        }
+        if entry[12] != 0 || entry[26] != 0 || entry[27] != 0 {
+            self.valid = false;
+            return;
+        }
+        if is_last {
+            self.bytes.fill(0);
+            self.length = usize::from(sequence) * FAT_LFN_CHARS_PER_ENTRY;
+            self.expected_order = sequence;
+            self.checksum = entry[13];
+            self.valid = true;
+        }
+        if !self.valid || sequence != self.expected_order {
+            self.valid = false;
+            return;
+        }
+
+        let start = (usize::from(sequence) - 1) * FAT_LFN_CHARS_PER_ENTRY;
+        for index in 0..FAT_LFN_CHARS_PER_ENTRY {
+            let offset = match index {
+                0..=4 => 1 + index * 2,
+                5..=10 => 14 + (index - 5) * 2,
+                _ => 28 + (index - 11) * 2,
+            };
+            let code_unit = u16::from_le_bytes([entry[offset], entry[offset + 1]]);
+            let destination = start + index;
+            if code_unit == 0 {
+                self.length = self.length.min(destination);
+            } else if code_unit == u16::MAX {
+                continue;
+            } else if code_unit <= u16::from(u8::MAX) && code_unit >= 0x20 {
+                if destination >= self.bytes.len() {
+                    self.valid = false;
+                    return;
+                }
+                self.bytes[destination] = code_unit as u8;
+            } else {
+                self.valid = false;
+                return;
+            }
+        }
+        self.expected_order = self.expected_order.saturating_sub(1);
+    }
+
+    fn matches(&self, component: &[u8], short_name: &[u8; 11]) -> bool {
+        if !self.valid
+            || self.expected_order != 0
+            || self.checksum != fat_long_name_checksum(short_name)
+            || self.length == 0
+            || self.length > self.bytes.len()
+        {
+            return short_name_from_component(component)
+                .is_ok_and(|candidate| candidate == *short_name);
+        }
+        &self.bytes[..self.length] == component
+            || short_name_from_component(component).is_ok_and(|candidate| candidate == *short_name)
+    }
+
+    fn component<'a>(&'a self, short_name: &[u8; 11]) -> Option<&'a [u8]> {
+        if self.valid
+            && self.expected_order == 0
+            && self.checksum == fat_long_name_checksum(short_name)
+            && self.length != 0
+            && self.length <= self.bytes.len()
+        {
+            Some(&self.bytes[..self.length])
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LocatedFatEntry {
     entry: FatFileEntry,
@@ -1036,29 +1152,105 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok(None)
     }
 
+    fn find_directory_entry_slot_by_name(
+        &mut self,
+        directory: FatDirectoryRef,
+        component: &[u8],
+    ) -> Result<Option<FatDirectorySlot>, FatFileSystemError<D::Error>> {
+        validate_long_name_component(component).map_err(|_| FatFileSystemError::InvalidName)?;
+        let locations = self.directory_sector_locations(directory)?;
+        let mut sector = [0u8; SECTOR_SIZE];
+        let mut long_name = FatLongNameState::new();
+        for (relative_sector, _) in locations {
+            self.read_volume_sector(relative_sector, &mut sector)?;
+            for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
+                let entry = &sector[offset..offset + FAT_DIRECTORY_ENTRY_SIZE];
+                if entry[0] == 0 {
+                    return Ok(None);
+                }
+                if entry[0] == FAT_DELETED_ENTRY {
+                    long_name.reset();
+                    continue;
+                }
+                if entry[11] == FAT_LFN_ATTRIBUTE {
+                    long_name.consume(entry);
+                    continue;
+                }
+                let file = parse_fat_directory_entry(entry)?;
+                let matches =
+                    file.is_some_and(|file| long_name.matches(component, &file.short_name));
+                if let Some(file) = file {
+                    long_name.reset();
+                    if matches {
+                        return Ok(Some(FatDirectorySlot {
+                            relative_sector,
+                            offset,
+                            file: Some(file),
+                        }));
+                    }
+                } else {
+                    long_name.reset();
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn find_free_directory_slot(
         &mut self,
         directory: FatDirectoryRef,
     ) -> Result<FatDirectorySlot, FatFileSystemError<D::Error>> {
-        let locations = self.directory_sector_locations(directory)?;
-        let mut sector = [0u8; SECTOR_SIZE];
-        for (relative_sector, _) in locations {
-            self.read_volume_sector(relative_sector, &mut sector)?;
-            for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
-                if matches!(sector[offset], 0 | FAT_DELETED_ENTRY) {
-                    return Ok(FatDirectorySlot {
-                        relative_sector,
-                        offset,
-                        file: None,
-                    });
+        self.find_free_directory_slots(directory, 1)?
+            .into_iter()
+            .next()
+            .ok_or(FatFileSystemError::DirectoryFull)
+    }
+
+    fn find_free_directory_slots(
+        &mut self,
+        directory: FatDirectoryRef,
+        count: usize,
+    ) -> Result<Vec<FatDirectorySlot>, FatFileSystemError<D::Error>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        loop {
+            let locations = self.directory_sector_locations(directory)?;
+            let mut sector = [0u8; SECTOR_SIZE];
+            let mut free_slots = Vec::with_capacity(count);
+            for (relative_sector, _) in locations {
+                self.read_volume_sector(relative_sector, &mut sector)?;
+                for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
+                    let entry = &sector[offset..offset + FAT_DIRECTORY_ENTRY_SIZE];
+                    if matches!(entry[0], 0 | FAT_DELETED_ENTRY) {
+                        free_slots.push(FatDirectorySlot {
+                            relative_sector,
+                            offset,
+                            file: None,
+                        });
+                        if free_slots.len() == count {
+                            return Ok(free_slots);
+                        }
+                    } else {
+                        free_slots.clear();
+                    }
                 }
             }
-        }
 
+            if !self.extend_directory(directory)? {
+                return Err(FatFileSystemError::DirectoryFull);
+            }
+        }
+    }
+
+    fn extend_directory(
+        &mut self,
+        directory: FatDirectoryRef,
+    ) -> Result<bool, FatFileSystemError<D::Error>> {
         let first_cluster = match directory {
             FatDirectoryRef::Cluster(first_cluster) => first_cluster,
             FatDirectoryRef::Root if self.boot.fat_type == FatType::Fat32 => self.boot.root_cluster,
-            FatDirectoryRef::Root => return Err(FatFileSystemError::DirectoryFull),
+            FatDirectoryRef::Root => return Ok(false),
         };
         let clusters = self.collect_cluster_chain(first_cluster)?;
         let last_cluster = clusters
@@ -1084,12 +1276,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
             let _ = self.release_cluster_chain(&new_chain);
             return Err(error);
         }
-        let relative_sector = self.cluster_start_sector(new_cluster)?;
-        Ok(FatDirectorySlot {
-            relative_sector,
-            offset: 0,
-            file: None,
-        })
+        Ok(true)
     }
 
     #[cfg_attr(target_os = "none", allow(dead_code))]
@@ -1167,6 +1354,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
 
             let locations = self.directory_sector_locations(current.directory)?;
             let mut sector = [0u8; SECTOR_SIZE];
+            let mut long_name = FatLongNameState::new();
             'sectors: for (relative_sector, _) in locations {
                 self.read_volume_sector(relative_sector, &mut sector)?;
                 for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
@@ -1174,15 +1362,33 @@ impl<D: BlockDevice> FatFileSystem<D> {
                     if entry[0] == 0 {
                         break 'sectors;
                     }
+                    if entry[0] == FAT_DELETED_ENTRY {
+                        long_name.reset();
+                        continue;
+                    }
+                    if entry[11] == FAT_LFN_ATTRIBUTE {
+                        long_name.consume(entry);
+                        continue;
+                    }
                     let Some(file) = parse_fat_directory_entry(entry)? else {
+                        long_name.reset();
                         continue;
                     };
                     if is_dot_directory_entry(&file.short_name) {
+                        long_name.reset();
                         continue;
                     }
-                    let Some(short_path) = path_from_short_name(&file.short_name) else {
+                    let mut name_path = Vec::new();
+                    name_path.push(b'/');
+                    if let Some(name) = long_name.component(&file.short_name) {
+                        name_path.extend_from_slice(name);
+                    } else if let Some(short_path) = path_from_short_name(&file.short_name) {
+                        name_path.extend_from_slice(&short_path[1..]);
+                    } else {
+                        long_name.reset();
                         continue;
-                    };
+                    }
+                    long_name.reset();
                     if file.is_regular_file() {
                         if snapshot.len() == FAT_RUNTIME_SNAPSHOT_FILE_LIMIT {
                             return Err(FatFileSystemError::RuntimeSnapshotTooLarge {
@@ -1190,9 +1396,9 @@ impl<D: BlockDevice> FatFileSystem<D> {
                             });
                         }
                         let mut file_path =
-                            Vec::with_capacity(current.path_length + short_path.len());
+                            Vec::with_capacity(current.path_length + name_path.len());
                         file_path.extend_from_slice(&current.path[..current.path_length]);
-                        file_path.extend_from_slice(&short_path);
+                        file_path.extend_from_slice(&name_path);
                         snapshot.push((
                             file_path,
                             usize::try_from(file.size)
@@ -1212,7 +1418,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
                         }
                         let child_path_length = current
                             .path_length
-                            .checked_add(short_path.len())
+                            .checked_add(name_path.len())
                             .ok_or(FatFileSystemError::InvalidName)?;
                         if child_path_length > FAT_RUNTIME_SNAPSHOT_PATH_LENGTH {
                             return Err(FatFileSystemError::InvalidName);
@@ -1225,7 +1431,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
                         let mut child = current;
                         child.directory = FatDirectoryRef::Cluster(file.first_cluster);
                         child.path[current.path_length..child_path_length]
-                            .copy_from_slice(&short_path);
+                            .copy_from_slice(&name_path);
                         child.path_length = child_path_length;
                         child.depth += 1;
                         child.visited[child.visited_length] = file.first_cluster;
@@ -1258,15 +1464,51 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok(components)
     }
 
+    fn name_plan<'a>(
+        &mut self,
+        directory: FatDirectoryRef,
+        component: &'a [u8],
+    ) -> Result<([u8; 11], Option<&'a [u8]>), FatFileSystemError<D::Error>> {
+        validate_long_name_component(component).map_err(|_| FatFileSystemError::InvalidName)?;
+        if self
+            .find_directory_entry_slot_by_name(directory, component)?
+            .is_some()
+        {
+            return Err(FatFileSystemError::FileAlreadyExists);
+        }
+
+        if let Ok(short_name) = short_name_from_component(component) {
+            if short_name_is_canonical(&short_name, component) {
+                return Ok((short_name, None));
+            }
+            if self
+                .find_directory_entry_slot(directory, &short_name)?
+                .is_none()
+            {
+                return Ok((short_name, Some(component)));
+            }
+        }
+
+        for ordinal in 1..=999_999u32 {
+            let short_name = short_alias_for_component(component, ordinal)
+                .ok_or(FatFileSystemError::InvalidName)?;
+            if self
+                .find_directory_entry_slot(directory, &short_name)?
+                .is_none()
+            {
+                return Ok((short_name, Some(component)));
+            }
+        }
+        Err(FatFileSystemError::DirectoryFull)
+    }
+
     fn resolve_directory_components(
         &mut self,
         components: &[&[u8]],
     ) -> Result<Option<FatDirectoryRef>, FatFileSystemError<D::Error>> {
         let mut directory = FatDirectoryRef::Root;
         for component in components {
-            let short_name = short_name_from_component(component)
-                .map_err(|_| FatFileSystemError::InvalidName)?;
-            let Some(slot) = self.find_directory_entry_slot(directory, &short_name)? else {
+            let Some(slot) = self.find_directory_entry_slot_by_name(directory, component)? else {
                 return Ok(None);
             };
             let entry = slot.file.ok_or(FatFileSystemError::FileNotFound)?;
@@ -1291,9 +1533,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
         }
         let mut directory = FatDirectoryRef::Root;
         for (index, component) in components.iter().enumerate() {
-            let short_name = short_name_from_component(component)
-                .map_err(|_| FatFileSystemError::InvalidName)?;
-            let Some(slot) = self.find_directory_entry_slot(directory, &short_name)? else {
+            let Some(slot) = self.find_directory_entry_slot_by_name(directory, component)? else {
                 return Ok(None);
             };
             let entry = slot.file.ok_or(FatFileSystemError::FileNotFound)?;
@@ -1315,9 +1555,13 @@ impl<D: BlockDevice> FatFileSystem<D> {
         &mut self,
         directory: FatDirectoryRef,
         short_name: [u8; 11],
+        long_name: Option<&[u8]>,
         contents: &[u8],
     ) -> Result<FatFileEntry, FatFileSystemError<D::Error>> {
         validate_short_name(&short_name).map_err(|_| FatFileSystemError::InvalidName)?;
+        if let Some(long_name) = long_name {
+            validate_long_name_component(long_name).map_err(|_| FatFileSystemError::InvalidName)?;
+        }
         if contents.len() > MAX_MUTABLE_FILE_SIZE {
             return Err(FatFileSystemError::FileTooLarge {
                 size: contents.len(),
@@ -1330,7 +1574,10 @@ impl<D: BlockDevice> FatFileSystem<D> {
         {
             return Err(FatFileSystemError::FileAlreadyExists);
         }
-        let slot = self.find_free_directory_slot(directory)?;
+        let long_name_slots = long_name.map_or(0, |name| {
+            (name.len() + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY
+        });
+        let slots = self.find_free_directory_slots(directory, long_name_slots + 1)?;
         let new_chain = self.allocate_cluster_chain(contents.len())?;
         if let Err(error) = self.write_cluster_chain_contents(&new_chain, contents) {
             let _ = self.release_cluster_chain(&new_chain);
@@ -1342,7 +1589,18 @@ impl<D: BlockDevice> FatFileSystem<D> {
             first_cluster: new_chain.first().copied().unwrap_or(0),
             size: u32::try_from(contents.len()).map_err(|_| FatFileSystemError::InvalidGeometry)?,
         };
-        if let Err(error) = self.write_directory_entry(slot, file) {
+        if let Some(long_name) = long_name {
+            if let Err(error) =
+                self.write_long_name_entries(&slots[..long_name_slots], long_name, &short_name)
+            {
+                let _ = self.release_cluster_chain(&new_chain);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.write_directory_entry(
+            *slots.last().ok_or(FatFileSystemError::DirectoryFull)?,
+            file,
+        ) {
             let _ = self.release_cluster_chain(&new_chain);
             return Err(error);
         }
@@ -1352,16 +1610,23 @@ impl<D: BlockDevice> FatFileSystem<D> {
     fn create_directory_in_directory(
         &mut self,
         parent: FatDirectoryRef,
+        long_name: Option<&[u8]>,
         short_name: [u8; 11],
     ) -> Result<FatFileEntry, FatFileSystemError<D::Error>> {
         validate_short_name(&short_name).map_err(|_| FatFileSystemError::InvalidName)?;
+        if let Some(long_name) = long_name {
+            validate_long_name_component(long_name).map_err(|_| FatFileSystemError::InvalidName)?;
+        }
         if self
             .find_directory_entry_slot(parent, &short_name)?
             .is_some()
         {
             return Err(FatFileSystemError::FileAlreadyExists);
         }
-        let slot = self.find_free_directory_slot(parent)?;
+        let long_name_slots = long_name.map_or(0, |name| {
+            (name.len() + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY
+        });
+        let slots = self.find_free_directory_slots(parent, long_name_slots + 1)?;
         let cluster_bytes = usize::from(self.boot.sectors_per_cluster)
             .checked_mul(SECTOR_SIZE)
             .ok_or(FatFileSystemError::InvalidGeometry)?;
@@ -1385,7 +1650,18 @@ impl<D: BlockDevice> FatFileSystem<D> {
             first_cluster,
             size: 0,
         };
-        if let Err(error) = self.write_directory_entry(slot, file) {
+        if let Some(long_name) = long_name {
+            if let Err(error) =
+                self.write_long_name_entries(&slots[..long_name_slots], long_name, &short_name)
+            {
+                let _ = self.release_cluster_chain(&new_chain);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.write_directory_entry(
+            *slots.last().ok_or(FatFileSystemError::DirectoryFull)?,
+            file,
+        ) {
             let _ = self.release_cluster_chain(&new_chain);
             return Err(error);
         }
@@ -1404,9 +1680,8 @@ impl<D: BlockDevice> FatFileSystem<D> {
         let Some(directory) = self.resolve_directory_components(parents)? else {
             return Err(FatFileSystemError::FileNotFound);
         };
-        let short_name =
-            short_name_from_component(name).map_err(|_| FatFileSystemError::InvalidName)?;
-        self.create_file_in_directory(directory, short_name, contents)
+        let (short_name, long_name) = self.name_plan(directory, name)?;
+        self.create_file_in_directory(directory, short_name, long_name, contents)
     }
 
     pub fn create_directory_path(
@@ -1420,9 +1695,8 @@ impl<D: BlockDevice> FatFileSystem<D> {
         let Some(parent) = self.resolve_directory_components(parents)? else {
             return Err(FatFileSystemError::FileNotFound);
         };
-        let short_name =
-            short_name_from_component(name).map_err(|_| FatFileSystemError::InvalidName)?;
-        self.create_directory_in_directory(parent, short_name)
+        let (short_name, long_name) = self.name_plan(parent, name)?;
+        self.create_directory_in_directory(parent, long_name, short_name)
     }
 
     /// Read a bounded range from a regular FAT12/FAT16/FAT32 file.
@@ -1707,7 +1981,7 @@ impl<D: BlockDevice> FatFileSystem<D> {
         short_name: [u8; 11],
         contents: &[u8],
     ) -> Result<FatFileEntry, FatFileSystemError<D::Error>> {
-        self.create_file_in_directory(FatDirectoryRef::Root, short_name, contents)
+        self.create_file_in_directory(FatDirectoryRef::Root, short_name, None, contents)
     }
 
     fn collect_cluster_chain(
@@ -1838,16 +2112,67 @@ impl<D: BlockDevice> FatFileSystem<D> {
         if self.boot.fat_type != FatType::Fat32 && file.first_cluster > u32::from(u16::MAX) {
             return Err(FatFileSystemError::InvalidGeometry);
         }
+        let mut entry = [0u8; FAT_DIRECTORY_ENTRY_SIZE];
+        entry[..11].copy_from_slice(&file.short_name);
+        entry[11] = file.attributes;
+        entry[20..22].copy_from_slice(&((file.first_cluster >> 16) as u16).to_le_bytes());
+        entry[26..28].copy_from_slice(&(file.first_cluster as u16).to_le_bytes());
+        entry[28..32].copy_from_slice(&file.size.to_le_bytes());
+        self.write_directory_slot_bytes(slot, &entry)
+    }
+
+    fn write_long_name_entries(
+        &mut self,
+        slots: &[FatDirectorySlot],
+        name: &[u8],
+        short_name: &[u8; 11],
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        let required = (name.len() + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY;
+        if required == 0 || required != slots.len() || required > MAX_LONG_NAME_ENTRIES {
+            return Err(FatFileSystemError::InvalidName);
+        }
+        let checksum = fat_long_name_checksum(short_name);
+        for ordinal in 1..=required {
+            let slot = slots[required - ordinal];
+            let mut entry = [0xffu8; FAT_LFN_ENTRY_SIZE];
+            entry[0] = u8::try_from(ordinal).map_err(|_| FatFileSystemError::InvalidName)?;
+            if ordinal == required {
+                entry[0] |= FAT_LFN_LAST_ENTRY;
+            }
+            entry[11] = FAT_LFN_ATTRIBUTE;
+            entry[12] = 0;
+            entry[13] = checksum;
+            entry[26] = 0;
+            entry[27] = 0;
+            let start = (ordinal - 1) * FAT_LFN_CHARS_PER_ENTRY;
+            for index in 0..FAT_LFN_CHARS_PER_ENTRY {
+                let code_unit = if let Some(byte) = name.get(start + index) {
+                    u16::from(*byte)
+                } else if start + index == name.len() {
+                    0
+                } else {
+                    u16::MAX
+                };
+                let offset = match index {
+                    0..=4 => 1 + index * 2,
+                    5..=10 => 14 + (index - 5) * 2,
+                    _ => 28 + (index - 11) * 2,
+                };
+                entry[offset..offset + 2].copy_from_slice(&code_unit.to_le_bytes());
+            }
+            self.write_directory_slot_bytes(slot, &entry)?;
+        }
+        Ok(())
+    }
+
+    fn write_directory_slot_bytes(
+        &mut self,
+        slot: FatDirectorySlot,
+        entry: &[u8; FAT_DIRECTORY_ENTRY_SIZE],
+    ) -> Result<(), FatFileSystemError<D::Error>> {
         let mut sector = [0u8; SECTOR_SIZE];
         self.read_volume_sector(slot.relative_sector, &mut sector)?;
-        sector[slot.offset..slot.offset + FAT_DIRECTORY_ENTRY_SIZE].fill(0);
-        sector[slot.offset..slot.offset + 11].copy_from_slice(&file.short_name);
-        sector[slot.offset + 11] = file.attributes;
-        sector[slot.offset + 20..slot.offset + 22]
-            .copy_from_slice(&((file.first_cluster >> 16) as u16).to_le_bytes());
-        sector[slot.offset + 26..slot.offset + 28]
-            .copy_from_slice(&(file.first_cluster as u16).to_le_bytes());
-        sector[slot.offset + 28..slot.offset + 32].copy_from_slice(&file.size.to_le_bytes());
+        sector[slot.offset..slot.offset + FAT_DIRECTORY_ENTRY_SIZE].copy_from_slice(entry);
         self.write_volume_sector(slot.relative_sector, &sector)
     }
 
@@ -2287,6 +2612,105 @@ fn path_from_short_name(short_name: &[u8; 11]) -> Option<Vec<u8>> {
     Some(path)
 }
 
+fn fat_long_name_checksum(short_name: &[u8; 11]) -> u8 {
+    let mut checksum = 0u8;
+    for byte in short_name.iter().copied() {
+        checksum = ((checksum & 1) << 7) | (checksum >> 1);
+        checksum = checksum.wrapping_add(byte);
+    }
+    checksum
+}
+
+fn validate_long_name_component(component: &[u8]) -> Result<(), ()> {
+    if component.is_empty()
+        || component.len() > MAX_LONG_NAME_LENGTH
+        || component == b"."
+        || component == b".."
+        || component[0] == b' '
+        || component[component.len() - 1] == b' '
+        || component[component.len() - 1] == b'.'
+    {
+        return Err(());
+    }
+    for byte in component.iter().copied() {
+        if !(0x20..=0x7e).contains(&byte)
+            || matches!(
+                byte,
+                b'"' | b'*' | b'/' | b':' | b'<' | b'>' | b'?' | b'\\' | b'|'
+            )
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn short_name_is_canonical(short_name: &[u8; 11], component: &[u8]) -> bool {
+    path_from_short_name(short_name)
+        .and_then(|path| path.get(1..).map(|path| path == component))
+        .unwrap_or(false)
+}
+
+fn short_alias_for_component(component: &[u8], ordinal: u32) -> Option<[u8; 11]> {
+    if ordinal == 0 {
+        return None;
+    }
+    let dot = component.iter().rposition(|byte| *byte == b'.');
+    let base = dot
+        .filter(|index| *index != 0)
+        .map_or(component, |index| &component[..index]);
+    let extension = dot
+        .filter(|index| *index + 1 < component.len())
+        .map_or(&[][..], |index| &component[index + 1..]);
+    let base = if base.is_empty() {
+        b"FILE".as_slice()
+    } else {
+        base
+    };
+
+    let mut digits = [0u8; 10];
+    let mut digit_count = 0;
+    let mut value = ordinal;
+    while value != 0 && digit_count < digits.len() {
+        digits[digit_count] = b'0' + (value % 10) as u8;
+        digit_count += 1;
+        value /= 10;
+    }
+    if value != 0 || digit_count + 1 >= 8 {
+        return None;
+    }
+    let prefix_length = 8 - digit_count - 1;
+    let mut short_name = [b' '; 11];
+    let mut written = 0;
+    for byte in base.iter().copied() {
+        if written == prefix_length {
+            break;
+        }
+        short_name[written] = short_alias_byte(byte);
+        written += 1;
+    }
+    while written < prefix_length {
+        short_name[written] = b'_';
+        written += 1;
+    }
+    short_name[prefix_length] = b'~';
+    for index in 0..digit_count {
+        short_name[prefix_length + 1 + index] = digits[digit_count - index - 1];
+    }
+    for (index, byte) in extension.iter().copied().take(3).enumerate() {
+        short_name[8 + index] = short_alias_byte(byte);
+    }
+    Some(short_name)
+}
+
+fn short_alias_byte(byte: u8) -> u8 {
+    if byte.is_ascii_alphanumeric() {
+        byte.to_ascii_uppercase()
+    } else {
+        b'_'
+    }
+}
+
 fn normalize_short_name_byte(byte: u8) -> Result<u8, ()> {
     if !(0x21..=0x7e).contains(&byte)
         || matches!(
@@ -2330,24 +2754,18 @@ impl<D: BlockDevice> crate::vfs::FileSystem for FatFileSystem<D> {
         component: &[u8],
     ) -> Result<Option<Self::Node>, Self::Error> {
         match parent {
-            FatVfsNode::Root => {
-                let short_name = short_name_from_component(component)
-                    .map_err(|_| FatFileSystemError::InvalidName)?;
-                Ok(self
-                    .find_directory_entry_slot(FatDirectoryRef::Root, &short_name)?
-                    .and_then(|slot| slot.file)
-                    .map(FatVfsNode::Entry))
-            }
+            FatVfsNode::Root => Ok(self
+                .find_directory_entry_slot_by_name(FatDirectoryRef::Root, component)?
+                .and_then(|slot| slot.file)
+                .map(FatVfsNode::Entry)),
             FatVfsNode::Entry(entry) if entry.is_directory() => {
                 if entry.first_cluster == 0 {
                     return Err(FatFileSystemError::InvalidCluster { cluster: 0 });
                 }
-                let short_name = short_name_from_component(component)
-                    .map_err(|_| FatFileSystemError::InvalidName)?;
                 Ok(self
-                    .find_directory_entry_slot(
+                    .find_directory_entry_slot_by_name(
                         FatDirectoryRef::Cluster(entry.first_cluster),
-                        &short_name,
+                        component,
                     )?
                     .and_then(|slot| slot.file)
                     .map(FatVfsNode::Entry))
@@ -3844,6 +4262,49 @@ mod tests {
             filesystem.lookup_path(b"/VAR/F19.TXT").unwrap().is_some(),
             true
         );
+    }
+
+    #[test]
+    fn creates_and_resolves_vfat_long_names_and_snapshots_them() {
+        use crate::vfs::FileSystem;
+
+        let (disk, partition, boot) = test_fat32_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        let directory = b"/Documents and Stuff";
+        let file = b"/Documents and Stuff/Meeting Notes.txt";
+        filesystem.create_directory_path(directory).unwrap();
+        let contents = b"long-name persistence";
+        let entry = filesystem.create_file_path(file, contents).unwrap();
+
+        let node = filesystem.lookup_path(file).unwrap().unwrap();
+        assert_eq!(filesystem.read(node, 0, &mut [0u8; 0]), Ok(0));
+        let mut readback = [0u8; 21];
+        assert_eq!(filesystem.read(node, 0, &mut readback), Ok(contents.len()));
+        assert_eq!(&readback, contents);
+        assert_eq!(
+            filesystem.lookup_path(b"/DOCUME~1/MEETIN~1.TXT"),
+            Ok(Some(node))
+        );
+        assert_eq!(entry.size, contents.len() as u32);
+
+        let mut snapshot = Vec::new();
+        filesystem
+            .collect_runtime_file_snapshot(&mut snapshot)
+            .unwrap();
+        assert!(
+            snapshot
+                .iter()
+                .any(|(path, size)| path == file && *size == contents.len())
+        );
+
+        filesystem
+            .create_directory_path(b"/Documents and Things")
+            .unwrap();
+        assert!(filesystem.lookup_path(b"/DOCUME~2").unwrap().is_some());
+
+        let hidden = b"/.config";
+        filesystem.create_file_path(hidden, b"x").unwrap();
+        assert!(filesystem.lookup_path(hidden).unwrap().is_some());
     }
 
     #[test]
