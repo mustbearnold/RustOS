@@ -978,7 +978,7 @@ fn create_fat32_root_partition(
     root_size: u64,
     files: &[(&str, &[u8])],
 ) -> Result<(), String> {
-    let disk = OpenOptions::new()
+    let mut disk = OpenOptions::new()
         .create(true)
         .truncate(true)
         .read(true)
@@ -1035,7 +1035,37 @@ fn create_fat32_root_partition(
         }
     }
     disk.sync_all()
-        .map_err(|error| format!("syncing FAT32 root partition {}: {error}", path.display()))
+        .map_err(|error| format!("syncing FAT32 root partition {}: {error}", path.display()))?;
+    disk.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewinding FAT32 root partition {}: {error}", path.display()))?;
+
+    let filesystem = fatfs::FileSystem::new(&disk, fatfs::FsOptions::new())
+        .map_err(|error| format!("reopening FAT32 root partition {}: {error}", path.display()))?;
+    let root = filesystem.root_dir();
+    for (file_path, expected) in files.iter().copied() {
+        let mut file = root.open_file(file_path).map_err(|error| {
+            format!(
+                "opening FAT32 root readback file {file_path} in {}: {error}",
+                path.display()
+            )
+        })?;
+        let mut actual = Vec::with_capacity(expected.len());
+        file.read_to_end(&mut actual).map_err(|error| {
+            format!(
+                "reading FAT32 root readback file {file_path} in {}: {error}",
+                path.display()
+            )
+        })?;
+        if actual != expected {
+            return Err(format!(
+                "FAT32 root readback mismatch for {file_path} in {}: expected {} bytes, got {}",
+                path.display(),
+                expected.len(),
+                actual.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
