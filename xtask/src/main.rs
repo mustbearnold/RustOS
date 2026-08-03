@@ -1483,6 +1483,15 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     if !platform_line.contains("hypervisor=none") {
         return Err("physical NVIDIA GSP proof requires hypervisor=none".to_owned());
     }
+    let Some(static_info_reply_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia GSP-RM reply function=65"))
+    else {
+        return Err("physical NVIDIA GSP proof missing static-info reply".to_owned());
+    };
+    if !static_info_reply_line.contains("rpc_sequence=2") {
+        return Err("physical NVIDIA GSP proof has wrong static-info RPC sequence".to_owned());
+    }
     let Some(static_info_line) = content
         .lines()
         .find(|line| line.contains("driver: nvidia GSP-RM ready function_flow="))
@@ -6482,6 +6491,12 @@ mod tests {
 
         let missing_static_info = success.replace("get-static-info", "missing-static-info");
         assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());
+
+        let wrong_static_rpc = success.replace(
+            "transport_sequence=5 rpc_sequence=2 result=0x00000000",
+            "transport_sequence=5 rpc_sequence=0 result=0x00000000",
+        );
+        assert!(validate_nvidia_gsp_physical_log(&wrong_static_rpc).is_err());
 
         let empty_gpu_name =
             success.replace("gpu_name=[78, 86, 73, 68, 73, 65, 0]", "gpu_name=[0]");

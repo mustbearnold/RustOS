@@ -93,6 +93,11 @@ pub enum NvidiaError {
         result: u32,
         private_result: u32,
     },
+    GspRpcSequenceMismatch {
+        function: u32,
+        expected_rpc: u32,
+        actual_rpc: u32,
+    },
     GspStaticInfo(rustos_gpu_protocol::GspStaticInfoError),
     GspFmcBootTimeout,
     GspFmcBootFailed {
@@ -987,6 +992,7 @@ pub fn boot_external_gsp(
         static_info_message.rpc_result(),
         static_info_message.rpc_result_private(),
     );
+    validate_static_info_rpc_sequence(static_info_message)?;
     if static_info_message.rpc_result() != 0 {
         return Err(NvidiaError::GspRpcFailed {
             function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
@@ -1143,6 +1149,19 @@ fn io_bar_base(bar: PciBar) -> Option<u64> {
     }
 }
 
+fn validate_static_info_rpc_sequence(
+    message: rustos_gpu_protocol::GspRpcMessage<'_>,
+) -> Result<(), NvidiaError> {
+    if message.rpc_sequence() != 2 {
+        return Err(NvidiaError::GspRpcSequenceMismatch {
+            function: message.function(),
+            expected_rpc: 2,
+            actual_rpc: message.rpc_sequence(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -1276,6 +1295,36 @@ mod tests {
             Err(NvidiaError::FspPacketUnaligned { size: 3 })
         );
         assert_eq!(validate_packet(&[0; 4]), Ok(()));
+    }
+
+    #[test]
+    fn requires_static_info_reply_rpc_sequence() {
+        let valid = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            2,
+            2,
+            &[],
+        )
+        .expect("static info reply");
+        let valid = rustos_gpu_protocol::GspRpcMessage::parse(&valid).expect("parse reply");
+        assert_eq!(validate_static_info_rpc_sequence(valid), Ok(()));
+
+        let wrong = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            2,
+            0,
+            &[],
+        )
+        .expect("static info reply");
+        let wrong = rustos_gpu_protocol::GspRpcMessage::parse(&wrong).expect("parse reply");
+        assert_eq!(
+            validate_static_info_rpc_sequence(wrong),
+            Err(NvidiaError::GspRpcSequenceMismatch {
+                function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+                expected_rpc: 2,
+                actual_rpc: 0,
+            })
+        );
     }
 
     #[test]
