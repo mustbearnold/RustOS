@@ -2305,8 +2305,16 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "shell: relative write path=/home/user/work/note status=ready",
             ),
             (
-                "cat note",
-                "shell: relative read path=/home/user/work/note status=ready",
+                "mv note renamed-note",
+                "shell: rename from=/home/user/work/note to=/home/user/work/renamed-note status=ready",
+            ),
+            (
+                "cat renamed-note",
+                "shell: relative read path=/home/user/work/renamed-note status=ready",
+            ),
+            (
+                "rm renamed-note",
+                "shell: remove path=/home/user/work/renamed-note status=ready",
             ),
             ("ls", "shell: ls path=/home/user/work status=ready"),
             (
@@ -3717,7 +3725,9 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: append path=/home/user/work/large.bin offset=65536 bytes=4 status=ready",
         "shell: truncate path=/home/user/work/large.bin bytes=131072 status=ready",
         "shell: relative write path=/home/user/work/note status=ready",
-        "shell: relative read path=/home/user/work/note status=ready",
+        "shell: rename from=/home/user/work/note to=/home/user/work/renamed-note status=ready",
+        "shell: relative read path=/home/user/work/renamed-note status=ready",
+        "shell: remove path=/home/user/work/renamed-note status=ready",
         "shell: ls path=/home/user/work status=ready",
         "shell: ps status=ready",
         "shell: relative read path=/etc/rustos/config.txt status=ready",
@@ -3738,9 +3748,14 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         || !content.contains("daily-use")
         || !content.contains("userland: /bin/replaced")
         || !content.contains("uid=1000 gid=1000 name=user")
-        || !content.contains("note 9 data")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "note 9 data")
         || !content.contains("documents 0 dir")
         || !content.contains("meeting-notes.txt")
+        || content
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "renamed-note 9 data")
         || !content.contains("large.bin 131072 data")
         || !content.contains("boot=1")
         || !content.contains("admin: state set status=ready")

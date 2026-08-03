@@ -83,6 +83,8 @@ pub const SYS_SPAWN_PRIVILEGED: u64 = 54;
 pub const SYS_GET_CALLER_CREDENTIALS: u64 = 55;
 pub const SYS_SEEK: u64 = 56;
 pub const SYS_TRUNCATE: u64 = 57;
+pub const SYS_UNLINK: u64 = 58;
+pub const SYS_RENAME: u64 = 59;
 const PATH_INFO_LENGTH: usize = 16;
 const CREDENTIALS_LENGTH: usize = 16;
 const PATH_KIND_FILE: u64 = 1;
@@ -224,6 +226,8 @@ pub enum SyscallAction {
     SpawnPrivileged,
     Seek,
     Truncate,
+    Unlink,
+    Rename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,7 +265,9 @@ pub struct ProcessExit {
 /// handle; `SYS_SEEK` takes a handle in `rdi`, a signed byte delta in `rsi`, and `SEEK_SET`/`SEEK_CUR`/
 /// `SEEK_END` in `rdx`, returning the new non-negative byte offset; `SYS_TRUNCATE` resizes a
 /// writable runtime file using the new size in `rsi`, zero-filling extensions and releasing
-/// truncated FAT clusters; `SYS_THREAD_CREATE` starts the
+/// truncated FAT clusters; `SYS_UNLINK` removes a regular runtime file at the NUL-terminated path
+/// in `rdi`; `SYS_RENAME` moves a regular runtime file from the NUL-terminated path in `rdi` to
+/// the path in `rsi`; `SYS_THREAD_CREATE` starts the
 /// executable entry point in the current address space with its argument in `rsi` and returns a
 /// thread identifier; `SYS_THREAD_JOIN` blocks until a same-process thread exits; and
 /// `SYS_THREAD_EXIT` exits the calling thread without terminating its process; `SYS_EXEC` replaces
@@ -329,6 +335,8 @@ pub fn dispatch_syscall(pid: ProcessId, frame: &mut SyscallFrame) -> SyscallActi
         SYS_CLOSE => SyscallAction::Close,
         SYS_SEEK => SyscallAction::Seek,
         SYS_TRUNCATE => SyscallAction::Truncate,
+        SYS_UNLINK => SyscallAction::Unlink,
+        SYS_RENAME => SyscallAction::Rename,
         SYS_THREAD_CREATE => SyscallAction::ThreadCreate,
         SYS_THREAD_JOIN => SyscallAction::ThreadJoin,
         SYS_THREAD_EXIT => SyscallAction::ThreadExit,
@@ -2348,6 +2356,8 @@ impl Thread {
             | SyscallAction::Close
             | SyscallAction::Seek
             | SyscallAction::Truncate
+            | SyscallAction::Unlink
+            | SyscallAction::Rename
             | SyscallAction::ThreadCreate
             | SyscallAction::ThreadJoin
             | SyscallAction::Exec
@@ -3005,6 +3015,8 @@ impl Process {
             SyscallAction::Close => {}
             SyscallAction::Seek => {}
             SyscallAction::Truncate => {}
+            SyscallAction::Unlink => {}
+            SyscallAction::Rename => {}
             SyscallAction::ThreadCreate => {}
             SyscallAction::ThreadJoin => {}
             SyscallAction::ThreadExit => {}
@@ -3992,6 +4004,108 @@ fn truncate_for_syscall(frame: &mut SyscallFrame) {
         return;
     }
     frame.rax = 0;
+}
+
+#[cfg(target_os = "none")]
+fn unlink_for_syscall(frame: &mut SyscallFrame) {
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    let mut path = [0u8; MAX_EXECUTABLE_PATH_LENGTH];
+    let path_length = {
+        // SAFETY: the current process pointer was registered before entering user mode and its
+        // address space remains stable for the duration of this syscall.
+        let process = unsafe { &*pointer };
+        match process.address_space.copy_user_string(frame.rdi, &mut path) {
+            Ok(length) => length,
+            Err(error) => {
+                crate::kprintln!(
+                    "process: unlink path copy failed ({:?}) status=degraded",
+                    error
+                );
+                frame.rax = SYSCALL_EFAULT;
+                return;
+            }
+        }
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    if !runtime_access_allowed(&path[..path_length], process.uid, AccessKind::Write) {
+        frame.rax = SYSCALL_EPERM;
+        return;
+    }
+    frame.rax = match crate::storage::unlink_runtime_file(&path[..path_length]) {
+        Ok(()) => 0,
+        Err(()) => SYSCALL_EAGAIN,
+    };
+}
+
+#[cfg(target_os = "none")]
+fn rename_for_syscall(frame: &mut SyscallFrame) {
+    let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
+    let Some(pointer) = process_pointer(pid) else {
+        frame.rax = SYSCALL_EFAULT;
+        return;
+    };
+    let mut source = [0u8; MAX_EXECUTABLE_PATH_LENGTH];
+    let mut destination = [0u8; MAX_EXECUTABLE_PATH_LENGTH];
+    let (source_length, destination_length) = {
+        // SAFETY: the current process pointer was registered before entering user mode and its
+        // address space remains stable for the duration of this syscall.
+        let process = unsafe { &*pointer };
+        let source_length = match process
+            .address_space
+            .copy_user_string(frame.rdi, &mut source)
+        {
+            Ok(length) => length,
+            Err(error) => {
+                crate::kprintln!(
+                    "process: rename source path copy failed ({:?}) status=degraded",
+                    error
+                );
+                frame.rax = SYSCALL_EFAULT;
+                return;
+            }
+        };
+        let destination_length = match process
+            .address_space
+            .copy_user_string(frame.rsi, &mut destination)
+        {
+            Ok(length) => length,
+            Err(error) => {
+                crate::kprintln!(
+                    "process: rename destination path copy failed ({:?}) status=degraded",
+                    error
+                );
+                frame.rax = SYSCALL_EFAULT;
+                return;
+            }
+        };
+        (source_length, destination_length)
+    };
+    // SAFETY: the current process pointer was registered before entering user mode and remains
+    // stable for the duration of this syscall.
+    let process = unsafe { &*pointer };
+    if !runtime_access_allowed(&source[..source_length], process.uid, AccessKind::Write)
+        || !runtime_access_allowed(
+            &destination[..destination_length],
+            process.uid,
+            AccessKind::Write,
+        )
+    {
+        frame.rax = SYSCALL_EPERM;
+        return;
+    }
+    frame.rax = match crate::storage::rename_runtime_file(
+        &source[..source_length],
+        &destination[..destination_length],
+    ) {
+        Ok(()) => 0,
+        Err(()) => SYSCALL_EAGAIN,
+    };
 }
 
 #[cfg(target_os = "none")]
@@ -6075,6 +6189,14 @@ fn dispatch_user_syscall(frame: &mut SyscallFrame) -> SyscallAction {
             truncate_for_syscall(frame);
             SyscallAction::Return
         }
+        SyscallAction::Unlink => {
+            unlink_for_syscall(frame);
+            SyscallAction::Return
+        }
+        SyscallAction::Rename => {
+            rename_for_syscall(frame);
+            SyscallAction::Return
+        }
         SyscallAction::ThreadCreate => {
             create_thread_for_syscall(frame);
             SyscallAction::Return
@@ -6334,6 +6456,12 @@ pub extern "C" fn rustos_user_syscall_dispatch(frame: *mut SyscallFrame) -> u64 
         SyscallAction::Seek => unreachable!("seek syscall must be resolved before returning"),
         SyscallAction::Truncate => {
             unreachable!("truncate syscall must be resolved before returning")
+        }
+        SyscallAction::Unlink => {
+            unreachable!("unlink syscall must be resolved before returning")
+        }
+        SyscallAction::Rename => {
+            unreachable!("rename syscall must be resolved before returning")
         }
         SyscallAction::ThreadCreate => {
             unreachable!("thread create syscall must be resolved before returning")
@@ -7165,7 +7293,15 @@ mod tests {
 
     #[test]
     fn syscall_abi_marks_file_handle_operations_for_kernel_resolution() {
-        for syscall in [SYS_OPEN, SYS_READ, SYS_CLOSE, SYS_SEEK, SYS_TRUNCATE] {
+        for syscall in [
+            SYS_OPEN,
+            SYS_READ,
+            SYS_CLOSE,
+            SYS_SEEK,
+            SYS_TRUNCATE,
+            SYS_UNLINK,
+            SYS_RENAME,
+        ] {
             let mut frame = SyscallFrame {
                 rax: syscall,
                 ..SyscallFrame::default()
@@ -7179,6 +7315,8 @@ mod tests {
                     SYS_CLOSE => SyscallAction::Close,
                     SYS_SEEK => SyscallAction::Seek,
                     SYS_TRUNCATE => SyscallAction::Truncate,
+                    SYS_UNLINK => SyscallAction::Unlink,
+                    SYS_RENAME => SyscallAction::Rename,
                     _ => unreachable!(),
                 }
             );

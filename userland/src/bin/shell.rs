@@ -9,8 +9,8 @@ use rustos_userland::{
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
     open_with_flags, open_write,
     path::{MAX_PATH_LENGTH, PathBuf, resolve},
-    path_info, pipe, poweroff, read, reboot, seek, spawn, spawn_privileged_redirected,
-    spawn_redirected, suspend, truncate, waitpid, write, write_stdout, yield_now,
+    path_info, pipe, poweroff, read, reboot, rename, seek, spawn, spawn_privileged_redirected,
+    spawn_redirected, suspend, truncate, unlink, waitpid, write, write_stdout, yield_now,
 };
 
 const STDIN_FD: u64 = 0;
@@ -143,7 +143,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate grow poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -289,6 +289,12 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if let Some(arguments) = argument_after(line, b"truncate ") {
         truncate_file(state, arguments);
+        write_prompt(recovery_mode, state);
+    } else if let Some(path) = argument_after(line, b"rm ") {
+        remove_file(state, path);
+        write_prompt(recovery_mode, state);
+    } else if let Some(arguments) = argument_after(line, b"mv ") {
+        move_file(state, arguments);
         write_prompt(recovery_mode, state);
     } else if line == b"grow" {
         grow_large_file(state);
@@ -1154,6 +1160,74 @@ fn truncate_file(state: &ShellState, arguments: &[u8]) {
         write_stdout(path.as_bytes());
         write_stdout(b" bytes=");
         write_decimal(size);
+        write_stdout(b" status=ready\n");
+    }
+}
+
+fn remove_file(state: &ShellState, input: &[u8]) {
+    let Some(path) = resolve_command_path(state, input) else {
+        write_stdout(b"rm: path too long\n");
+        return;
+    };
+    let mut path_buffer = [0u8; MAX_PATH_LENGTH];
+    let Some(path_bytes) = path.write_nul(&mut path_buffer) else {
+        write_stdout(b"rm: path too long\n");
+        return;
+    };
+    let result = unlink(path_bytes);
+    if is_permission_error(result) {
+        write_stdout(b"rm: permission denied\n");
+        write_permission_marker(&path);
+    } else if is_syscall_error(result) {
+        write_stdout(b"rm: failed\n");
+    } else {
+        write_stdout(b"rm: ok\n");
+        write_stdout(b"shell: remove path=");
+        write_stdout(path.as_bytes());
+        write_stdout(b" status=ready\n");
+    }
+}
+
+fn move_file(state: &ShellState, arguments: &[u8]) {
+    let Some(separator) = arguments.iter().position(|byte| *byte == b' ') else {
+        write_stdout(b"mv: usage mv /source /destination\n");
+        return;
+    };
+    let source_input = &arguments[..separator];
+    let destination_input = trim_spaces(&arguments[separator + 1..]);
+    if source_input.is_empty() || destination_input.is_empty() {
+        write_stdout(b"mv: usage mv /source /destination\n");
+        return;
+    }
+    let Some(source) = resolve_command_path(state, source_input) else {
+        write_stdout(b"mv: path too long\n");
+        return;
+    };
+    let Some(destination) = resolve_command_path(state, destination_input) else {
+        write_stdout(b"mv: path too long\n");
+        return;
+    };
+    let mut source_buffer = [0u8; MAX_PATH_LENGTH];
+    let mut destination_buffer = [0u8; MAX_PATH_LENGTH];
+    let (Some(source_bytes), Some(destination_bytes)) = (
+        source.write_nul(&mut source_buffer),
+        destination.write_nul(&mut destination_buffer),
+    ) else {
+        write_stdout(b"mv: path too long\n");
+        return;
+    };
+    let result = rename(source_bytes, destination_bytes);
+    if is_permission_error(result) {
+        write_stdout(b"mv: permission denied\n");
+        write_permission_marker(&source);
+    } else if is_syscall_error(result) {
+        write_stdout(b"mv: failed\n");
+    } else {
+        write_stdout(b"mv: ok\n");
+        write_stdout(b"shell: rename from=");
+        write_stdout(source.as_bytes());
+        write_stdout(b" to=");
+        write_stdout(destination.as_bytes());
         write_stdout(b" status=ready\n");
     }
 }

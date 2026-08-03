@@ -1009,10 +1009,12 @@ impl FatLongNameState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct LocatedFatEntry {
+    directory: FatDirectoryRef,
     entry: FatFileEntry,
     slot: FatDirectorySlot,
+    long_name_slots: Vec<FatDirectorySlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -1166,15 +1168,17 @@ impl<D: BlockDevice> FatFileSystem<D> {
         Ok(None)
     }
 
-    fn find_directory_entry_slot_by_name(
+    fn find_directory_entry_slots_by_name(
         &mut self,
         directory: FatDirectoryRef,
         component: &[u8],
-    ) -> Result<Option<FatDirectorySlot>, FatFileSystemError<D::Error>> {
+    ) -> Result<Option<(Vec<FatDirectorySlot>, FatDirectorySlot)>, FatFileSystemError<D::Error>>
+    {
         validate_long_name_component(component).map_err(|_| FatFileSystemError::InvalidName)?;
         let locations = self.directory_sector_locations(directory)?;
         let mut sector = [0u8; SECTOR_SIZE];
         let mut long_name = FatLongNameState::new();
+        let mut long_name_slots = Vec::new();
         for (relative_sector, _) in locations {
             self.read_volume_sector(relative_sector, &mut sector)?;
             for offset in (0..SECTOR_SIZE).step_by(FAT_DIRECTORY_ENTRY_SIZE) {
@@ -1184,30 +1188,51 @@ impl<D: BlockDevice> FatFileSystem<D> {
                 }
                 if entry[0] == FAT_DELETED_ENTRY {
                     long_name.reset();
+                    long_name_slots.clear();
                     continue;
                 }
                 if entry[11] == FAT_LFN_ATTRIBUTE {
                     long_name.consume(entry);
+                    long_name_slots.push(FatDirectorySlot {
+                        relative_sector,
+                        offset,
+                        file: None,
+                    });
                     continue;
                 }
                 let file = parse_fat_directory_entry(entry)?;
                 let matches =
                     file.is_some_and(|file| long_name.matches(component, &file.short_name));
                 if let Some(file) = file {
-                    long_name.reset();
                     if matches {
-                        return Ok(Some(FatDirectorySlot {
-                            relative_sector,
-                            offset,
-                            file: Some(file),
-                        }));
+                        return Ok(Some((
+                            long_name_slots,
+                            FatDirectorySlot {
+                                relative_sector,
+                                offset,
+                                file: Some(file),
+                            },
+                        )));
                     }
+                    long_name.reset();
+                    long_name_slots.clear();
                 } else {
                     long_name.reset();
+                    long_name_slots.clear();
                 }
             }
         }
         Ok(None)
+    }
+
+    fn find_directory_entry_slot_by_name(
+        &mut self,
+        directory: FatDirectoryRef,
+        component: &[u8],
+    ) -> Result<Option<FatDirectorySlot>, FatFileSystemError<D::Error>> {
+        Ok(self
+            .find_directory_entry_slots_by_name(directory, component)?
+            .map(|(_, slot)| slot))
     }
 
     fn find_free_directory_slot(
@@ -1547,12 +1572,19 @@ impl<D: BlockDevice> FatFileSystem<D> {
         }
         let mut directory = FatDirectoryRef::Root;
         for (index, component) in components.iter().enumerate() {
-            let Some(slot) = self.find_directory_entry_slot_by_name(directory, component)? else {
+            let Some((long_name_slots, slot)) =
+                self.find_directory_entry_slots_by_name(directory, component)?
+            else {
                 return Ok(None);
             };
             let entry = slot.file.ok_or(FatFileSystemError::FileNotFound)?;
             if index + 1 == components.len() {
-                return Ok(Some(LocatedFatEntry { entry, slot }));
+                return Ok(Some(LocatedFatEntry {
+                    directory,
+                    entry,
+                    slot,
+                    long_name_slots,
+                }));
             }
             if !entry.is_directory() {
                 return Err(FatFileSystemError::NotRegularFile);
@@ -1711,6 +1743,98 @@ impl<D: BlockDevice> FatFileSystem<D> {
         };
         let (short_name, long_name) = self.name_plan(parent, name)?;
         self.create_directory_in_directory(parent, long_name, short_name)
+    }
+
+    pub fn unlink_file_path(&mut self, path: &[u8]) -> Result<(), FatFileSystemError<D::Error>> {
+        let located = self
+            .locate_path_entry(path)?
+            .ok_or(FatFileSystemError::FileNotFound)?;
+        if !located.entry.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+
+        self.write_cursor = None;
+        let clusters = self.collect_cluster_chain(located.entry.first_cluster)?;
+        self.delete_directory_slots(&located.long_name_slots)?;
+        self.write_directory_slot_deleted(located.slot)?;
+        self.release_cluster_chain(&clusters)
+    }
+
+    pub fn rename_file_path(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        let Some(located) = self.locate_path_entry(source)? else {
+            #[cfg(target_os = "none")]
+            crate::kprintln!(
+                "storage: rename source missing source={:?} destination={:?}",
+                source,
+                destination
+            );
+            return Err(FatFileSystemError::FileNotFound);
+        };
+        if !located.entry.is_regular_file() {
+            return Err(FatFileSystemError::NotRegularFile);
+        }
+
+        let components = self.path_components(destination)?;
+        let Some((name, parents)) = components.split_last() else {
+            return Err(FatFileSystemError::InvalidName);
+        };
+        let Some(directory) = self.resolve_directory_components(parents)? else {
+            #[cfg(target_os = "none")]
+            crate::kprintln!(
+                "storage: rename destination parent missing source={:?} destination={:?} parents={:?}",
+                source,
+                destination,
+                parents
+            );
+            return Err(FatFileSystemError::FileNotFound);
+        };
+        if let Some((_, destination_slot)) =
+            self.find_directory_entry_slots_by_name(directory, name)?
+        {
+            if directory == located.directory && destination_slot == located.slot {
+                return Ok(());
+            }
+            return Err(FatFileSystemError::FileAlreadyExists);
+        }
+
+        let (short_name, long_name) = self.name_plan(directory, name)?;
+        let long_name_slots = long_name.map_or(0, |name| {
+            (name.len() + FAT_LFN_CHARS_PER_ENTRY - 1) / FAT_LFN_CHARS_PER_ENTRY
+        });
+        let slots = self.find_free_directory_slots(directory, long_name_slots + 1)?;
+        let new_file = FatFileEntry {
+            short_name,
+            ..located.entry
+        };
+
+        if let Some(long_name) = long_name {
+            if let Err(error) =
+                self.write_long_name_entries(&slots[..long_name_slots], long_name, &short_name)
+            {
+                let _ = self.delete_directory_slots(&slots);
+                return Err(error);
+            }
+        }
+        let short_slot = *slots.last().ok_or(FatFileSystemError::DirectoryFull)?;
+        if let Err(error) = self.write_directory_entry(short_slot, new_file) {
+            let _ = self.delete_directory_slots(&slots);
+            return Err(error);
+        }
+
+        self.write_cursor = None;
+        if let Err(error) = self.delete_directory_slots(&located.long_name_slots) {
+            let _ = self.delete_directory_slots(&slots);
+            return Err(error);
+        }
+        if let Err(error) = self.write_directory_slot_deleted(located.slot) {
+            let _ = self.delete_directory_slots(&slots);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Read a bounded range from a regular FAT12/FAT16/FAT32 file.
@@ -2730,6 +2854,26 @@ impl<D: BlockDevice> FatFileSystem<D> {
         self.read_volume_sector(slot.relative_sector, &mut sector)?;
         sector[slot.offset..slot.offset + FAT_DIRECTORY_ENTRY_SIZE].copy_from_slice(entry);
         self.write_volume_sector(slot.relative_sector, &sector)
+    }
+
+    fn write_directory_slot_deleted(
+        &mut self,
+        slot: FatDirectorySlot,
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        let mut sector = [0u8; SECTOR_SIZE];
+        self.read_volume_sector(slot.relative_sector, &mut sector)?;
+        sector[slot.offset] = FAT_DELETED_ENTRY;
+        self.write_volume_sector(slot.relative_sector, &sector)
+    }
+
+    fn delete_directory_slots(
+        &mut self,
+        slots: &[FatDirectorySlot],
+    ) -> Result<(), FatFileSystemError<D::Error>> {
+        for slot in slots.iter().copied() {
+            self.write_directory_slot_deleted(slot)?;
+        }
+        Ok(())
     }
 
     fn update_directory_entry_metadata(
@@ -3957,6 +4101,41 @@ pub fn truncate_runtime_file(path: &[u8], new_size: usize) -> Result<usize, ()> 
 }
 
 #[cfg(target_os = "none")]
+pub fn unlink_runtime_file(path: &[u8]) -> Result<(), ()> {
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut filesystem = filesystem.lock();
+    match filesystem.unlink_file_path(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime unlink failed path={:?} error={:?} status=degraded",
+                path,
+                error
+            );
+            Err(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn rename_runtime_file(source: &[u8], destination: &[u8]) -> Result<(), ()> {
+    let filesystem = RUNTIME_FILESYSTEM.get().ok_or(())?;
+    let mut filesystem = filesystem.lock();
+    match filesystem.rename_file_path(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            crate::kprintln!(
+                "storage: runtime rename failed source={:?} destination={:?} error={:?} status=degraded",
+                source,
+                destination,
+                error
+            );
+            Err(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
 struct AtaPorts {
     data: Port<u16>,
     error_features: Port<u8>,
@@ -4990,6 +5169,83 @@ mod tests {
         let hidden = b"/.config";
         filesystem.create_file_path(hidden, b"x").unwrap();
         assert!(filesystem.lookup_path(hidden).unwrap().is_some());
+    }
+
+    #[test]
+    fn renames_and_unlinks_vfat_long_name_files() {
+        use crate::vfs::FileSystem;
+
+        let (disk, partition, boot) = test_fat32_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        let source_directory = b"/Documents and Stuff";
+        let destination_directory = b"/Documents and Things";
+        let source = b"/Documents and Stuff/Meeting Notes.txt";
+        let destination = b"/Documents and Things/Renamed Notes.txt";
+        filesystem.create_directory_path(source_directory).unwrap();
+        filesystem
+            .create_directory_path(destination_directory)
+            .unwrap();
+        let contents = vec![0x5a; 700];
+        let entry = filesystem.create_file_path(source, &contents).unwrap();
+        let first_cluster = entry.first_cluster;
+
+        filesystem.rename_file_path(source, destination).unwrap();
+        assert!(filesystem.lookup_path(source).unwrap().is_none());
+        let node = filesystem.lookup_path(destination).unwrap().unwrap();
+        let mut readback = vec![0u8; contents.len()];
+        assert_eq!(filesystem.read(node, 0, &mut readback), Ok(contents.len()));
+        assert_eq!(readback, contents);
+
+        filesystem.unlink_file_path(destination).unwrap();
+        assert!(filesystem.lookup_path(destination).unwrap().is_none());
+        let mut fat_scratch = [0u8; SECTOR_SIZE];
+        assert_eq!(
+            filesystem
+                .fat_entry_value(first_cluster, &mut fat_scratch)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn renames_and_unlinks_nested_fat16_files() {
+        use crate::vfs::FileSystem;
+
+        let (disk, partition, boot) = test_fat16_volume();
+        let mut filesystem = FatFileSystem::mount(disk, partition, boot).unwrap();
+        filesystem.create_directory_path(b"/home").unwrap();
+        filesystem.create_directory_path(b"/home/user").unwrap();
+        filesystem
+            .create_directory_path(b"/home/user/work")
+            .unwrap();
+        filesystem
+            .create_file_path(b"/home/user/work/note", b"daily-use")
+            .unwrap();
+
+        filesystem
+            .rename_file_path(b"/home/user/work/note", b"/home/user/work/renamed-note")
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_path(b"/home/user/work/note")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            filesystem
+                .lookup_path(b"/home/user/work/renamed-note")
+                .unwrap()
+                .is_some()
+        );
+        filesystem
+            .unlink_file_path(b"/home/user/work/renamed-note")
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_path(b"/home/user/work/renamed-note")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
