@@ -137,6 +137,27 @@ pub enum GspFramebufferLayoutError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GspMaterializationError {
+    BootLayout(GspBootPlanError),
+    SystemPlan(GspSystemMemoryPlanError),
+    Memory(GspMemoryError),
+    BufferTooSmall {
+        required: usize,
+        actual: usize,
+    },
+    InvalidSectionRange {
+        offset: usize,
+        size: usize,
+        available: usize,
+    },
+    SectionTooLarge {
+        section: usize,
+        region: usize,
+    },
+    LayoutMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareSection {
     pub offset: usize,
     pub size: usize,
@@ -614,6 +635,7 @@ impl GspFramebufferLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GspBootSystemMemoryPlan {
     pub layout: GspFirmwareLayout,
+    pub system_base: u64,
     pub gsp_image_bytes: usize,
     pub fmc_image_bytes: usize,
     pub bootloader_bytes: usize,
@@ -756,6 +778,7 @@ impl GspBootSystemMemoryPlan {
         .map_err(|_| GspSystemMemoryPlanError::SizeOverflow)?;
         Ok(Self {
             layout,
+            system_base,
             gsp_image_bytes,
             fmc_image_bytes,
             bootloader_bytes,
@@ -869,6 +892,130 @@ impl GspBootSystemMemoryPlan {
             pmu_reserved_size,
             verified: 0,
         })
+    }
+
+    pub fn materialize_bundle_into(
+        self,
+        bundle: GspFirmwareBundle,
+        gsp_bytes: &[u8],
+        fmc_bytes: &[u8],
+        bootloader_bytes: &[u8],
+        framebuffer: GspFramebufferLayout,
+        output: &mut [u8],
+    ) -> Result<(), GspMaterializationError> {
+        if output.len() < self.total_bytes {
+            return Err(GspMaterializationError::BufferTooSmall {
+                required: self.total_bytes,
+                actual: output.len(),
+            });
+        }
+        let bundle_layout = bundle
+            .gsp
+            .boot_layout()
+            .map_err(GspMaterializationError::BootLayout)?;
+        if bundle_layout != self.layout
+            || bundle.fmc.image.size != self.fmc_image_bytes
+            || bundle.bootloader.payload.size != self.bootloader_bytes
+        {
+            return Err(GspMaterializationError::LayoutMismatch);
+        }
+        output[..self.total_bytes].fill(0);
+
+        copy_section_into(
+            output,
+            self.system_base,
+            self.fmc_image,
+            bundle.fmc.image,
+            fmc_bytes,
+        )?;
+        copy_section_into(
+            output,
+            self.system_base,
+            self.gsp_image,
+            bundle.gsp.image,
+            gsp_bytes,
+        )?;
+        let signature = bundle
+            .gsp
+            .gb20x_signature
+            .ok_or(GspMaterializationError::LayoutMismatch)?;
+        copy_section_into(
+            output,
+            self.system_base,
+            self.signature,
+            signature,
+            gsp_bytes,
+        )?;
+        copy_section_into(
+            output,
+            self.system_base,
+            self.bootloader,
+            bundle.bootloader.payload,
+            bootloader_bytes,
+        )?;
+
+        let radix3 = self
+            .radix3_tables()
+            .map_err(GspMaterializationError::Memory)?;
+        copy_bytes_into(output, self.system_base, self.radix3_level0, &radix3.level0)?;
+        copy_bytes_into(output, self.system_base, self.radix3_level1, &radix3.level1)?;
+        copy_bytes_into(output, self.system_base, self.radix3_level2, &radix3.level2)?;
+
+        let shared = self
+            .shared_memory_image()
+            .map_err(GspMaterializationError::Memory)?;
+        copy_bytes_into(
+            output,
+            self.system_base,
+            self.shared_memory,
+            &shared.page_table,
+        )?;
+        let command_queue_address = self
+            .shared_memory
+            .address
+            .checked_add(
+                u64::try_from(self.layout.shared_memory.command_queue_offset)
+                    .map_err(|_| GspMaterializationError::LayoutMismatch)?,
+            )
+            .ok_or(GspMaterializationError::LayoutMismatch)?;
+        copy_bytes_into(
+            output,
+            self.system_base,
+            GspMemoryRegion {
+                address: command_queue_address,
+                size: shared.command_queue.len(),
+            },
+            &shared.command_queue,
+        )?;
+        let status_queue_address = self
+            .shared_memory
+            .address
+            .checked_add(
+                u64::try_from(self.layout.shared_memory.status_queue_offset)
+                    .map_err(|_| GspMaterializationError::LayoutMismatch)?,
+            )
+            .ok_or(GspMaterializationError::LayoutMismatch)?;
+        copy_bytes_into(
+            output,
+            self.system_base,
+            GspMemoryRegion {
+                address: status_queue_address,
+                size: shared.status_queue.len(),
+            },
+            &shared.status_queue,
+        )?;
+
+        let cached_arguments = self
+            .cached_arguments()
+            .map_err(GspMaterializationError::Memory)?;
+        copy_bytes_into(output, self.system_base, self.rm_args, &cached_arguments)?;
+        let metadata = self
+            .wpr_meta(framebuffer)
+            .map_err(GspMaterializationError::SystemPlan)?
+            .encode();
+        copy_bytes_into(output, self.system_base, self.wpr_meta, &metadata)?;
+        let fmc_args = self.fmc_boot_params();
+        copy_bytes_into(output, self.system_base, self.fmc_args, &fmc_args)
     }
 }
 
@@ -1338,6 +1485,64 @@ fn contiguous_page_addresses(
     Ok(addresses)
 }
 
+fn copy_bytes_into(
+    output: &mut [u8],
+    system_base: u64,
+    region: GspMemoryRegion,
+    bytes: &[u8],
+) -> Result<(), GspMaterializationError> {
+    let offset = usize::try_from(
+        region
+            .address
+            .checked_sub(system_base)
+            .ok_or(GspMaterializationError::LayoutMismatch)?,
+    )
+    .map_err(|_| GspMaterializationError::LayoutMismatch)?;
+    let end = offset
+        .checked_add(region.size)
+        .ok_or(GspMaterializationError::LayoutMismatch)?;
+    let output_len = output.len();
+    let target = output
+        .get_mut(offset..end)
+        .ok_or(GspMaterializationError::BufferTooSmall {
+            required: end,
+            actual: output_len,
+        })?;
+    if bytes.len() > target.len() {
+        return Err(GspMaterializationError::SectionTooLarge {
+            section: bytes.len(),
+            region: target.len(),
+        });
+    }
+    target[..bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
+fn copy_section_into(
+    output: &mut [u8],
+    system_base: u64,
+    region: GspMemoryRegion,
+    section: FirmwareSection,
+    source: &[u8],
+) -> Result<(), GspMaterializationError> {
+    let end = section.offset.checked_add(section.size).ok_or(
+        GspMaterializationError::InvalidSectionRange {
+            offset: section.offset,
+            size: section.size,
+            available: source.len(),
+        },
+    )?;
+    let bytes =
+        source
+            .get(section.offset..end)
+            .ok_or(GspMaterializationError::InvalidSectionRange {
+                offset: section.offset,
+                size: section.size,
+                available: source.len(),
+            })?;
+    copy_bytes_into(output, system_base, region, bytes)
+}
+
 fn align_down_u64(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
@@ -1728,6 +1933,145 @@ mod tests {
         let fmc_args = plan.fmc_boot_params();
         assert_eq!(read_test_u64(&fmc_args, 16), plan.wpr_meta.address);
         assert_eq!(read_test_u64(&fmc_args, 48), plan.libos_args.address);
+    }
+
+    #[test]
+    fn materializes_r570_bundle_into_linked_system_image() {
+        let gsp_bytes = synthetic_firmware();
+        let gsp = GspFirmware::parse(&gsp_bytes).expect("firmware");
+        let fmc_bytes = (0u8..16).collect::<Vec<_>>();
+        let fmc = GspFmc {
+            hash: FirmwareSection { offset: 0, size: 4 },
+            signature: FirmwareSection { offset: 4, size: 4 },
+            public_key: FirmwareSection { offset: 8, size: 4 },
+            image: FirmwareSection {
+                offset: 12,
+                size: 4,
+            },
+            section_count: 6,
+        };
+        let bootloader_bytes = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let bootloader = GspBootloader {
+            bin_size: bootloader_bytes.len(),
+            header_offset: 0,
+            data_offset: 2,
+            data_size: 4,
+            payload: FirmwareSection { offset: 2, size: 4 },
+            descriptor: GspRmUcodeDescriptor {
+                version: 5,
+                bootloader_offset: 0,
+                bootloader_size: 0,
+                bootloader_param_offset: 0,
+                bootloader_param_size: 0,
+                riscv_elf_offset: 0,
+                riscv_elf_size: 0,
+                app_version: 0x55,
+                manifest_offset: 0,
+                manifest_size: 0,
+                monitor_data_offset: 2,
+                monitor_data_size: 1,
+                monitor_code_offset: 1,
+                monitor_code_size: 1,
+                monitor_enabled: 0,
+                swbrom_code_offset: 0,
+                swbrom_code_size: 0,
+                swbrom_data_offset: 0,
+                swbrom_data_size: 0,
+                framebuffer_reserved_size: 0,
+                signed_as_code: 0,
+            },
+        };
+        let bundle = GspFirmwareBundle {
+            gsp,
+            fmc,
+            bootloader,
+        };
+        let plan =
+            GspBootSystemMemoryPlan::r570_gb20x(bundle, 0x1000_0000).expect("system-memory plan");
+        let framebuffer = GspFramebufferLayout::r570_gb20x(
+            16 * (1u64 << 30),
+            16 * (1u64 << 30) - 0x20_000,
+            plan.gsp_image_bytes,
+            plan.bootloader_bytes,
+        )
+        .expect("framebuffer layout");
+        let mut output = vec![0u8; plan.total_bytes];
+        plan.materialize_bundle_into(
+            bundle,
+            &gsp_bytes,
+            &fmc_bytes,
+            &bootloader_bytes,
+            framebuffer,
+            &mut output,
+        )
+        .expect("materialized system image");
+
+        let offset = |region: GspMemoryRegion| (region.address - plan.system_base) as usize;
+        let fmc_offset = offset(plan.fmc_image);
+        assert_eq!(&output[fmc_offset..fmc_offset + 4], &fmc_bytes[12..16]);
+        let gsp_offset = offset(plan.gsp_image);
+        assert_eq!(
+            &output[gsp_offset..gsp_offset + gsp.image.size],
+            &gsp_bytes[gsp.image.offset..gsp.image.offset + gsp.image.size]
+        );
+        assert!(
+            output[gsp_offset + gsp.image.size..gsp_offset + plan.gsp_image.size]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        let signature_offset = offset(plan.signature);
+        assert_eq!(
+            &output[signature_offset..signature_offset + gsp.gb20x_signature.unwrap().size],
+            &gsp_bytes[gsp.gb20x_signature.unwrap().offset
+                ..gsp.gb20x_signature.unwrap().offset + gsp.gb20x_signature.unwrap().size]
+        );
+        let bootloader_offset = offset(plan.bootloader);
+        assert_eq!(
+            &output[bootloader_offset..bootloader_offset + 4],
+            &bootloader_bytes[2..6]
+        );
+
+        let radix3_level0_offset = offset(plan.radix3_level0);
+        assert_eq!(
+            read_test_u64(&output[radix3_level0_offset..], 0),
+            plan.radix3_level1.address
+        );
+        let shared_offset = offset(plan.shared_memory);
+        assert_eq!(
+            read_test_u64(&output[shared_offset..], 0),
+            plan.shared_memory.address
+        );
+        let rm_args_offset = offset(plan.rm_args);
+        assert_eq!(
+            read_test_u64(&output[rm_args_offset..], 0),
+            plan.shared_memory.address
+        );
+        let wpr_meta_offset = offset(plan.wpr_meta);
+        assert_eq!(
+            read_test_u64(&output[wpr_meta_offset..], 16),
+            plan.radix3_level0.address
+        );
+        let fmc_args_offset = offset(plan.fmc_args);
+        assert_eq!(
+            read_test_u64(&output[fmc_args_offset..], 16),
+            plan.wpr_meta.address
+        );
+
+        let mut small_output = vec![0u8; plan.total_bytes - 1];
+        assert_eq!(
+            plan.materialize_bundle_into(
+                bundle,
+                &gsp_bytes,
+                &fmc_bytes,
+                &bootloader_bytes,
+                framebuffer,
+                &mut small_output,
+            ),
+            Err(GspMaterializationError::BufferTooSmall {
+                required: plan.total_bytes,
+                actual: plan.total_bytes - 1,
+            })
+        );
     }
 
     #[test]

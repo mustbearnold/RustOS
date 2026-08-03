@@ -1,8 +1,8 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
 use rustos_gpu_protocol::{
-    GspBootSystemMemoryPlan, GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc, GspFspCot,
-    GspRpcMessage, encode_gsp_rpc,
+    GspBootSystemMemoryPlan, GspCachedArguments, GspFirmware, GspFirmwareBundle, GspFmc,
+    GspFramebufferLayout, GspFspCot, GspRpcMessage, encode_gsp_rpc,
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -1297,6 +1297,25 @@ fn nvidia_gsp_bundle_check(
         .map_err(|error| format!("planning NVIDIA GSP bundle layout: {error:?}"))?;
     let staging = GspBootSystemMemoryPlan::r570_gb20x(bundle, 0x1000_0000)
         .map_err(|error| format!("planning NVIDIA GSP system memory staging: {error:?}"))?;
+    let framebuffer = GspFramebufferLayout::r570_gb20x(
+        16 * (1u64 << 30),
+        16 * (1u64 << 30) - 0x20_000,
+        staging.gsp_image_bytes,
+        staging.bootloader_bytes,
+    )
+    .map_err(|error| format!("planning NVIDIA GSP framebuffer WPR: {error:?}"))?;
+    let mut staged_memory = vec![0u8; staging.total_bytes];
+    staging
+        .materialize_bundle_into(
+            bundle,
+            &gsp,
+            &fmc,
+            &bootloader,
+            framebuffer,
+            &mut staged_memory,
+        )
+        .map_err(|error| format!("materializing NVIDIA GSP system image: {error:?}"))?;
+    let staged_nonzero_bytes = staged_memory.iter().filter(|byte| **byte != 0).count();
     let radix3 = staging
         .radix3_tables()
         .map_err(|error| format!("materializing NVIDIA GSP staged radix-3 tables: {error:?}"))?;
@@ -1319,7 +1338,7 @@ fn nvidia_gsp_bundle_check(
     .encode()
     .map_err(|error| format!("encoding NVIDIA GSP-FMC COT request: {error:?}"))?;
     println!(
-        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} staged_system_base=0x{:x} staged_system_bytes={} staged_system_end=0x{:x} staged_radix3_bytes={} staged_shared_bytes={} staged_cached_args_bytes={} staged_fmc_args_bytes={} fsp_cot_bytes={} fsp_cot_version={} fsp_hash_bytes={} fsp_public_key_bytes={} fsp_signature_bytes={} status=ready",
+        "nvidia-gsp-bundle: version={} gsp_bytes={} gsp_image_bytes={} gsp_image_pages={} fmc_bytes={} fmc_image_bytes={} bootloader_bytes={} bootloader_payload_bytes={} descriptor_version={} descriptor_app_version={} radix3_bytes={} staged_system_base=0x{:x} staged_system_bytes={} staged_system_end=0x{:x} staged_nonzero_bytes={} staged_radix3_bytes={} staged_shared_bytes={} staged_cached_args_bytes={} staged_fmc_args_bytes={} fsp_cot_bytes={} fsp_cot_version={} fsp_hash_bytes={} fsp_public_key_bytes={} fsp_signature_bytes={} status=ready",
         String::from_utf8_lossy(expected_version),
         gsp.len(),
         bundle.gsp.image.size,
@@ -1334,6 +1353,7 @@ fn nvidia_gsp_bundle_check(
         staging.fmc_image.address,
         staging.total_bytes,
         staging.end_address,
+        staged_nonzero_bytes,
         radix3.level0.len() + radix3.level1.len() + radix3.level2.len(),
         shared_memory.page_table.len()
             + shared_memory.command_queue.len()
