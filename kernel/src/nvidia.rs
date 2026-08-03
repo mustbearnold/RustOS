@@ -98,6 +98,10 @@ pub enum NvidiaError {
         expected_rpc: u32,
         actual_rpc: u32,
     },
+    GspRpcTransportSequenceMismatch {
+        expected: u32,
+        actual: u32,
+    },
     GspStaticInfo(rustos_gpu_protocol::GspStaticInfoError),
     GspFmcBootTimeout,
     GspFmcBootFailed {
@@ -171,6 +175,7 @@ pub struct NvidiaGspStaging {
     pub gsp_bytes: usize,
     pub fmc_bytes: usize,
     pub bootloader_bytes: usize,
+    gsp_status_sequence: u32,
     next_frame_address: u64,
 }
 
@@ -453,6 +458,7 @@ pub fn stage_external_gsp(
         gsp_bytes: gsp_size,
         fmc_bytes: fmc_size,
         bootloader_bytes: bootloader_size,
+        gsp_status_sequence: 0,
         next_frame_address,
     }))
 }
@@ -729,18 +735,28 @@ impl NvidiaFspTransport {
                 size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
                 available: staging.plan.shared_memory.size,
             })?;
-        let shared = staging.shared_memory_mut()?;
-        let available = shared.len();
-        let queue_bytes = shared
-            .get_mut(layout.status_queue_offset..queue_end)
-            .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
-                offset: layout.status_queue_offset,
-                size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
-                available,
-            })?;
-        let mut queue =
-            rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
-        queue.try_receive_message().map_err(NvidiaError::GspQueue)
+        let message = {
+            let shared = staging.shared_memory_mut()?;
+            let available = shared.len();
+            let queue_bytes = shared
+                .get_mut(layout.status_queue_offset..queue_end)
+                .ok_or(NvidiaError::GspSharedMemoryOutOfRange {
+                    offset: layout.status_queue_offset,
+                    size: rustos_gpu_protocol::NVIDIA_GSP_SHARED_QUEUE_BYTES,
+                    available,
+                })?;
+            let mut queue =
+                rustos_gpu_protocol::GspQueue::new(queue_bytes).map_err(NvidiaError::GspQueue)?;
+            queue.try_receive_message().map_err(NvidiaError::GspQueue)?
+        };
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        let parsed =
+            rustos_gpu_protocol::GspRpcMessage::parse(&message).map_err(NvidiaError::GspRpc)?;
+        validate_gsp_rpc_transport_sequence(parsed, staging.gsp_status_sequence)?;
+        staging.gsp_status_sequence = staging.gsp_status_sequence.wrapping_add(1);
+        Ok(Some(message))
     }
 
     #[cfg(target_os = "none")]
@@ -970,11 +986,11 @@ pub fn boot_external_gsp(
         staging,
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
         2,
-        2,
+        0,
         &static_info_request,
     )?;
     crate::kprintln!(
-        "driver: nvidia GSP-RM command function={} transport_sequence=2 rpc_sequence=2 payload_bytes={} queue=shared status=sent",
+        "driver: nvidia GSP-RM command function={} transport_sequence=2 rpc_sequence=0 payload_bytes={} queue=shared status=sent",
         rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
         static_info_request.len(),
     );
@@ -1152,11 +1168,24 @@ fn io_bar_base(bar: PciBar) -> Option<u64> {
 fn validate_static_info_rpc_sequence(
     message: rustos_gpu_protocol::GspRpcMessage<'_>,
 ) -> Result<(), NvidiaError> {
-    if message.rpc_sequence() != 2 {
+    if message.rpc_sequence() != 0 {
         return Err(NvidiaError::GspRpcSequenceMismatch {
             function: message.function(),
-            expected_rpc: 2,
+            expected_rpc: 0,
             actual_rpc: message.rpc_sequence(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_gsp_rpc_transport_sequence(
+    message: rustos_gpu_protocol::GspRpcMessage<'_>,
+    expected: u32,
+) -> Result<(), NvidiaError> {
+    if message.transport_sequence() != expected {
+        return Err(NvidiaError::GspRpcTransportSequenceMismatch {
+            expected,
+            actual: message.transport_sequence(),
         });
     }
     Ok(())
@@ -1302,7 +1331,7 @@ mod tests {
         let valid = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
             rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
             2,
-            2,
+            0,
             &[],
         )
         .expect("static info reply");
@@ -1312,7 +1341,7 @@ mod tests {
         let wrong = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
             rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
             2,
-            0,
+            2,
             &[],
         )
         .expect("static info reply");
@@ -1321,8 +1350,37 @@ mod tests {
             validate_static_info_rpc_sequence(wrong),
             Err(NvidiaError::GspRpcSequenceMismatch {
                 function: rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
-                expected_rpc: 2,
-                actual_rpc: 0,
+                expected_rpc: 0,
+                actual_rpc: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn requires_monotonic_status_queue_transport_sequence() {
+        let valid = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            rustos_gpu_protocol::NVIDIA_GSP_EVENT_GSP_INIT_DONE,
+            0,
+            0,
+            &[],
+        )
+        .expect("event");
+        let valid = rustos_gpu_protocol::GspRpcMessage::parse(&valid).expect("parse event");
+        assert_eq!(validate_gsp_rpc_transport_sequence(valid, 0), Ok(()));
+
+        let wrong = rustos_gpu_protocol::encode_gsp_rpc_with_sequences(
+            rustos_gpu_protocol::NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
+            5,
+            0,
+            &[],
+        )
+        .expect("reply");
+        let wrong = rustos_gpu_protocol::GspRpcMessage::parse(&wrong).expect("parse reply");
+        assert_eq!(
+            validate_gsp_rpc_transport_sequence(wrong, 1),
+            Err(NvidiaError::GspRpcTransportSequenceMismatch {
+                expected: 1,
+                actual: 5,
             })
         );
     }

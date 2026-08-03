@@ -1446,7 +1446,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent",
         "driver: nvidia GSP-RM event function=4097",
         "status=consumed",
-        "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=2 payload_bytes=1656 queue=shared status=sent",
+        "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=0 payload_bytes=1656 queue=shared status=sent",
         "driver: nvidia GSP-RM reply function=65",
         "status=received",
         "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info",
@@ -1489,7 +1489,7 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     else {
         return Err("physical NVIDIA GSP proof missing static-info reply".to_owned());
     };
-    if !static_info_reply_line.contains("rpc_sequence=2") {
+    if !static_info_reply_line.contains("rpc_sequence=0") {
         return Err("physical NVIDIA GSP proof has wrong static-info RPC sequence".to_owned());
     }
     let Some(static_info_line) = content
@@ -6489,9 +6489,9 @@ mod tests {
             "driver: nvidia GSP-FMC ready status=ready\n",
             "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent\n",
             "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
-            "driver: nvidia GSP-RM event function=4097 transport_sequence=4 rpc_sequence=0 status=consumed\n",
-            "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=2 payload_bytes=1656 queue=shared status=sent\n",
-            "driver: nvidia GSP-RM reply function=65 transport_sequence=5 rpc_sequence=2 result=0x00000000 private_result=0x00000000 status=received\n",
+            "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 status=consumed\n",
+            "driver: nvidia GSP-RM command function=65 transport_sequence=2 rpc_sequence=0 payload_bytes=1656 queue=shared status=sent\n",
+            "driver: nvidia GSP-RM reply function=65 transport_sequence=1 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=received\n",
             "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[78, 86, 73, 68, 73, 65, 0]\n",
             "driver: nvidia GSP staging gsp_rm_status=gsp-rm-ready device_writes=opt-in status=ready\n",
             "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
@@ -6512,8 +6512,8 @@ mod tests {
         assert!(validate_nvidia_gsp_physical_log(&missing_static_info).is_err());
 
         let wrong_static_rpc = success.replace(
-            "transport_sequence=5 rpc_sequence=2 result=0x00000000",
-            "transport_sequence=5 rpc_sequence=0 result=0x00000000",
+            "transport_sequence=1 rpc_sequence=0 result=0x00000000",
+            "transport_sequence=1 rpc_sequence=2 result=0x00000000",
         );
         assert!(validate_nvidia_gsp_physical_log(&wrong_static_rpc).is_err());
 
