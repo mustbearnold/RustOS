@@ -2,6 +2,10 @@
 
 extern crate alloc;
 
+mod fmc;
+
+pub use fmc::{GspFmc, GspFmcError, GspFmcRequiredSection};
+
 use alloc::vec::Vec;
 
 pub const NVIDIA_GSP_MAX_FIRMWARE_SIZE: usize = 128 * 1024 * 1024;
