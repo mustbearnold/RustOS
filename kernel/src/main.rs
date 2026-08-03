@@ -1069,11 +1069,57 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     process::update_frame_allocator(dma_next_frame_address);
 
-    let (virtio_gpu_runtime, gpu_dma_next_frame_address) = match virtio_gpu::initialize(
+    let (igc_runtime, igc_dma_next_frame_address) = match igc::initialize(
         &pci_inventory,
         physical_memory_offset,
         &boot_info.memory_regions,
         dma_next_frame_address,
+    ) {
+        Ok(Some(runtime)) => {
+            let next_frame_address = runtime.next_frame_address();
+            (Some(runtime), next_frame_address)
+        }
+        Ok(None) => {
+            kprintln!("driver: igc I225-V not present status=absent");
+            (None, dma_next_frame_address)
+        }
+        Err(failure) => {
+            kprintln!(
+                "driver: igc I225-V initialization failed ({:?}) status=degraded",
+                failure.error
+            );
+            (None, failure.next_frame_address)
+        }
+    };
+    process::update_frame_allocator(igc_dma_next_frame_address);
+    if let Some(runtime) = igc_runtime.as_ref() {
+        let probe = runtime.probe_snapshot();
+        hardware::set_i225(probe);
+        kprintln!(
+            "driver: igc transport={} {:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} tx_queue={} rx_queue={} busmaster={} failure={:?} status={}",
+            igc::IgcRuntime::interface_name(),
+            runtime.address.bus,
+            runtime.address.device,
+            runtime.address.function,
+            runtime.mmio_base,
+            runtime.mmio_length,
+            runtime.tx_queue_ready,
+            runtime.rx_queue_ready,
+            runtime.bus_master_enabled,
+            runtime.failure,
+            if runtime.is_ready() {
+                "ready"
+            } else {
+                "degraded"
+            }
+        );
+    }
+
+    let (virtio_gpu_runtime, gpu_dma_next_frame_address) = match virtio_gpu::initialize(
+        &pci_inventory,
+        physical_memory_offset,
+        &boot_info.memory_regions,
+        igc_dma_next_frame_address,
         framebuffer::info(),
     ) {
         Ok(Some(runtime)) => {
@@ -1082,7 +1128,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         Ok(None) => {
             kprintln!("driver: virtio-gpu not present status=absent");
-            (None, dma_next_frame_address)
+            (None, igc_dma_next_frame_address)
         }
         Err(failure) => {
             kprintln!(

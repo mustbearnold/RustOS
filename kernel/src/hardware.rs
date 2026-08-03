@@ -191,7 +191,7 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
     if let Some(network) = snapshot.i225 {
         writeln!(
             writer,
-            "network: driver=igc probe=i225-v pci={:02x}:{:02x}.{} mmio=0x{:x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_up={} speed_mbps={} full_duplex={} busmaster={} status=ready",
+            "network: driver=igc probe=i225-v pci={:02x}:{:02x}.{} mmio=0x{:x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_up={} speed_mbps={} full_duplex={} busmaster={} tx_queue={} rx_queue={} status={}",
             network.address.bus,
             network.address.device,
             network.address.function,
@@ -205,7 +205,14 @@ pub fn write_text<W: Write>(writer: &mut W) -> fmt::Result {
             network.link.up,
             network.link.speed.mbps(),
             network.link.full_duplex,
-            network.bus_master_enabled
+            network.bus_master_enabled,
+            network.tx_queue_ready,
+            network.rx_queue_ready,
+            if network.tx_queue_ready && network.rx_queue_ready {
+                "ready"
+            } else {
+                "probe"
+            }
         )?;
     } else {
         writeln!(writer, "network: driver=igc probe=i225-v status=absent")?;
