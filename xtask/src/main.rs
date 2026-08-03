@@ -1,5 +1,6 @@
 use bootloader::DiskImageBuilder;
 use ed25519_dalek::{Signer, SigningKey};
+use rustos_gpu_protocol::{GspFirmware, GspRpcMessage, encode_gsp_rpc};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -86,6 +87,13 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             partitioned_root_size(&arguments)?,
         ),
         Some("check") => check(),
+        Some("nvidia-gsp-check") => {
+            let path = arguments
+                .get(1)
+                .map(PathBuf::from)
+                .ok_or_else(|| "nvidia-gsp-check requires a firmware path".to_owned())?;
+            nvidia_gsp_check(&path)
+        }
         Some("run") => {
             let firmware = arguments.get(1).map(String::as_str).ok_or_else(usage)?;
             let release = arguments.iter().any(|argument| argument == "--release");
@@ -1150,6 +1158,29 @@ fn copy_partition(
             output.display()
         )
     })?;
+    Ok(())
+}
+
+fn nvidia_gsp_check(path: &Path) -> Result<(), String> {
+    let firmware = fs::read(path)
+        .map_err(|error| format!("reading NVIDIA GSP firmware {}: {error}", path.display()))?;
+    let descriptor = GspFirmware::parse(&firmware)
+        .map_err(|error| format!("parsing NVIDIA GSP firmware {}: {error:?}", path.display()))?;
+    let command = encode_gsp_rpc(0, 1, &[])
+        .map_err(|error| format!("encoding GSP RPC smoke command: {error:?}"))?;
+    let message = GspRpcMessage::parse(&command)
+        .map_err(|error| format!("parsing GSP RPC smoke command: {error:?}"))?;
+    println!(
+        "nvidia-gsp: path={} bytes={} image_offset=0x{:x} image_bytes={} version={} gb20x_signature={} rpc_pages={} checksum={} status=ready",
+        path.display(),
+        firmware.len(),
+        descriptor.image.offset,
+        descriptor.image.size,
+        String::from_utf8_lossy(descriptor.version_bytes(&firmware)),
+        descriptor.supports_gb20x(),
+        message.element_count(),
+        message.checksum_valid()
+    );
     Ok(())
 }
 
@@ -5836,13 +5867,14 @@ fn usage() -> String {
 }
 
 fn usage_text() -> &'static str {
-    "usage: cargo run -p rustos-xtask -- <build|check|run|install> ..."
+    "usage: cargo run -p rustos-xtask -- <build|check|nvidia-gsp-check|run|install> ..."
 }
 
 fn print_usage() {
     println!("{usage}", usage = usage_text());
     println!("  build              compile the kernel and create BIOS + UEFI images");
     println!("  check              check the host workspace and bare-metal kernel");
+    println!("  nvidia-gsp-check PATH  validate an external NVIDIA GSP ELF and RPC marshalling");
     println!("  run bios|uefi      boot the image in QEMU with serial output");
     println!("  --shell            boot the shell-only init configuration");
     println!("  --recovery         boot the standalone recovery configuration");

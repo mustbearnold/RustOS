@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "userland", "xtask"]
+members = ["gpu-protocol", "kernel", "userland", "xtask"]
 resolver = "3"
 
 [workspace.package]

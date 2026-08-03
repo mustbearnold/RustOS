@@ -2,6 +2,9 @@ use crate::pci::{
     MmioRegion, PciAddress, PciBar, PciDevice, PciDeviceResources, PciInventory, PciResourceError,
 };
 
+pub const GSP_RPC_PAGE_SIZE: usize = rustos_gpu_protocol::NVIDIA_GSP_PAGE_SIZE;
+pub const GSP_RPC_MAX_MESSAGE_PAGES: usize = rustos_gpu_protocol::NVIDIA_GSP_MAX_MESSAGE_PAGES;
+
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
 pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
 pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = 0x1000;

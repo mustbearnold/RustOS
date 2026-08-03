@@ -455,6 +455,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-gpu-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -462,6 +466,7 @@ dependencies = [
  "linked_list_allocator",
  "noto-sans-mono-bitmap",
  "pic8259",
+ "rustos-gpu-protocol",
  "spin",
  "x86_64",
 ]
@@ -482,6 +487,7 @@ dependencies = [
  "ed25519-dalek",
  "fatfs",
  "gpt",
+ "rustos-gpu-protocol",
  "sha2",
 ]
 

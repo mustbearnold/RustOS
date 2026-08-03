@@ -758,7 +758,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(Some(probe)) => {
             hardware::set_nvidia(probe);
             kprintln!(
-                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} acceleration=unavailable status=probe-ready",
+                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} gsp=external-firmware-riscv64 rpc_page={} rpc_max_pages={} acceleration=unavailable status=probe-ready",
                 probe.address.bus,
                 probe.address.device,
                 probe.address.function,
@@ -774,7 +774,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 probe.memory_space_enabled,
                 probe.bus_master_enabled,
                 probe.msi,
-                probe.msix
+                probe.msix,
+                nvidia::GSP_RPC_PAGE_SIZE,
+                nvidia::GSP_RPC_MAX_MESSAGE_PAGES
             );
         }
         Ok(None) => kprintln!("driver: nvidia RTX 5070 not present status=absent"),

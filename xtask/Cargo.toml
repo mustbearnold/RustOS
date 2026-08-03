@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["signature"] }
+rustos-gpu-protocol = { path = "../gpu-protocol" }
 sha2 = { version = "0.11.0", default-features = false }
 bootloader = "=0.11.17"
 fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
