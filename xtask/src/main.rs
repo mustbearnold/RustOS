@@ -2623,6 +2623,7 @@ fn spawn_keyboard_proof(
         if let Some(serial) = serial.as_deref()
             && !ensure_shell_login(&mut monitor, serial)
         {
+            let _ = monitor.write_all(b"quit\n");
             return;
         }
         for command in ["sendkey n\n", "sendkey e\n", "sendkey t\n", "sendkey ret\n"] {
@@ -2659,6 +2660,7 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
         let ready = ensure_shell_login(&mut monitor, &serial);
         println!("shell proof: shell_ready={ready}");
         if !ready {
+            let _ = monitor.write_all(b"quit\n");
             return;
         }
         let steps = [
