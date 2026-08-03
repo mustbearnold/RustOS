@@ -1513,6 +1513,15 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
     {
         return Err("physical NVIDIA GSP proof has invalid GSP-FMC status".to_owned());
     }
+    let Some(hw_nvidia_line) = content
+        .lines()
+        .find(|line| line.starts_with("nvidia: driver=probe pci=0b:00.0"))
+    else {
+        return Err("physical NVIDIA GSP proof missing hw NVIDIA status".to_owned());
+    };
+    if !hw_nvidia_line.contains("busmaster=true") {
+        return Err("physical NVIDIA GSP proof requires NVIDIA bus mastering".to_owned());
+    }
     let Some(platform_line) = content
         .lines()
         .find(|line| line.contains("platform: cpu_vendor="))
@@ -6557,9 +6566,12 @@ mod tests {
             "driver: nvidia GSP-RM reply function=65 transport_sequence=1 rpc_sequence=0 result=0x00000000 private_result=0x00000000 status=received\n",
             "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name=[78, 86, 73, 68, 73, 65, 0]\n",
             "driver: nvidia GSP staging gsp_rm_status=gsp-rm-ready device_writes=opt-in status=ready\n",
-            "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 gsp_rm=ready acceleration=unavailable status=probe-ready\n",
+            "nvidia: driver=probe pci=0b:00.0 device_id=0x2f04 busmaster=true gsp_rm=ready acceleration=unavailable status=probe-ready\n",
         );
         assert!(validate_nvidia_gsp_physical_log(success).is_ok());
+
+        let no_bus_master = success.replace("busmaster=true", "busmaster=false");
+        assert!(validate_nvidia_gsp_physical_log(&no_bus_master).is_err());
 
         let unrelated_status = success
             .replace(

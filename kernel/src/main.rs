@@ -816,7 +816,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             display.device_id
         );
     }
-    let nvidia_probe = match nvidia::initialize(&pci_inventory, physical_memory_offset) {
+    let mut nvidia_probe = match nvidia::initialize(&pci_inventory, physical_memory_offset) {
         Ok(Some(probe)) => {
             hardware::set_nvidia(probe);
             kprintln!(
@@ -1456,41 +1456,56 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         "target-platform-failed"
                     } else {
                         hardware::set_nvidia_gsp_status(hardware::NvidiaGspStatus::Staged);
-                        match nvidia_probe.as_ref() {
-                            Some(probe) => match nvidia::boot_external_gsp(probe, &mut staging) {
-                                Ok(boot) => {
-                                    hardware::set_nvidia_gsp_status(
-                                        hardware::NvidiaGspStatus::Ready,
-                                    );
-                                    kprintln!(
-                                        "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
-                                        boot.fsp_response.task_id,
-                                        boot.fsp_response.command_nvdm_type,
-                                        boot.fsp_response.error_code,
-                                    );
-                                    kprintln!(
-                                        "driver: nvidia GSP-FMC ready hwcfg2=0x{:08x} mailbox=0x{:08x}:0x{:08x} riscv_active={} riscv_lockdown={} status=ready",
-                                        boot.gsp.hwcfg2,
-                                        boot.gsp.mailbox0,
-                                        boot.gsp.mailbox1,
-                                        boot.gsp.riscv_active,
-                                        boot.gsp.riscv_lockdown,
-                                    );
-                                    kprintln!(
-                                        "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name={:?} acceleration=unavailable status=ready",
-                                        boot.static_info.gpu_name,
-                                    );
-                                    "gsp-rm-ready"
+                        match nvidia_probe.as_mut() {
+                            Some(probe) => match probe.enable_bus_master() {
+                                Ok(()) => {
+                                    hardware::set_nvidia(*probe);
+                                    match nvidia::boot_external_gsp(probe, &mut staging) {
+                                        Ok(boot) => {
+                                            hardware::set_nvidia_gsp_status(
+                                                hardware::NvidiaGspStatus::Ready,
+                                            );
+                                            kprintln!(
+                                                "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
+                                                boot.fsp_response.task_id,
+                                                boot.fsp_response.command_nvdm_type,
+                                                boot.fsp_response.error_code,
+                                            );
+                                            kprintln!(
+                                                "driver: nvidia GSP-FMC ready hwcfg2=0x{:08x} mailbox=0x{:08x}:0x{:08x} riscv_active={} riscv_lockdown={} status=ready",
+                                                boot.gsp.hwcfg2,
+                                                boot.gsp.mailbox0,
+                                                boot.gsp.mailbox1,
+                                                boot.gsp.riscv_active,
+                                                boot.gsp.riscv_lockdown,
+                                            );
+                                            kprintln!(
+                                                "driver: nvidia GSP-RM ready function_flow=set-system-info,set-registry,gsp-init-done,get-static-info gpu_name={:?} acceleration=unavailable status=ready",
+                                                boot.static_info.gpu_name,
+                                            );
+                                            "gsp-rm-ready"
+                                        }
+                                        Err(error) => {
+                                            hardware::set_nvidia_gsp_status(
+                                                hardware::NvidiaGspStatus::Failed,
+                                            );
+                                            kprintln!(
+                                                "driver: nvidia GSP-RM bootstrap failed ({:?}) status=degraded",
+                                                error
+                                            );
+                                            "gsp-rm-failed"
+                                        }
+                                    }
                                 }
                                 Err(error) => {
                                     hardware::set_nvidia_gsp_status(
                                         hardware::NvidiaGspStatus::Failed,
                                     );
                                     kprintln!(
-                                        "driver: nvidia GSP-RM bootstrap failed ({:?}) status=degraded",
+                                        "driver: nvidia bus-master enable failed ({:?}) device_writes=opt-in status=degraded",
                                         error
                                     );
-                                    "gsp-rm-failed"
+                                    "bus-master-failed"
                                 }
                             },
                             None => {

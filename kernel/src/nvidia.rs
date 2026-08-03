@@ -1075,6 +1075,21 @@ impl NvidiaProbe {
         self.bar0.map(NvidiaFspTransport::new)
     }
 
+    #[cfg(target_os = "none")]
+    pub fn enable_bus_master(&mut self) -> Result<(), NvidiaError> {
+        if self.bus_master_enabled {
+            return Ok(());
+        }
+        let command = crate::pci::enable_bus_master(self.address)?;
+        self.bus_master_enabled = command & (1 << 2) != 0;
+        if !self.bus_master_enabled {
+            return Err(NvidiaError::Resources(
+                PciResourceError::BusMasterEnableFailed,
+            ));
+        }
+        Ok(())
+    }
+
     fn from_device_mapping(
         device: PciDevice,
         mmio_base: u64,

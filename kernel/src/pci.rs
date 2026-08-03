@@ -650,18 +650,7 @@ impl PciDeviceResources {
     }
 
     pub fn enable_bus_master(&mut self) -> Result<(), PciResourceError> {
-        if self.device.bus_master_enabled() {
-            return Ok(());
-        }
-
-        let mut config = LegacyConfigAccess::new();
-        let command = config.read_u16(self.device.address, 0x04);
-        let updated_command = command | (1 << 2);
-        config.write_u16(self.device.address, 0x04, updated_command);
-        let read_back = config.read_u16(self.device.address, 0x04);
-        if read_back & (1 << 2) == 0 {
-            return Err(PciResourceError::BusMasterEnableFailed);
-        }
+        let read_back = enable_bus_master(self.device.address)?;
         self.device.command = read_back;
         Ok(())
     }
@@ -803,6 +792,24 @@ impl PciDeviceResources {
             vector,
         })
     }
+}
+
+/// Enable PCI bus mastering for a device after its caller has crossed its device-write gate.
+/// Returns the post-write command register so cached probe state stays accurate.
+pub fn enable_bus_master(address: PciAddress) -> Result<u16, PciResourceError> {
+    let mut config = LegacyConfigAccess::new();
+    let command = config.read_u16(address, 0x04);
+    if command & (1 << 2) != 0 {
+        return Ok(command);
+    }
+
+    let updated_command = command | (1 << 2);
+    config.write_u16(address, 0x04, updated_command);
+    let read_back = config.read_u16(address, 0x04);
+    if read_back & (1 << 2) == 0 {
+        return Err(PciResourceError::BusMasterEnableFailed);
+    }
+    Ok(read_back)
 }
 
 fn msi_message(vector: u8, destination_apic_id: u32) -> Result<(u64, u16), PciResourceError> {
