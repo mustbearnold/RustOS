@@ -1492,6 +1492,27 @@ fn validate_nvidia_gsp_physical_log(content: &str) -> Result<(), String> {
         };
         cursor += relative + marker.len();
     }
+    let Some(fsp_response_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia FSP COT response"))
+    else {
+        return Err("physical NVIDIA GSP proof missing FSP response".to_owned());
+    };
+    if !fsp_response_line.contains("command=0x00000014")
+        || !fsp_response_line.contains("error=0x00000000")
+    {
+        return Err("physical NVIDIA GSP proof has invalid FSP COT response".to_owned());
+    }
+    let Some(gsp_fmc_line) = content
+        .lines()
+        .find(|line| line.contains("driver: nvidia GSP-FMC ready"))
+    else {
+        return Err("physical NVIDIA GSP proof missing GSP-FMC status".to_owned());
+    };
+    if !gsp_fmc_line.contains("riscv_active=true") || !gsp_fmc_line.contains("riscv_lockdown=false")
+    {
+        return Err("physical NVIDIA GSP proof has invalid GSP-FMC status".to_owned());
+    }
     let Some(platform_line) = content
         .lines()
         .find(|line| line.contains("platform: cpu_vendor="))
@@ -6527,8 +6548,8 @@ mod tests {
         let success = concat!(
             "platform: cpu_vendor=AuthenticAMD cpu_brand=AMD Ryzen 7 5800X 8-Core Processor usable_memory_kib=32760016 hypervisor=none status=present\n",
             "driver: nvidia probe 0b:00.0 device=0x2f04 revision=0xa1 architecture=blackwell\n",
-            "driver: nvidia FSP COT response status=accepted\n",
-            "driver: nvidia GSP-FMC ready status=ready\n",
+            "driver: nvidia FSP COT response task_id=0x00000001 command=0x00000014 error=0x00000000 status=accepted\n",
+            "driver: nvidia GSP-FMC ready hwcfg2=0x00000000 mailbox=0x00000000:0x00000000 riscv_active=true riscv_lockdown=false status=ready\n",
             "driver: nvidia GSP-RM command function=72 transport_sequence=0 rpc_sequence=0 payload_bytes=544 queue=shared status=sent\n",
             "driver: nvidia GSP-RM command function=73 transport_sequence=1 rpc_sequence=0 payload_bytes=117 queue=shared status=sent\n",
             "driver: nvidia GSP-RM event function=4097 transport_sequence=0 rpc_sequence=0 status=consumed\n",
@@ -6573,6 +6594,18 @@ mod tests {
         let empty_gpu_name =
             success.replace("gpu_name=[78, 86, 73, 68, 73, 65, 0]", "gpu_name=[0]");
         assert!(validate_nvidia_gsp_physical_log(&empty_gpu_name).is_err());
+
+        let wrong_fsp_command = success.replace("command=0x00000014", "command=0x00000015");
+        assert!(validate_nvidia_gsp_physical_log(&wrong_fsp_command).is_err());
+
+        let failed_fsp = success.replace("error=0x00000000", "error=0x00000001");
+        assert!(validate_nvidia_gsp_physical_log(&failed_fsp).is_err());
+
+        let inactive_gsp = success.replace("riscv_active=true", "riscv_active=false");
+        assert!(validate_nvidia_gsp_physical_log(&inactive_gsp).is_err());
+
+        let unlocked_gsp = success.replace("riscv_lockdown=false", "riscv_lockdown=true");
+        assert!(validate_nvidia_gsp_physical_log(&unlocked_gsp).is_err());
 
         let failed = format!("{success}driver: nvidia GSP-RM bootstrap failed status=degraded\n");
         assert!(validate_nvidia_gsp_physical_log(&failed).is_err());
