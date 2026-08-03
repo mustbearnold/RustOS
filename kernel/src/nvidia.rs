@@ -29,6 +29,7 @@ pub const RTX_5070_DEVICE_ID: u16 = 0x2f04;
 pub const NVIDIA_PROBE_MMIO_LENGTH: u64 = rustos_gpu_protocol::NVIDIA_GSP_FSP_BAR0_REQUIRED_LENGTH;
 #[allow(dead_code)]
 const NVIDIA_GSP_FSP_POLL_SPINS: usize = 10_000_000;
+const NVIDIA_GSP_FMC_POLL_SPINS: usize = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -62,6 +63,9 @@ pub enum NvidiaError {
     FspResponseTimeout,
     FspResponseBufferTooSmall { required: usize, actual: usize },
     FspResponse(rustos_gpu_protocol::GspFspResponseError),
+    GspFmcBootTimeout,
+    GspFmcBootFailed { mailbox0: u32, mailbox1: u32 },
+    GspRiscvInactiveTimeout,
 }
 
 impl From<PciResourceError> for NvidiaError {
@@ -392,6 +396,11 @@ pub struct NvidiaFspSnapshot {
     pub mailbox0: u32,
     pub mailbox1: u32,
     pub riscv_lockdown: bool,
+    pub gsp_hwcfg2: u32,
+    pub gsp_mailbox0: u32,
+    pub gsp_mailbox1: u32,
+    pub gsp_riscv_active: bool,
+    pub gsp_riscv_lockdown: bool,
 }
 
 impl NvidiaFspSnapshot {
@@ -405,11 +414,17 @@ impl NvidiaFspSnapshot {
             mailbox0: 0,
             mailbox1: 0,
             riscv_lockdown: true,
+            gsp_hwcfg2: 0,
+            gsp_mailbox0: 0,
+            gsp_mailbox1: 0,
+            gsp_riscv_active: false,
+            gsp_riscv_lockdown: true,
         }
     }
 
     fn read(mmio: MmioRegion) -> Result<Self, NvidiaError> {
         let hwcfg2 = mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_HWCFG2))?;
+        let gsp_hwcfg2 = mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2))?;
         Ok(Self {
             secure_boot_status: mmio.read_u32(u64::from(
                 rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_REGISTER_GB20X,
@@ -429,8 +444,84 @@ impl NvidiaFspSnapshot {
             riscv_lockdown: hwcfg2
                 & (1 << rustos_gpu_protocol::NVIDIA_GSP_FSP_FALCON_HWCFG2_LOCKDOWN_BIT)
                 != 0,
+            gsp_hwcfg2,
+            gsp_mailbox0: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_MAILBOX0))?,
+            gsp_mailbox1: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_MAILBOX1))?,
+            gsp_riscv_active: mmio.read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL))?
+                & (1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL_RISCV_ACTIVE_BIT)
+                != 0,
+            gsp_riscv_lockdown: gsp_hwcfg2
+                & (1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_RISCV_BRANCH_PRIVILEGE_LOCKDOWN_BIT)
+                != 0,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaGspReady {
+    pub hwcfg2: u32,
+    pub mailbox0: u32,
+    pub mailbox1: u32,
+    pub riscv_active: bool,
+    pub riscv_lockdown: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaGspBootResult {
+    pub fsp_response: rustos_gpu_protocol::GspFspResponse,
+    pub gsp: NvidiaGspReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvidiaGspFmcPollState {
+    TargetMaskLocked,
+    WaitingForBootParams,
+    BootFailed { mailbox0: u32, mailbox1: u32 },
+    RiscvLockdown,
+    RiscvInactive,
+    Ready(NvidiaGspReady),
+}
+
+fn classify_gsp_fmc_state(
+    hwcfg2: u32,
+    mailbox0: u32,
+    mailbox1: u32,
+    fmc_args_address: u64,
+    cpuctl: u32,
+) -> NvidiaGspFmcPollState {
+    let target_mask = rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_TARGET_MASK;
+    if hwcfg2 & target_mask == rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_TARGET_MASK_LOCKED {
+        return NvidiaGspFmcPollState::TargetMaskLocked;
+    }
+
+    let mailbox_address = u64::from(mailbox0) | (u64::from(mailbox1) << 32);
+    if mailbox0 != 0 {
+        if mailbox_address != fmc_args_address {
+            return NvidiaGspFmcPollState::BootFailed { mailbox0, mailbox1 };
+        }
+        return NvidiaGspFmcPollState::WaitingForBootParams;
+    }
+
+    let riscv_lockdown = hwcfg2
+        & (1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_RISCV_BRANCH_PRIVILEGE_LOCKDOWN_BIT)
+        != 0;
+    if riscv_lockdown {
+        return NvidiaGspFmcPollState::RiscvLockdown;
+    }
+
+    let riscv_active =
+        cpuctl & (1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL_RISCV_ACTIVE_BIT) != 0;
+    if !riscv_active {
+        return NvidiaGspFmcPollState::RiscvInactive;
+    }
+
+    NvidiaGspFmcPollState::Ready(NvidiaGspReady {
+        hwcfg2,
+        mailbox0,
+        mailbox1,
+        riscv_active,
+        riscv_lockdown,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,6 +548,46 @@ impl NvidiaFspTransport {
             core::hint::spin_loop();
         }
         Err(NvidiaError::FspSecureBootTimeout)
+    }
+
+    fn wait_gsp_fmc_ready(&self, fmc_args_address: u64) -> Result<NvidiaGspReady, NvidiaError> {
+        let mut last_state = NvidiaGspFmcPollState::TargetMaskLocked;
+        for _ in 0..NVIDIA_GSP_FMC_POLL_SPINS {
+            let hwcfg2 = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2))?;
+            let mailbox0 = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_MAILBOX0))?;
+            let mailbox1 = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_MAILBOX1))?;
+            let cpuctl = self
+                .mmio
+                .read_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL))?;
+            last_state =
+                classify_gsp_fmc_state(hwcfg2, mailbox0, mailbox1, fmc_args_address, cpuctl);
+            match last_state {
+                NvidiaGspFmcPollState::BootFailed { mailbox0, mailbox1 } => {
+                    return Err(NvidiaError::GspFmcBootFailed { mailbox0, mailbox1 });
+                }
+                NvidiaGspFmcPollState::Ready(ready) => return Ok(ready),
+                NvidiaGspFmcPollState::TargetMaskLocked
+                | NvidiaGspFmcPollState::WaitingForBootParams
+                | NvidiaGspFmcPollState::RiscvLockdown
+                | NvidiaGspFmcPollState::RiscvInactive => core::hint::spin_loop(),
+            }
+        }
+        match last_state {
+            NvidiaGspFmcPollState::RiscvInactive => Err(NvidiaError::GspRiscvInactiveTimeout),
+            NvidiaGspFmcPollState::BootFailed { mailbox0, mailbox1 } => {
+                Err(NvidiaError::GspFmcBootFailed { mailbox0, mailbox1 })
+            }
+            NvidiaGspFmcPollState::TargetMaskLocked
+            | NvidiaGspFmcPollState::WaitingForBootParams
+            | NvidiaGspFmcPollState::RiscvLockdown
+            | NvidiaGspFmcPollState::Ready(_) => Err(NvidiaError::GspFmcBootTimeout),
+        }
     }
 
     pub fn send(&self, packet: &[u8]) -> Result<(), NvidiaError> {
@@ -604,13 +735,15 @@ impl NvidiaFspTransport {
 pub fn boot_external_gsp(
     probe: &NvidiaProbe,
     staging: &NvidiaGspStaging,
-) -> Result<rustos_gpu_protocol::GspFspResponse, NvidiaError> {
+) -> Result<NvidiaGspBootResult, NvidiaError> {
     let transport = probe.fsp_transport().ok_or(NvidiaError::FspUnavailable)?;
     transport.wait_secure_boot()?;
-    transport.send_sync(
+    let fsp_response = transport.send_sync(
         rustos_gpu_protocol::NVIDIA_GSP_FSP_NVDM_TYPE_COT,
         &staging.fsp_cot,
-    )
+    )?;
+    let gsp = transport.wait_gsp_fmc_ready(staging.plan.fmc_args.address)?;
+    Ok(NvidiaGspBootResult { fsp_response, gsp })
 }
 
 #[allow(dead_code)]
@@ -756,6 +889,10 @@ mod tests {
     use super::*;
     use crate::pci::PciCapabilities;
 
+    fn put_u32(bytes: &mut [u8], offset: u32, value: u32) {
+        bytes[offset as usize..offset as usize + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn device(device_id: u16, bars: [PciBar; 6]) -> PciDevice {
         PciDevice {
             address: PciAddress::new(0x0b, 0, 0),
@@ -891,6 +1028,111 @@ mod tests {
         assert_eq!(
             transport.wait_secure_boot(),
             Ok(rustos_gpu_protocol::NVIDIA_GSP_FSP_BOOT_COMPLETE_STATUS_SUCCESS)
+        );
+    }
+
+    #[test]
+    fn classifies_the_gb20x_post_cot_state_machine() {
+        let fmc_args_address = 0x0000_0001_2345_6000;
+        let locked = rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_TARGET_MASK_LOCKED;
+        assert_eq!(
+            classify_gsp_fmc_state(locked, 0, 0, fmc_args_address, 0),
+            NvidiaGspFmcPollState::TargetMaskLocked
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(
+                0,
+                fmc_args_address as u32,
+                (fmc_args_address >> 32) as u32,
+                fmc_args_address,
+                0,
+            ),
+            NvidiaGspFmcPollState::WaitingForBootParams
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(0, 0x1234, 0, fmc_args_address, 0),
+            NvidiaGspFmcPollState::BootFailed {
+                mailbox0: 0x1234,
+                mailbox1: 0,
+            }
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(
+                1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2_RISCV_BRANCH_PRIVILEGE_LOCKDOWN_BIT,
+                0,
+                0,
+                fmc_args_address,
+                1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL_RISCV_ACTIVE_BIT,
+            ),
+            NvidiaGspFmcPollState::RiscvLockdown
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(0, 0, 0, fmc_args_address, 0),
+            NvidiaGspFmcPollState::RiscvInactive
+        );
+        assert_eq!(
+            classify_gsp_fmc_state(
+                0,
+                0,
+                0,
+                fmc_args_address,
+                1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL_RISCV_ACTIVE_BIT,
+            ),
+            NvidiaGspFmcPollState::Ready(NvidiaGspReady {
+                hwcfg2: 0,
+                mailbox0: 0,
+                mailbox1: 0,
+                riscv_active: true,
+                riscv_lockdown: false,
+            })
+        );
+    }
+
+    #[test]
+    fn waits_for_gb20x_gsp_fmc_release_and_riscv_activity() {
+        let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
+        put_u32(
+            &mut mmio_bytes,
+            rustos_gpu_protocol::NVIDIA_GSP_FALCON_HWCFG2,
+            0,
+        );
+        put_u32(
+            &mut mmio_bytes,
+            rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL,
+            1 << rustos_gpu_protocol::NVIDIA_GSP_FALCON_CPUCTL_RISCV_ACTIVE_BIT,
+        );
+        let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
+        let transport = NvidiaFspTransport::new(mmio);
+
+        assert_eq!(
+            transport.wait_gsp_fmc_ready(0x0000_0001_2345_6000),
+            Ok(NvidiaGspReady {
+                hwcfg2: 0,
+                mailbox0: 0,
+                mailbox1: 0,
+                riscv_active: true,
+                riscv_lockdown: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_gb20x_gsp_fmc_error_mailbox() {
+        let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
+        put_u32(
+            &mut mmio_bytes,
+            rustos_gpu_protocol::NVIDIA_GSP_FALCON_MAILBOX0,
+            0x1234,
+        );
+        let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
+        let transport = NvidiaFspTransport::new(mmio);
+
+        assert_eq!(
+            transport.wait_gsp_fmc_ready(0x0000_0001_2345_6000),
+            Err(NvidiaError::GspFmcBootFailed {
+                mailbox0: 0x1234,
+                mailbox1: 0,
+            })
         );
     }
 

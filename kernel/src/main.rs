@@ -758,7 +758,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(Some(probe)) => {
             hardware::set_nvidia(probe);
             kprintln!(
-                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_transport={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} gsp=external-firmware-riscv64 rpc_page={} rpc_max_pages={} shared_bytes={} shared_ptes={} queue_entries={} acceleration=unavailable status=probe-ready",
+                "driver: nvidia probe {:02x}:{:02x}.{} device=0x{:04x} revision=0x{:02x} architecture={} bar0=0x{:x} bar1={:?} bar3={:?} bar5_io={:?} mmio=0x{:x}+0x{:x} memory_space={} busmaster={} msi={} msix={} fsp_transport={} fsp_secure_boot=0x{:08x} fsp_queue={}/{} fsp_msgq={}/{} fsp_mailbox=0x{:08x}:0x{:08x} fsp_riscv_lockdown={} gsp_hwcfg2=0x{:08x} gsp_mailbox=0x{:08x}:0x{:08x} gsp_riscv_active={} gsp_riscv_lockdown={} gsp=external-firmware-riscv64 rpc_page={} rpc_max_pages={} shared_bytes={} shared_ptes={} queue_entries={} acceleration=unavailable status=probe-ready",
                 probe.address.bus,
                 probe.address.device,
                 probe.address.function,
@@ -788,6 +788,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 probe.fsp.mailbox0,
                 probe.fsp.mailbox1,
                 probe.fsp.riscv_lockdown,
+                probe.fsp.gsp_hwcfg2,
+                probe.fsp.gsp_mailbox0,
+                probe.fsp.gsp_mailbox1,
+                probe.fsp.gsp_riscv_active,
+                probe.fsp.gsp_riscv_lockdown,
                 nvidia::GSP_RPC_PAGE_SIZE,
                 nvidia::GSP_RPC_MAX_MESSAGE_PAGES,
                 nvidia::GSP_SHARED_MEMORY_BYTES,
@@ -1383,14 +1388,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let fsp_status = if staging.fsp_boot_requested {
                     match nvidia_probe.as_ref() {
                         Some(probe) => match nvidia::boot_external_gsp(probe, &staging) {
-                            Ok(response) => {
+                            Ok(boot) => {
                                 kprintln!(
                                     "driver: nvidia FSP COT response task_id=0x{:08x} command=0x{:08x} error=0x{:08x} status=accepted",
-                                    response.task_id,
-                                    response.command_nvdm_type,
-                                    response.error_code,
+                                    boot.fsp_response.task_id,
+                                    boot.fsp_response.command_nvdm_type,
+                                    boot.fsp_response.error_code,
                                 );
-                                "cot-accepted"
+                                kprintln!(
+                                    "driver: nvidia GSP-FMC ready hwcfg2=0x{:08x} mailbox=0x{:08x}:0x{:08x} riscv_active={} riscv_lockdown={} status=ready",
+                                    boot.gsp.hwcfg2,
+                                    boot.gsp.mailbox0,
+                                    boot.gsp.mailbox1,
+                                    boot.gsp.riscv_active,
+                                    boot.gsp.riscv_lockdown,
+                                );
+                                "gsp-ready"
                             }
                             Err(error) => {
                                 kprintln!(
