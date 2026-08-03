@@ -2335,6 +2335,7 @@ fn spawn_shell_proof(path: PathBuf, screenshot: PathBuf, serial: PathBuf) -> Joi
                 "cat /etc/rustos/config.txt",
                 "shell: relative read path=/etc/rustos/config.txt status=ready",
             ),
+            ("hw", "shell: hw status=ready"),
             (
                 "write /etc/rustos/config.txt denied",
                 "shell: permission denied path=/etc/rustos/config.txt status=ready",
@@ -3746,6 +3747,7 @@ fn verify_shell_proof(serial: &Path, screenshot: &Path) -> Result<(), String> {
         "shell: rmdir path=/home/user/work/nonempty status=ready",
         "shell: open-file lifecycle status=ready",
         "shell: ls path=/home/user/work status=ready",
+        "shell: hw status=ready",
         "shell: ps status=ready",
         "shell: relative read path=/etc/rustos/config.txt status=ready",
         "shell: permission denied path=/etc/rustos/config.txt status=ready",

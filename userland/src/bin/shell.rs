@@ -2,11 +2,11 @@
 #![no_main]
 
 use rustos_userland::{
-    CREDENTIALS_LENGTH, Credentials, NET_MAX_BUFFER_LENGTH, NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE,
-    OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY, PathInfo, SEEK_END, SEEK_SET,
-    SPAWN_INHERIT_FD,
+    CREDENTIALS_LENGTH, Credentials, HARDWARE_INFO_MAX_LENGTH, NET_MAX_BUFFER_LENGTH,
+    NET_RECEIVE_HEADER_LENGTH, OPEN_CREATE, OPEN_WRITE, PATH_INFO_LENGTH, PATH_KIND_DIRECTORY,
+    PathInfo, SEEK_END, SEEK_SET, SPAWN_INHERIT_FD,
     accounts::{ACCOUNT_DATABASE_LENGTH, ACCOUNT_STORE_PATH, AccountStore, parse, password_digest},
-    close, exit, get_credentials, is_permission_error, is_syscall_error, list_files,
+    close, exit, get_credentials, hardware_info, is_permission_error, is_syscall_error, list_files,
     list_processes, mkdir, net_info, net_interfaces, net_receive, net_renew, net_send, open,
     open_with_flags, open_write,
     path::{MAX_PATH_LENGTH, PathBuf, resolve},
@@ -145,7 +145,7 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         write_prompt(recovery_mode, state);
     } else if line == b"help" {
         write_stdout(
-            b"commands: help id whoami pwd cd [path] ls [path] ps run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir rmdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv open-proof grow poweroff reboot suspend exit\n",
+            b"commands: help id whoami pwd cd [path] ls [path] ps hw run <path> vm passwd useradd sudo useradd lock pipe net [interfaces|renew|probe] mkdir rmdir pkg [install|update|rollback|sync|recover] sudo pkg [install|update|rollback|sync|recover] state [set] sudo state set uname echo cat touch write append truncate rm mv open-proof grow poweroff reboot suspend exit\n",
         );
         write_prompt(recovery_mode, state);
     } else if line == b"ls" {
@@ -158,6 +158,9 @@ fn execute_line(line: &[u8], recovery_mode: bool, state: &mut ShellState) {
         if list_process_table() {
             write_stdout(b"shell: ps status=ready\n");
         }
+        write_prompt(recovery_mode, state);
+    } else if line == b"hw" {
+        show_hardware();
         write_prompt(recovery_mode, state);
     } else if line == b"id" {
         show_identity();
@@ -691,6 +694,17 @@ fn list_process_table() -> bool {
     }
     write_stdout(&buffer[..count as usize]);
     true
+}
+
+fn show_hardware() {
+    let mut buffer = [0u8; HARDWARE_INFO_MAX_LENGTH];
+    let count = hardware_info(&mut buffer);
+    if is_syscall_error(count) || count > buffer.len() as u64 {
+        write_stdout(b"hw: snapshot unavailable\n");
+        return;
+    }
+    write_stdout(&buffer[..count as usize]);
+    write_stdout(b"shell: hw status=ready\n");
 }
 
 fn show_identity() {

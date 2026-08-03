@@ -22,6 +22,8 @@ mod e1000;
 #[cfg(any(target_os = "none", test))]
 mod framebuffer;
 #[cfg(any(target_os = "none", test))]
+mod hardware;
+#[cfg(any(target_os = "none", test))]
 mod hda;
 #[cfg(target_os = "none")]
 mod heap;
@@ -583,6 +585,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             device.bars[0]
         );
     }
+    hardware::init(&pci_inventory, framebuffer::info());
+    let pci_roles = pci_inventory.role_counts();
+    kprintln!(
+        "hardware: pci storage={} network={} display={} audio={} usb={} host_bridges={} bridges={} other={} status=ready",
+        pci_roles.mass_storage,
+        pci_roles.network,
+        pci_roles.display,
+        pci_roles.audio,
+        pci_roles.usb,
+        pci_roles.host_bridges,
+        pci_roles.bridges,
+        pci_roles.other
+    );
+    if let Some(display) = pci_inventory.first_display() {
+        kprintln!(
+            "hardware: display {:02x}:{:02x}.{} vendor={} vendor_id=0x{:04x} device_id=0x{:04x} status=present",
+            display.address.bus,
+            display.address.device,
+            display.address.function,
+            display.vendor_name(),
+            display.vendor_id,
+            display.device_id
+        );
+    }
 
     if apic_active {
         // NVMe completion interrupts are needed while the boot filesystem is still being
@@ -1039,6 +1065,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::update_frame_allocator(gpu_dma_next_frame_address);
     if let Some(runtime) = virtio_gpu_runtime {
         if runtime.is_ready() {
+            hardware::set_graphics_backend(hardware::GraphicsBackend::VirtioGpu);
             kprintln!(
                 "driver: virtio-gpu {:02x}:{:02x}.{} mmio=0x{:x} common_len=0x{:x} device_len=0x{:x} notify_multiplier={} features=0x{:x} queue={} scanouts={} bus_master={} status=ready",
                 runtime.address.bus,
@@ -1073,6 +1100,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             );
         }
     }
+    let graphics_backend = hardware::snapshot().graphics_backend;
+    kprintln!(
+        "graphics: backend={} compositor={} acceleration={} status={}",
+        graphics_backend.name(),
+        graphics_backend.compositor(),
+        graphics_backend.acceleration(),
+        graphics_backend.status()
+    );
 
     let mut e1000_interrupt_ready = false;
     if apic_active {

@@ -288,6 +288,48 @@ impl PciDevice {
             .flatten()
             .filter(|capability| capability.cfg_type == cfg_type)
     }
+
+    pub fn vendor_name(self) -> &'static str {
+        match self.vendor_id {
+            0x1002 => "amd",
+            0x10de => "nvidia",
+            0x8086 => "intel",
+            0x1af4 => "virtio",
+            0x1234 => "qemu",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PciRoleCounts {
+    pub total: u16,
+    pub host_bridges: u16,
+    pub bridges: u16,
+    pub mass_storage: u16,
+    pub network: u16,
+    pub display: u16,
+    pub audio: u16,
+    pub usb: u16,
+    pub other: u16,
+}
+
+impl PciRoleCounts {
+    fn add(&mut self, device: PciDevice) {
+        self.total = self.total.saturating_add(1);
+        match device.driver_kind() {
+            DriverKind::HostBridge => self.host_bridges = self.host_bridges.saturating_add(1),
+            DriverKind::PciBridge => self.bridges = self.bridges.saturating_add(1),
+            DriverKind::MassStorage => self.mass_storage = self.mass_storage.saturating_add(1),
+            DriverKind::Network => self.network = self.network.saturating_add(1),
+            DriverKind::Display => self.display = self.display.saturating_add(1),
+            DriverKind::Audio => self.audio = self.audio.saturating_add(1),
+            DriverKind::Usb => self.usb = self.usb.saturating_add(1),
+            DriverKind::IsaBridge | DriverKind::Generic => {
+                self.other = self.other.saturating_add(1)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -817,6 +859,21 @@ impl PciInventory {
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty()
     }
+
+    pub fn role_counts(&self) -> PciRoleCounts {
+        let mut counts = PciRoleCounts::default();
+        for device in &self.devices {
+            counts.add(*device);
+        }
+        counts
+    }
+
+    pub fn first_display(&self) -> Option<PciDevice> {
+        self.devices
+            .iter()
+            .copied()
+            .find(|device| device.driver_kind() == DriverKind::Display)
+    }
 }
 
 struct LegacyConfigAccess {
@@ -1114,7 +1171,12 @@ fn read_bars(config: &mut LegacyConfigAccess, address: PciAddress, header_type: 
 
 #[cfg(test)]
 mod tests {
-    use super::{PciCapabilities, PciResourceError, msi_message, parse_capabilities};
+    use alloc::vec;
+
+    use super::{
+        PciAddress, PciBar, PciCapabilities, PciDevice, PciInventory, PciResourceError,
+        msi_message, parse_capabilities,
+    };
 
     #[test]
     fn parses_msi_and_msix_capabilities() {
@@ -1197,5 +1259,53 @@ mod tests {
             msi_message(50, 256),
             Err(PciResourceError::MsiDestinationOutOfRange { destination: 256 })
         );
+    }
+
+    #[test]
+    fn role_counts_and_display_selection_are_deterministic() {
+        let device = |bus, vendor_id, class_code, subclass| PciDevice {
+            address: PciAddress::new(bus, 0, 0),
+            vendor_id,
+            device_id: 1,
+            revision_id: 0,
+            prog_if: 0,
+            command: 0,
+            status: 0,
+            subclass,
+            class_code,
+            header_type: 0,
+            interrupt_line: 0,
+            interrupt_pin: 0,
+            bars: [PciBar::Unassigned; 6],
+            capabilities: PciCapabilities::empty(),
+        };
+        let inventory = PciInventory {
+            scanned_buses: 256,
+            devices: vec![
+                device(0, 0x1022, 0x06, 0x00),
+                device(1, 0x10de, 0x03, 0x00),
+                device(2, 0x8086, 0x02, 0x00),
+                device(3, 0x144d, 0x01, 0x08),
+                device(4, 0x8086, 0x0c, 0x03),
+            ],
+        };
+
+        assert_eq!(
+            inventory.role_counts(),
+            super::PciRoleCounts {
+                total: 5,
+                host_bridges: 1,
+                bridges: 0,
+                mass_storage: 1,
+                network: 1,
+                display: 1,
+                audio: 0,
+                usb: 1,
+                other: 0,
+            }
+        );
+        let display = inventory.first_display().expect("display device");
+        assert_eq!(display.address.bus, 1);
+        assert_eq!(display.vendor_name(), "nvidia");
     }
 }

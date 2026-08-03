@@ -65,6 +65,7 @@ pub const SYS_TRUNCATE: u64 = 57;
 pub const SYS_UNLINK: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
 pub const SYS_RMDIR: u64 = 60;
+pub const SYS_HW_INFO: u64 = 61;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_CREATE: u64 = 2;
 pub const SEEK_SET: u64 = 0;
@@ -78,6 +79,7 @@ pub const NET_MAX_BUFFER_LENGTH: usize = NET_RECEIVE_HEADER_LENGTH + NET_MAX_PAY
 pub const NET_INFO_MAX_LENGTH: usize = 320;
 pub const NET_INTERFACES_MAX_LENGTH: usize = 1024;
 pub const NET_RENEW_MAX_LENGTH: usize = 1024;
+pub const HARDWARE_INFO_MAX_LENGTH: usize = 1024;
 pub const GRAPHICS_INFO_LENGTH: usize = 16;
 pub const GRAPHICS_RECT_LENGTH: usize = 20;
 pub const GRAPHICS_TEXT_REQUEST_LENGTH: usize = 32;
@@ -453,6 +455,17 @@ pub fn net_interfaces(buffer: &mut [u8]) -> u64 {
 pub fn net_renew(buffer: &mut [u8]) -> u64 {
     syscall(
         SYS_NET_RENEW,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+        0,
+    )
+    .rax
+}
+
+#[inline]
+pub fn hardware_info(buffer: &mut [u8]) -> u64 {
+    syscall(
+        SYS_HW_INFO,
         buffer.as_mut_ptr() as u64,
         buffer.len() as u64,
         0,

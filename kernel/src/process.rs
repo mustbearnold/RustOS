@@ -86,6 +86,7 @@ pub const SYS_TRUNCATE: u64 = 57;
 pub const SYS_UNLINK: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
 pub const SYS_RMDIR: u64 = 60;
+pub const SYS_HW_INFO: u64 = 61;
 const PATH_INFO_LENGTH: usize = 16;
 const CREDENTIALS_LENGTH: usize = 16;
 const PATH_KIND_FILE: u64 = 1;
@@ -230,6 +231,7 @@ pub enum SyscallAction {
     Unlink,
     Rename,
     Rmdir,
+    HardwareInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +289,8 @@ pub struct ProcessExit {
 /// `(rdi, rsi)`; `SYS_NET_INTERFACES` writes the bounded network-manager interface and route table
 /// to `(rdi, rsi)`; and `SYS_NET_RENEW` renews every DHCP lease through the network manager and
 /// writes its bounded result report to `(rdi, rsi)`.
+/// `SYS_HW_INFO` writes the bounded PCI, framebuffer, display, and graphics-backend capability
+/// snapshot to `(rdi, rsi)`.
 /// `SYS_GFX_INFO` writes the current framebuffer geometry to `(rdi, rsi)`; `SYS_GFX_ACQUIRE`
 /// reserves the framebuffer for the calling process; `SYS_GFX_FILL_RECT` reads one bounded
 /// color rectangle from `(rdi, rsi)`; `SYS_GFX_TEXT` reads a bounded text request from `(rdi, rsi)`
@@ -379,6 +383,7 @@ pub fn dispatch_syscall(pid: ProcessId, frame: &mut SyscallFrame) -> SyscallActi
         SYS_POWEROFF => SyscallAction::Poweroff,
         SYS_REBOOT => SyscallAction::Reboot,
         SYS_SUSPEND => SyscallAction::Suspend,
+        SYS_HW_INFO => SyscallAction::HardwareInfo,
         SYS_PIPE => SyscallAction::Pipe,
         SYS_READ_NONBLOCK => SyscallAction::ReadNonblocking,
         SYS_GFX_WINDOW_FOCUS => SyscallAction::GfxWindowFocus,
@@ -2415,6 +2420,7 @@ impl Thread {
             | SyscallAction::Poweroff
             | SyscallAction::Reboot
             | SyscallAction::Suspend
+            | SyscallAction::HardwareInfo
             | SyscallAction::Pipe => {}
         }
     }
@@ -3080,6 +3086,7 @@ impl Process {
             SyscallAction::Poweroff => {}
             SyscallAction::Reboot => {}
             SyscallAction::Suspend => {}
+            SyscallAction::HardwareInfo => {}
             SyscallAction::Pipe => {}
         }
     }
@@ -5682,6 +5689,16 @@ fn list_files_for_syscall(frame: &mut SyscallFrame) {
 }
 
 #[cfg(target_os = "none")]
+fn hardware_info_for_syscall(frame: &mut SyscallFrame) {
+    let mut snapshot = SnapshotBuffer::new();
+    if crate::hardware::write_text(&mut snapshot).is_err() {
+        frame.rax = SYSCALL_EINVAL;
+        return;
+    }
+    copy_snapshot_to_user(frame, &snapshot);
+}
+
+#[cfg(target_os = "none")]
 fn close_for_syscall(frame: &mut SyscallFrame) {
     let pid = ProcessId::try_from(CURRENT_PROCESS_ID.load(Ordering::Acquire)).unwrap_or(0);
     let Some(pointer) = process_pointer(pid) else {
@@ -6362,6 +6379,10 @@ fn dispatch_user_syscall(frame: &mut SyscallFrame) -> SyscallAction {
             network_renew_for_syscall(frame);
             SyscallAction::Return
         }
+        SyscallAction::HardwareInfo => {
+            hardware_info_for_syscall(frame);
+            SyscallAction::Return
+        }
         SyscallAction::GfxInfo => {
             graphics_info_for_syscall(frame);
             SyscallAction::Return
@@ -6583,6 +6604,9 @@ pub extern "C" fn rustos_user_syscall_dispatch(frame: *mut SyscallFrame) -> u64 
         }
         SyscallAction::NetRenew => {
             unreachable!("network-renew syscall must be resolved before returning")
+        }
+        SyscallAction::HardwareInfo => {
+            unreachable!("hardware-info syscall must be resolved before returning")
         }
         SyscallAction::GfxInfo => {
             unreachable!("graphics-info syscall must be resolved before returning")
@@ -7413,7 +7437,7 @@ mod tests {
 
     #[test]
     fn syscall_abi_marks_diagnostic_snapshots_for_kernel_resolution() {
-        for syscall in [SYS_LIST_PROCESSES, SYS_LIST_FILES] {
+        for syscall in [SYS_LIST_PROCESSES, SYS_LIST_FILES, SYS_HW_INFO] {
             let mut frame = SyscallFrame {
                 rax: syscall,
                 rdi: USER_IMAGE_BASE,
@@ -7426,6 +7450,7 @@ mod tests {
                 match syscall {
                     SYS_LIST_PROCESSES => SyscallAction::ListProcesses,
                     SYS_LIST_FILES => SyscallAction::ListFiles,
+                    SYS_HW_INFO => SyscallAction::HardwareInfo,
                     _ => unreachable!(),
                 }
             );
