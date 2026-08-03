@@ -58,7 +58,11 @@ const USERLAND_BINARIES: [&str; 19] = [
     "window",
     "window-secondary",
 ];
-const PARTITIONED_ROOT_SIZE: u64 = 64 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_PARTITIONED_ROOT_MIB: u64 = 64;
+const MIN_PARTITIONED_ROOT_MIB: u64 = 64;
+const MAX_PARTITIONED_ROOT_MIB: u64 = 131_072;
+const PARTITIONED_ROOT_SIZE: u64 = DEFAULT_PARTITIONED_ROOT_MIB * MIB;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImageMode {
@@ -77,7 +81,10 @@ fn main() {
 
 fn execute(arguments: Vec<String>) -> Result<(), String> {
     match arguments.first().map(String::as_str) {
-        Some("build") => build(arguments.iter().any(|argument| argument == "--release")),
+        Some("build") => build(
+            arguments.iter().any(|argument| argument == "--release"),
+            partitioned_root_size(&arguments)?,
+        ),
         Some("check") => check(),
         Some("run") => {
             let firmware = arguments.get(1).map(String::as_str).ok_or_else(usage)?;
@@ -451,7 +458,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             }
             let image = argument_value(&arguments, "--image")?;
             if image.is_none() {
-                build(release)?;
+                build(release, partitioned_root_size(&arguments)?)?;
             }
             run(
                 firmware,
@@ -504,7 +511,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             if partitioned && firmware != "uefi" {
                 return Err("--partitioned currently requires the uefi firmware path".to_owned());
             }
-            build(release)?;
+            build(release, partitioned_root_size(&arguments)?)?;
             let source = target_dir(&workspace_root())
                 .join("images")
                 .join(if partitioned {
@@ -526,7 +533,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
     }
 }
 
-fn build(release: bool) -> Result<(), String> {
+fn build(release: bool, partitioned_root_size: u64) -> Result<(), String> {
     let root = workspace_root();
     let userland = build_userland(&root, release)?;
     let mut command = Command::new(cargo_binary());
@@ -684,7 +691,13 @@ fn build(release: bool) -> Result<(), String> {
         .create_uefi_image(&uefi)
         .map_err(|error| format!("creating UEFI image {}: {error:#}", uefi.display()))?;
     let uefi_partitioned = images.join(partitioned_image_name("uefi", release, ImageMode::Default));
-    create_partitioned_uefi_image(&kernel, &initramfs, &repository, &uefi_partitioned)?;
+    create_partitioned_uefi_image(
+        &kernel,
+        &initramfs,
+        &repository,
+        &uefi_partitioned,
+        partitioned_root_size,
+    )?;
 
     let bios_shell = images.join(image_name("bios", release, ImageMode::Shell));
     let mut bios_shell_builder = DiskImageBuilder::new(kernel.clone());
@@ -720,6 +733,7 @@ fn build(release: bool) -> Result<(), String> {
         &shell_initramfs,
         &repository,
         &uefi_shell_partitioned,
+        partitioned_root_size,
     )?;
 
     let bios_desktop = images.join(image_name("bios", release, ImageMode::Desktop));
@@ -758,6 +772,7 @@ fn build(release: bool) -> Result<(), String> {
         &desktop_initramfs,
         &repository,
         &uefi_desktop_partitioned,
+        partitioned_root_size,
     )?;
 
     let bios_recovery = images.join(image_name("bios", release, ImageMode::Recovery));
@@ -796,6 +811,7 @@ fn build(release: bool) -> Result<(), String> {
         &recovery_initramfs,
         &repository,
         &uefi_recovery_partitioned,
+        partitioned_root_size,
     )?;
 
     println!("kernel: {}", kernel.display());
@@ -828,7 +844,9 @@ fn create_partitioned_uefi_image(
     initramfs: &[u8],
     repository: &[u8],
     output: &Path,
+    root_size: u64,
 ) -> Result<(), String> {
+    validate_partitioned_root_size(root_size)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -854,6 +872,7 @@ fn create_partitioned_uefi_image(
             .map_err(|error| format!("reading kernel for {}: {error}", output.display()))?;
         create_fat32_root_partition(
             &root_path,
+            root_size,
             &[
                 ("kernel-x86_64", kernel_image.as_slice()),
                 ("initrd.cpi", initramfs),
@@ -868,7 +887,11 @@ fn create_partitioned_uefi_image(
     result
 }
 
-fn create_fat32_root_partition(path: &Path, files: &[(&str, &[u8])]) -> Result<(), String> {
+fn create_fat32_root_partition(
+    path: &Path,
+    root_size: u64,
+    files: &[(&str, &[u8])],
+) -> Result<(), String> {
     let disk = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -876,7 +899,7 @@ fn create_fat32_root_partition(path: &Path, files: &[(&str, &[u8])]) -> Result<(
         .write(true)
         .open(path)
         .map_err(|error| format!("creating FAT32 root partition {}: {error}", path.display()))?;
-    disk.set_len(PARTITIONED_ROOT_SIZE)
+    disk.set_len(root_size)
         .map_err(|error| format!("sizing FAT32 root partition {}: {error}", path.display()))?;
     fatfs::format_volume(
         &disk,
@@ -5673,6 +5696,46 @@ fn argument_value(arguments: &[String], name: &str) -> Result<Option<PathBuf>, S
     Ok(Some(PathBuf::from(value)))
 }
 
+fn partitioned_root_size(arguments: &[String]) -> Result<u64, String> {
+    let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--root-mib")
+    else {
+        return Ok(PARTITIONED_ROOT_SIZE);
+    };
+    let value = arguments
+        .get(index + 1)
+        .ok_or_else(|| "--root-mib requires a size in MiB".to_owned())?;
+    if value.starts_with('-') {
+        return Err("--root-mib requires a size in MiB".to_owned());
+    }
+    let mib = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --root-mib value `{value}`"))?;
+    if !(MIN_PARTITIONED_ROOT_MIB..=MAX_PARTITIONED_ROOT_MIB).contains(&mib) {
+        return Err(format!(
+            "--root-mib must be between {MIN_PARTITIONED_ROOT_MIB} and {MAX_PARTITIONED_ROOT_MIB} MiB"
+        ));
+    }
+    mib.checked_mul(MIB)
+        .ok_or_else(|| "--root-mib size overflowed".to_owned())
+}
+
+fn validate_partitioned_root_size(root_size: u64) -> Result<(), String> {
+    if root_size % MIB != 0 {
+        return Err(format!(
+            "partitioned root size must be aligned to 1 MiB: {root_size} bytes"
+        ));
+    }
+    let mib = root_size / MIB;
+    if !(MIN_PARTITIONED_ROOT_MIB..=MAX_PARTITIONED_ROOT_MIB).contains(&mib) {
+        return Err(format!(
+            "partitioned root size must be between {MIN_PARTITIONED_ROOT_MIB} and {MAX_PARTITIONED_ROOT_MIB} MiB"
+        ));
+    }
+    Ok(())
+}
+
 fn cargo_binary() -> PathBuf {
     env::var_os("CARGO")
         .map(PathBuf::from)
@@ -5707,6 +5770,9 @@ fn print_usage() {
     );
     println!("  --virtio-gpu-proof require a virtio-gpu scanout and desktop frame proof");
     println!("  --partitioned      use a GPT EFI + FAT32 RustOS root image (UEFI only)");
+    println!(
+        "  --root-mib N       size the partitioned FAT32 RustOS root (64-131072 MiB; default: 64)"
+    );
     println!("  --msi              use Q35 + e1000e to exercise PCI MSI delivery");
     println!("  --ahci             use Q35 SATA/AHCI storage instead of legacy IDE");
     println!("  --nvme             use Q35 PCI NVMe storage instead of legacy IDE");
@@ -5819,10 +5885,12 @@ fn smp_count(arguments: &[String]) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPOSITORY_ROTATED_KEY_ID, REPOSITORY_ROTATED_SIGNING_KEY_BYTES,
-        REPOSITORY_ROTATION_MATERIAL_LENGTH, REPOSITORY_SIGNATURE_LENGTH, ahci_interrupt_count,
-        build_repository, create_partitioned_uefi_image, install_image, install_partitioned_image,
-        key_rotation_message, nvme_interrupt_count, virtio_interrupt_count, wav_data,
+        MIB, PARTITIONED_ROOT_SIZE, REPOSITORY_ROTATED_KEY_ID,
+        REPOSITORY_ROTATED_SIGNING_KEY_BYTES, REPOSITORY_ROTATION_MATERIAL_LENGTH,
+        REPOSITORY_SIGNATURE_LENGTH, ahci_interrupt_count, build_repository,
+        create_partitioned_uefi_image, install_image, install_partitioned_image,
+        key_rotation_message, nvme_interrupt_count, partitioned_root_size,
+        validate_partitioned_root_size, virtio_interrupt_count, wav_data,
     };
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::{
@@ -6006,6 +6074,37 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_root_size_is_bounded_and_mib_aligned() {
+        assert_eq!(
+            partitioned_root_size(&[
+                "build".to_owned(),
+                "--root-mib".to_owned(),
+                "256".to_owned()
+            ])
+            .unwrap(),
+            256 * MIB
+        );
+        assert_eq!(
+            partitioned_root_size(&["build".to_owned()]).unwrap(),
+            PARTITIONED_ROOT_SIZE
+        );
+        assert!(
+            partitioned_root_size(&["build".to_owned(), "--root-mib".to_owned(), "63".to_owned()])
+                .is_err()
+        );
+        assert!(
+            partitioned_root_size(&[
+                "build".to_owned(),
+                "--root-mib".to_owned(),
+                "not-a-size".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(validate_partitioned_root_size(256 * MIB).is_ok());
+        assert!(validate_partitioned_root_size(256 * MIB + 512).is_err());
+    }
+
+    #[test]
     fn partitioned_uefi_image_contains_efi_and_rustos_root_partitions() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6021,7 +6120,14 @@ mod tests {
         ));
         fs::write(&kernel, b"RustOS test kernel").unwrap();
 
-        create_partitioned_uefi_image(&kernel, b"initrd", b"repository", &image).unwrap();
+        create_partitioned_uefi_image(
+            &kernel,
+            b"initrd",
+            b"repository",
+            &image,
+            PARTITIONED_ROOT_SIZE,
+        )
+        .unwrap();
         let table = gpt::GptConfig::new()
             .writable(false)
             .initialized(true)
@@ -6065,7 +6171,14 @@ mod tests {
             std::process::id()
         ));
         fs::write(&kernel, b"RustOS test kernel").unwrap();
-        create_partitioned_uefi_image(&kernel, b"initrd", b"repository", &source).unwrap();
+        create_partitioned_uefi_image(
+            &kernel,
+            b"initrd",
+            b"repository",
+            &source,
+            PARTITIONED_ROOT_SIZE,
+        )
+        .unwrap();
         let target_file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
