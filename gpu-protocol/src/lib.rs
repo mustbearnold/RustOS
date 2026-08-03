@@ -1729,6 +1729,9 @@ impl<'a> GspQueue<'a> {
             }
             .into());
         }
+        // Publish page reclamation only after CPU finished copying and validating the message.
+        // The GSP may reuse those pages as soon as it observes the RX read pointer.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         let next = queue_advance(read, pages)?;
         write_le_u32(self.bytes, NVIDIA_GSP_QUEUE_RX_READ_POINTER_OFFSET, next);
         Ok(Some(message))

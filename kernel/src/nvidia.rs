@@ -845,10 +845,14 @@ impl NvidiaFspTransport {
             });
         }
         self.read_emem(&mut buffer[..packet_size])?;
-        self.mmio
-            .write_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL), 0)?;
-        self.mmio
-            .write_u32(u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD), 0)?;
+        self.mmio.write_u32(
+            u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL),
+            head,
+        )?;
+        self.mmio.write_u32(
+            u64::from(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD),
+            head,
+        )?;
         Ok(Some(packet_size))
     }
 
@@ -1558,5 +1562,34 @@ mod tests {
             read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_EMEM_PIO_DATA),
             u32::from_le_bytes(packet[864..868].try_into().expect("last word"))
         );
+    }
+
+    #[test]
+    fn consumes_fsp_response_without_resetting_nonzero_message_queue_head() {
+        let mut mmio_bytes = vec![0u8; NVIDIA_PROBE_MMIO_LENGTH as usize];
+        put_u32(
+            &mut mmio_bytes,
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD,
+            16,
+        );
+        put_u32(
+            &mut mmio_bytes,
+            rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL,
+            32,
+        );
+        let mmio = MmioRegion::for_test(mmio_bytes.as_mut_ptr() as u64, NVIDIA_PROBE_MMIO_LENGTH);
+        let transport = NvidiaFspTransport::new(mmio);
+        let mut response = [0u8; 20];
+
+        assert_eq!(transport.try_receive(&mut response), Ok(Some(20)));
+        let read_u32 = |offset: u32| {
+            u32::from_le_bytes(
+                mmio_bytes[offset as usize..offset as usize + 4]
+                    .try_into()
+                    .expect("u32"),
+            )
+        };
+        assert_eq!(read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_HEAD), 16);
+        assert_eq!(read_u32(rustos_gpu_protocol::NVIDIA_GSP_FSP_MSGQ_TAIL), 16);
     }
 }
