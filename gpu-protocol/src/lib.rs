@@ -1408,7 +1408,7 @@ impl<'a> GspRpcMessage<'a> {
     }
 
     pub fn checksum_valid(self) -> bool {
-        checksum(self.bytes) == self.checksum()
+        checksum_for_rpc(self.bytes, self.rpc_length()) == self.checksum()
     }
 }
 
@@ -1465,7 +1465,7 @@ pub fn encode_gsp_rpc_with_sequences(
     write_le_u32(&mut bytes, rpc_offset + 24, rpc_sequence);
     let payload_offset = rpc_offset + NVIDIA_GSP_RPC_HEADER_SIZE;
     bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-    let message_checksum = checksum(&bytes);
+    let message_checksum = checksum_for_rpc(&bytes, rpc_length as u32);
     write_le_u32(&mut bytes, 32, message_checksum);
     Ok(bytes)
 }
@@ -1658,7 +1658,7 @@ impl<'a> GspQueue<'a> {
         let parsed = GspRpcMessage::parse(message)?;
         if !parsed.checksum_valid() {
             return Err(GspRpcError::ChecksumMismatch {
-                expected: checksum(message),
+                expected: checksum_for_rpc(message, parsed.rpc_length()),
                 actual: parsed.checksum(),
             }
             .into());
@@ -1724,7 +1724,7 @@ impl<'a> GspQueue<'a> {
         let parsed = GspRpcMessage::parse(&message)?;
         if !parsed.checksum_valid() {
             return Err(GspRpcError::ChecksumMismatch {
-                expected: checksum(&message),
+                expected: checksum_for_rpc(&message, parsed.rpc_length()),
                 actual: parsed.checksum(),
             }
             .into());
@@ -1836,12 +1836,21 @@ fn ceil_div(value: usize, divisor: usize) -> Option<usize> {
     value.checked_add(divisor - 1).map(|value| value / divisor)
 }
 
-fn checksum(bytes: &[u8]) -> u32 {
+fn checksum_for_rpc(bytes: &[u8], rpc_length: u32) -> u32 {
+    let rpc_length = usize::try_from(rpc_length).unwrap_or(usize::MAX);
+    let message_length = NVIDIA_GSP_MESSAGE_HEADER_SIZE.saturating_add(rpc_length);
+    let padded_length = message_length.saturating_add(7) & !7;
+    checksum_padded(bytes, padded_length)
+}
+
+fn checksum_padded(bytes: &[u8], padded_length: usize) -> u32 {
     let mut result = 0u64;
     let mut offset = 0;
-    while offset < bytes.len() {
+    while offset < padded_length {
         let mut word = [0u8; 8];
-        word.copy_from_slice(&bytes[offset..offset + 8]);
+        for (index, byte) in word.iter_mut().enumerate() {
+            *byte = bytes.get(offset + index).copied().unwrap_or(0);
+        }
         if offset == 32 {
             word[..4].fill(0);
         }
@@ -2374,13 +2383,14 @@ mod tests {
 
     #[test]
     fn enqueues_and_receives_wrapped_r570_queue_elements() {
-        let message = encode_gsp_rpc_with_sequences(
+        let mut message = encode_gsp_rpc_with_sequences(
             NVIDIA_GSP_FUNCTION_GET_GSP_STATIC_INFO,
             3,
             3,
             b"static-info",
         )
         .expect("rpc");
+        message[NVIDIA_GSP_PAGE_SIZE - 1] = 0xa5;
         let mut command_queue = vec![0u8; NVIDIA_GSP_SHARED_QUEUE_BYTES];
         let mut command = GspQueue::new(&mut command_queue).expect("command queue");
         assert_eq!(command.available_entries().expect("capacity"), 62);
